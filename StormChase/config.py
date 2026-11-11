@@ -1,0 +1,5 @@
+
+
+
+LATITUDE = 50.04
+LONGITUDE = 10.24

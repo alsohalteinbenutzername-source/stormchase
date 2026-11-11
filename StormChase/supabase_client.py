@@ -1,0 +1,715 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+import json
+import math
+import os
+from threading import RLock
+from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlencode, urlsplit
+from urllib.request import Request, urlopen
+
+import keyring
+
+from lightning import LightningStrike
+from radar import (
+    RadarFrame,
+    RainCell,
+    RainTrackPoint,
+    RotationDetection,
+    decode_radar_file,
+)
+from tracking import StormCell, StormUpdate
+
+
+RADAR_BUCKET = "stormchase-radar"
+KEYRING_SERVICE = "StormChase Supabase"
+
+
+class SupabaseError(RuntimeError):
+    """Raised when Supabase configuration, authentication, or data access fails."""
+
+    def __init__(self, message: str, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+@dataclass(frozen=True)
+class SupabaseConfig:
+    url: str
+    anon_key: str
+
+    def __post_init__(self) -> None:
+        parsed = urlsplit(self.url)
+        local_http = parsed.scheme == "http" and parsed.hostname in {
+            "localhost",
+            "127.0.0.1",
+            "::1",
+        }
+        if parsed.scheme != "https" and not local_http:
+            raise ValueError("Supabase URL must use HTTPS (HTTP is allowed for localhost).")
+        if not parsed.netloc or parsed.username or parsed.password:
+            raise ValueError("Supabase URL must be an origin without embedded credentials.")
+        if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+            raise ValueError("Supabase URL must be a project origin without a path or query.")
+        if not self.anon_key.strip():
+            raise ValueError("Supabase anon key cannot be empty.")
+
+    @classmethod
+    def from_environment(cls) -> SupabaseConfig:
+        url = os.environ.get("STORMCHASE_SUPABASE_URL", "").strip().rstrip("/")
+        anon_key = os.environ.get("STORMCHASE_SUPABASE_ANON_KEY", "").strip()
+        missing = [
+            name
+            for name, value in (
+                ("STORMCHASE_SUPABASE_URL", url),
+                ("STORMCHASE_SUPABASE_ANON_KEY", anon_key),
+            )
+            if not value
+        ]
+        if missing:
+            raise SupabaseError(
+                "Missing Supabase configuration: " + ", ".join(missing)
+            )
+        try:
+            return cls(url=url, anon_key=anon_key)
+        except ValueError as error:
+            raise SupabaseError(f"Invalid Supabase configuration: {error}") from error
+
+
+@dataclass(frozen=True)
+class AuthUser:
+    identifier: str
+    email: str
+
+
+@dataclass(frozen=True)
+class _AuthSession:
+    access_token: str
+    refresh_token: str
+    user: AuthUser
+    expires_at: datetime
+
+
+def _parse_datetime(value: object, field: str) -> datetime:
+    if not isinstance(value, str) or not value:
+        raise SupabaseError(f"Supabase returned an invalid {field} timestamp.")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise SupabaseError(f"Supabase returned an invalid {field} timestamp.") from error
+    if parsed.tzinfo is None:
+        raise SupabaseError(f"Supabase returned a timezone-naive {field} timestamp.")
+    return parsed.astimezone(timezone.utc)
+
+
+class SupabaseClient:
+    """Small typed REST/Auth client using only the public Supabase anon key."""
+
+    def __init__(self, config: SupabaseConfig, timeout: float = 20.0) -> None:
+        if timeout <= 0 or not math.isfinite(timeout):
+            raise ValueError("Supabase request timeout must be a positive finite value.")
+        self.config = config
+        self.timeout = timeout
+        self._session: _AuthSession | None = None
+        self._session_lock = RLock()
+        self.session_persistence_error: str | None = None
+        self.session_restore_notice: str | None = None
+
+    @property
+    def current_user(self) -> AuthUser | None:
+        with self._session_lock:
+            return self._session.user if self._session is not None else None
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        query: dict[str, str] | None = None,
+        payload: dict[str, Any] | None = None,
+        access_token: str | None = None,
+    ) -> Any:
+        url = f"{self.config.url}{path}"
+        if query:
+            url = f"{url}?{urlencode(query)}"
+        headers = {
+            "apikey": self.config.anon_key,
+            "Authorization": f"Bearer {access_token or self.config.anon_key}",
+            "Accept": "application/json",
+        }
+        body = None
+        if payload is not None:
+            body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        request = Request(url, data=body, headers=headers, method=method)
+        try:
+            with urlopen(request, timeout=self.timeout) as response:
+                contents = response.read()
+        except HTTPError as error:
+            detail = error.read().decode("utf-8", errors="replace")
+            try:
+                message = json.loads(detail)
+            except json.JSONDecodeError:
+                message = detail or str(error)
+            if isinstance(message, dict):
+                message = (
+                    message.get("msg")
+                    or message.get("message")
+                    or message.get("error_description")
+                    or message.get("error")
+                    or str(message)
+                )
+            raise SupabaseError(
+                f"Supabase request failed ({error.code}): {message}",
+                status_code=error.code,
+            ) from error
+        except (URLError, TimeoutError, OSError) as error:
+            raise SupabaseError(
+                f"Unable to reach Supabase: {type(error).__name__}: {error}"
+            ) from error
+        if not contents:
+            return None
+        content_type = response.headers.get("Content-Type", "")
+        if "application/json" not in content_type.lower():
+            return contents
+        try:
+            return json.loads(contents)
+        except json.JSONDecodeError as error:
+            raise SupabaseError("Supabase returned malformed JSON.") from error
+
+    def _session_payload(self, payload: Any) -> _AuthSession:
+        if not isinstance(payload, dict):
+            raise SupabaseError("Supabase returned an invalid authentication response.")
+        user_payload = payload.get("user")
+        if not isinstance(user_payload, dict):
+            raise SupabaseError("Supabase did not return a user for this session.")
+        identifier = user_payload.get("id")
+        email = user_payload.get("email")
+        access_token = payload.get("access_token")
+        refresh_token = payload.get("refresh_token")
+        expires_in = payload.get("expires_in")
+        if (
+            not isinstance(identifier, str)
+            or not identifier
+            or not isinstance(email, str)
+            or not isinstance(access_token, str)
+            or not isinstance(refresh_token, str)
+            or not isinstance(expires_in, (int, float))
+        ):
+            raise SupabaseError("Supabase returned incomplete authentication data.")
+        return _AuthSession(
+            access_token=access_token,
+            refresh_token=refresh_token,
+            user=AuthUser(identifier, email),
+            expires_at=datetime.now(timezone.utc) + timedelta(seconds=expires_in),
+        )
+
+    def _save_session(self, session: _AuthSession) -> None:
+        value = json.dumps(
+            {
+                "refresh_token": session.refresh_token,
+                "user_id": session.user.identifier,
+                "email": session.user.email,
+            },
+            separators=(",", ":"),
+        )
+        try:
+            keyring.set_password(KEYRING_SERVICE, self.config.url, value)
+        except Exception as error:
+            self.session_persistence_error = (
+                f"Sign-in succeeded, but Windows secure session storage failed: "
+                f"{type(error).__name__}: {error}"
+            )
+        else:
+            self.session_persistence_error = None
+
+    def _remove_saved_session(self) -> None:
+        try:
+            keyring.delete_password(KEYRING_SERVICE, self.config.url)
+        except keyring.errors.PasswordDeleteError:
+            pass
+        except Exception as error:
+            self.session_persistence_error = (
+                f"Could not remove the saved sign-in session: "
+                f"{type(error).__name__}: {error}"
+            )
+
+    def _clear_session(self, notice: str) -> None:
+        with self._session_lock:
+            self._session = None
+        self._remove_saved_session()
+        self.session_restore_notice = notice
+
+    def _install_session(self, payload: Any) -> AuthUser:
+        session = self._session_payload(payload)
+        with self._session_lock:
+            self._session = session
+        self.session_restore_notice = None
+        self._save_session(session)
+        return session.user
+
+    def sign_in(self, email: str, password: str) -> AuthUser:
+        email = email.strip()
+        if not email or not password:
+            raise ValueError("Enter both an email address and password.")
+        payload = self._request(
+            "POST",
+            "/auth/v1/token",
+            query={"grant_type": "password"},
+            payload={"email": email, "password": password},
+        )
+        return self._install_session(payload)
+
+    def sign_up(self, email: str, password: str) -> AuthUser | None:
+        email = email.strip()
+        if not email or len(password) < 8:
+            raise ValueError("Enter an email address and a password of at least 8 characters.")
+        payload = self._request(
+            "POST",
+            "/auth/v1/signup",
+            payload={"email": email, "password": password},
+        )
+        if not isinstance(payload, dict):
+            raise SupabaseError("Supabase returned an invalid sign-up response.")
+        if payload.get("access_token") and payload.get("refresh_token"):
+            return self._install_session(payload)
+        user_payload = payload.get("user") or payload
+        if isinstance(user_payload, dict) and user_payload.get("id"):
+            return None
+        raise SupabaseError("Supabase did not return a user for sign-up.")
+
+    def restore_session(self) -> AuthUser | None:
+        try:
+            saved = keyring.get_password(KEYRING_SERVICE, self.config.url)
+        except Exception as error:
+            raise SupabaseError(
+                f"Unable to read the saved Windows sign-in session: "
+                f"{type(error).__name__}: {error}"
+            ) from error
+        if not saved:
+            return None
+        try:
+            saved_payload = json.loads(saved)
+            refresh_token = saved_payload["refresh_token"]
+        except (json.JSONDecodeError, KeyError, TypeError) as error:
+            self._remove_saved_session()
+            raise SupabaseError("The saved sign-in session is invalid.") from error
+        if not isinstance(refresh_token, str) or not refresh_token:
+            self._remove_saved_session()
+            raise SupabaseError("The saved sign-in session has no refresh token.")
+        try:
+            payload = self._request(
+                "POST",
+                "/auth/v1/token",
+                query={"grant_type": "refresh_token"},
+                payload={"refresh_token": refresh_token},
+            )
+            return self._install_session(payload)
+        except SupabaseError as error:
+            if error.status_code in {400, 401}:
+                self._remove_saved_session()
+                self.session_restore_notice = (
+                    "The saved sign-in expired. Sign in again to file and view reports."
+                )
+                return None
+            raise
+
+    def _access_token(self) -> str:
+        with self._session_lock:
+            session = self._session
+            if session is None:
+                raise SupabaseError("Sign in is required for this operation.")
+            if session.expires_at <= datetime.now(timezone.utc) + timedelta(seconds=60):
+                try:
+                    payload = self._request(
+                        "POST",
+                        "/auth/v1/token",
+                        query={"grant_type": "refresh_token"},
+                        payload={"refresh_token": session.refresh_token},
+                    )
+                except SupabaseError as error:
+                    if error.status_code in {400, 401}:
+                        self._clear_session(
+                            "The saved sign-in expired. Sign in again to file and view reports."
+                        )
+                    raise
+                session = self._session_payload(payload)
+                self._session = session
+                self._save_session(session)
+            return session.access_token
+
+    def sign_out(self) -> None:
+        with self._session_lock:
+            session = self._session
+        if session is not None:
+            try:
+                self._request(
+                    "POST",
+                    "/auth/v1/logout",
+                    access_token=self._access_token(),
+                )
+            finally:
+                with self._session_lock:
+                    self._session = None
+                self._remove_saved_session()
+
+    def _table_rows(
+        self,
+        table: str,
+        query: dict[str, str],
+        *,
+        authenticated: bool = False,
+    ) -> list[dict[str, Any]]:
+        token = self._access_token() if authenticated else None
+        result = self._request(
+            "GET",
+            f"/rest/v1/{table}",
+            query=query,
+            access_token=token,
+        )
+        if not isinstance(result, list) or not all(
+            isinstance(row, dict) for row in result
+        ):
+            raise SupabaseError(f"Supabase returned an invalid {table} response.")
+        return result
+
+    def latest_storm_update(self) -> StormUpdate | None:
+        rows = self._table_rows(
+            "live_snapshots",
+            {
+                "select": "observed_at,payload",
+                "product": "eq.konrad3d",
+                "order": "observed_at.desc",
+                "limit": "1",
+            },
+        )
+        if not rows:
+            return None
+        row = rows[0]
+        observed_at = _parse_datetime(row.get("observed_at"), "KONRAD3D")
+        payload = row.get("payload")
+        if not isinstance(payload, dict) or not isinstance(payload.get("cells"), list):
+            raise SupabaseError("KONRAD3D snapshot payload must contain a cells array.")
+        cells: list[StormCell] = []
+        for item in payload["cells"]:
+            if not isinstance(item, dict):
+                raise SupabaseError("KONRAD3D snapshot contains an invalid cell.")
+            try:
+                identifier = str(item["identifier"])
+                latitude = float(item["latitude"])
+                longitude = float(item["longitude"])
+                reflectivity = item.get("reflectivity_dbz")
+                if reflectivity is not None:
+                    reflectivity = float(reflectivity)
+                severity = item.get("severity")
+                if severity is not None:
+                    severity = str(severity)
+                track_payload = item.get("track", [[latitude, longitude]])
+                track = tuple(
+                    (float(point[0]), float(point[1]))
+                    for point in track_payload
+                )
+            except (KeyError, TypeError, ValueError, IndexError) as error:
+                raise SupabaseError("KONRAD3D snapshot contains invalid cell data.") from error
+            if (
+                not identifier
+                or not math.isfinite(latitude)
+                or not math.isfinite(longitude)
+                or (
+                    reflectivity is not None
+                    and not math.isfinite(reflectivity)
+                )
+                or not track
+                or any(
+                    not -90 <= point[0] <= 90
+                    or not -180 <= point[1] <= 180
+                    for point in track
+                )
+            ):
+                raise SupabaseError("KONRAD3D snapshot contains out-of-range coordinates.")
+            cells.append(
+                StormCell(
+                    identifier=identifier,
+                    latitude=latitude,
+                    longitude=longitude,
+                    track=track,
+                    reflectivity_dbz=reflectivity,
+                    severity=severity,
+                )
+            )
+        return StormUpdate(cells=tuple(cells), timestamp=observed_at)
+
+    def latest_radar_frame(
+        self,
+        product: str,
+        site_code: str = "",
+    ) -> RadarFrame | None:
+        if product not in {"reflectivity", "velocity"}:
+            raise ValueError("Radar product must be reflectivity or velocity.")
+        if product == "velocity" and not site_code:
+            raise ValueError("A radar site code is required for velocity data.")
+        if product == "reflectivity" and site_code:
+            raise ValueError("Reflectivity radar frames do not use a site code.")
+        rows = self._table_rows(
+            "radar_frames",
+            {
+                "select": "observed_at,storage_path",
+                "product": f"eq.{product}",
+                "site_code": f"eq.{site_code}",
+                "order": "observed_at.desc",
+                "limit": "1",
+            },
+        )
+        if not rows:
+            return None
+        observed_at = _parse_datetime(rows[0].get("observed_at"), "radar")
+        storage_path = rows[0].get("storage_path")
+        if not isinstance(storage_path, str) or not storage_path:
+            raise SupabaseError("Radar frame metadata contains no Storage path.")
+        if any(
+            not part or part in {".", ".."}
+            for part in storage_path.split("/")
+        ):
+            raise SupabaseError("Radar frame metadata contains an unsafe Storage path.")
+        path = "/".join(quote(part, safe="") for part in storage_path.split("/"))
+        contents = self._request(
+            "GET",
+            f"/storage/v1/object/public/{RADAR_BUCKET}/{path}",
+        )
+        if not isinstance(contents, bytes):
+            raise SupabaseError("Supabase Storage returned an invalid radar file.")
+        return decode_radar_file(contents, timestamp=observed_at)
+
+    def recent_lightning(self, minutes: int = 15) -> tuple[LightningStrike, ...]:
+        if minutes < 1:
+            raise ValueError("Lightning lookback must be at least one minute.")
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat()
+        rows = self._table_rows(
+            "lightning_strikes",
+            {
+                "select": (
+                    "identifier,latitude,longitude,observed_at,quality,uncertainty_km"
+                ),
+                "observed_at": f"gte.{cutoff}",
+                "order": "observed_at.desc",
+                "limit": "5000",
+            },
+        )
+        strikes: list[LightningStrike] = []
+        for row in rows:
+            try:
+                identifier = str(row["identifier"])
+                latitude = float(row["latitude"])
+                longitude = float(row["longitude"])
+                timestamp = _parse_datetime(row.get("observed_at"), "lightning")
+                quality = row.get("quality")
+                uncertainty = row.get("uncertainty_km")
+                if uncertainty is not None:
+                    uncertainty = float(uncertainty)
+            except (KeyError, TypeError, ValueError) as error:
+                raise SupabaseError("Lightning table contains an invalid observation.") from error
+            if (
+                not identifier
+                or not math.isfinite(latitude)
+                or not math.isfinite(longitude)
+                or not -90 <= latitude <= 90
+                or not -180 <= longitude <= 180
+                or (
+                    uncertainty is not None
+                    and (not math.isfinite(uncertainty) or uncertainty < 0)
+                )
+            ):
+                raise SupabaseError("Lightning table contains out-of-range values.")
+            strikes.append(
+                LightningStrike(
+                    identifier=identifier,
+                    latitude=latitude,
+                    longitude=longitude,
+                    timestamp=timestamp,
+                    quality=str(quality) if quality is not None else None,
+                    uncertainty_km=uncertainty,
+                )
+            )
+        return tuple(strikes)
+
+    def latest_snapshot(
+        self,
+        product: str,
+        scope: str = "",
+    ) -> dict[str, Any] | None:
+        rows = self._table_rows(
+            "live_snapshots",
+            {
+                "select": "observed_at,payload",
+                "product": f"eq.{product}",
+                "scope": f"eq.{scope}",
+                "order": "observed_at.desc",
+                "limit": "1",
+            },
+        )
+        return rows[0] if rows else None
+
+    def latest_rain_cells(self) -> tuple[RainCell, ...] | None:
+        snapshot = self.latest_snapshot("rain_cells")
+        if snapshot is None:
+            return None
+        payload = snapshot.get("payload")
+        if not isinstance(payload, dict) or not isinstance(payload.get("cells"), list):
+            raise SupabaseError("Rain-cell snapshot payload must contain a cells array.")
+        observed_at = _parse_datetime(snapshot.get("observed_at"), "rain-cell")
+        cells: list[RainCell] = []
+        for item in payload["cells"]:
+            if not isinstance(item, dict):
+                raise SupabaseError("Rain-cell snapshot contains an invalid cell.")
+            try:
+                identifier = str(item["identifier"])
+                latitude = float(item["latitude"])
+                longitude = float(item["longitude"])
+                maximum = float(item["max_reflectivity_dbz"])
+                area_pixels = int(item["area_pixels"])
+                track_payload = item.get("track", [])
+                track = tuple(
+                    RainTrackPoint(
+                        latitude=float(point["latitude"]),
+                        longitude=float(point["longitude"]),
+                        timestamp=_parse_datetime(point["timestamp"], "rain track"),
+                        reflectivity_dbz=float(point["reflectivity_dbz"]),
+                    )
+                    for point in track_payload
+                )
+            except (KeyError, TypeError, ValueError) as error:
+                raise SupabaseError("Rain-cell snapshot contains invalid cell data.") from error
+            if (
+                not identifier
+                or not math.isfinite(latitude)
+                or not math.isfinite(longitude)
+                or not math.isfinite(maximum)
+                or not -90 <= latitude <= 90
+                or not -180 <= longitude <= 180
+                or area_pixels < 1
+                or any(
+                    not math.isfinite(point.latitude)
+                    or not math.isfinite(point.longitude)
+                    or not math.isfinite(point.reflectivity_dbz)
+                    for point in track
+                )
+            ):
+                raise SupabaseError("Rain-cell snapshot contains invalid cell values.")
+            if not track:
+                track = (
+                    RainTrackPoint(
+                        latitude=latitude,
+                        longitude=longitude,
+                        timestamp=observed_at,
+                        reflectivity_dbz=maximum,
+                    ),
+                )
+            cells.append(
+                RainCell(
+                    identifier=identifier,
+                    latitude=latitude,
+                    longitude=longitude,
+                    max_reflectivity_dbz=maximum,
+                    area_pixels=area_pixels,
+                    track=track,
+                )
+            )
+        return tuple(cells)
+
+    def latest_rotation_detections(
+        self,
+        site_code: str,
+    ) -> tuple[RotationDetection, ...] | None:
+        if not site_code:
+            raise ValueError("A radar site code is required for rotation detections.")
+        snapshot = self.latest_snapshot("rotation_detections", site_code)
+        if snapshot is None:
+            return None
+        payload = snapshot.get("payload")
+        if not isinstance(payload, dict) or not isinstance(
+            payload.get("detections"),
+            list,
+        ):
+            raise SupabaseError(
+                "Rotation snapshot payload must contain a detections array."
+            )
+        detections: list[RotationDetection] = []
+        for item in payload["detections"]:
+            if not isinstance(item, dict):
+                raise SupabaseError("Rotation snapshot contains an invalid detection.")
+            try:
+                detection = RotationDetection(
+                    latitude=float(item["latitude"]),
+                    longitude=float(item["longitude"]),
+                    negative_pixels=int(item["negative_pixels"]),
+                    positive_pixels=int(item["positive_pixels"]),
+                )
+            except (KeyError, TypeError, ValueError) as error:
+                raise SupabaseError(
+                    "Rotation snapshot contains invalid detection data."
+                ) from error
+            if (
+                not -90 <= detection.latitude <= 90
+                or not -180 <= detection.longitude <= 180
+                or not math.isfinite(detection.latitude)
+                or not math.isfinite(detection.longitude)
+                or detection.negative_pixels < 0
+                or detection.positive_pixels < 0
+            ):
+                raise SupabaseError(
+                    "Rotation snapshot contains invalid detection values."
+                )
+            detections.append(detection)
+        return tuple(detections)
+
+    def recent_reports(self, limit: int = 100) -> tuple[dict[str, Any], ...]:
+        if not 1 <= limit <= 500:
+            raise ValueError("Community report limit must be between 1 and 500.")
+        try:
+            rows = self._table_rows(
+                "storm_reports",
+                {
+                    "select": "id,cell_id,latitude,longitude,report,created_at",
+                    "order": "created_at.desc",
+                    "limit": str(limit),
+                },
+                authenticated=True,
+            )
+        except SupabaseError as error:
+            if error.status_code == 401:
+                self._clear_session(
+                    "The saved sign-in expired. Sign in again to file and view reports."
+                )
+            raise
+        return tuple(rows)
+
+    def submit_report(self, cell: StormCell, report: str) -> None:
+        report = report.strip()
+        if not report or len(report) > 2000:
+            raise ValueError("Report text must contain between 1 and 2000 characters.")
+        token = self._access_token()
+        user = self.current_user
+        if user is None:
+            raise SupabaseError("Sign in is required to submit a report.")
+        try:
+            self._request(
+                "POST",
+                "/rest/v1/storm_reports",
+                payload={
+                    "user_id": user.identifier,
+                    "cell_id": cell.identifier,
+                    "latitude": cell.latitude,
+                    "longitude": cell.longitude,
+                    "report": report,
+                },
+                access_token=token,
+            )
+        except SupabaseError as error:
+            if error.status_code == 401:
+                self._clear_session(
+                    "The saved sign-in expired. Sign in again to file and view reports."
+                )
+            raise
