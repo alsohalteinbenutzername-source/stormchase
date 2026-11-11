@@ -75,10 +75,16 @@ from loading.
    only allows each signed-in user to create reports as themselves. Report
    text is limited to 2000 characters.
 3. Configure the separate publisher to publish KONRAD3D tracking and movement
-   prediction snapshots only. Keep its server-side secret or legacy
-   `service_role` key in GitHub Actions only. The desktop uses its public
-   publishable key to read tracking snapshots and email/password Auth for
-   reports.
+   prediction snapshots only. Supabase Cron dispatches its GitHub Actions
+   workflow every five minutes; it can also be started manually. Create a
+   fine-grained GitHub token restricted to the publisher repository with
+   **Actions: read and write**, then add it to Supabase Vault as
+   `stormchase_github_dispatch_token`. Run
+   [`supabase/002_github_publisher_scheduler.sql`](./supabase/002_github_publisher_scheduler.sql)
+   after adding that Vault secret. Keep the publisher's server-side secret or
+   legacy `service_role` key in GitHub Actions only. The desktop uses its
+   public publishable key to read tracking snapshots and email/password Auth
+   for reports.
 4. For a prototype release, set the project URL and publishable key in
    `config.py`:
 
