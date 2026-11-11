@@ -21,6 +21,35 @@ class SupabaseConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(SupabaseError, "STORMCHASE_SUPABASE_URL"):
                 SupabaseConfig.from_environment()
 
+    def test_reads_bundled_configuration(self) -> None:
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch("supabase_client.SUPABASE_URL", "https://bundled.supabase.co"),
+            patch("supabase_client.SUPABASE_PUBLISHABLE_KEY", "sb_publishable_bundled"),
+        ):
+            config = SupabaseConfig.from_environment()
+
+        self.assertEqual(config.url, "https://bundled.supabase.co")
+        self.assertEqual(config.api_key, "sb_publishable_bundled")
+
+    def test_environment_configuration_overrides_bundled_values(self) -> None:
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "STORMCHASE_SUPABASE_URL": "https://environment.supabase.co",
+                    "STORMCHASE_SUPABASE_PUBLISHABLE_KEY": "sb_publishable_environment",
+                },
+                clear=True,
+            ),
+            patch("supabase_client.SUPABASE_URL", "https://bundled.supabase.co"),
+            patch("supabase_client.SUPABASE_PUBLISHABLE_KEY", "sb_publishable_bundled"),
+        ):
+            config = SupabaseConfig.from_environment()
+
+        self.assertEqual(config.url, "https://environment.supabase.co")
+        self.assertEqual(config.api_key, "sb_publishable_environment")
+
     def test_rejects_non_tls_remote_urls(self) -> None:
         with self.assertRaisesRegex(ValueError, "HTTPS"):
             SupabaseConfig("http://db.example.com", "anon-key")
@@ -49,6 +78,42 @@ class SupabaseDataContractTests(unittest.TestCase):
         self.assertEqual(request.headers["Apikey"], "public-anon-key")
         self.assertEqual(request.headers["Authorization"], "Bearer public-anon-key")
         self.assertEqual(result, {"ok": True})
+
+    def test_publishable_key_is_not_sent_as_a_bearer_token(self) -> None:
+        client = SupabaseClient(
+            SupabaseConfig("https://example.supabase.co", "sb_publishable_public-key")
+        )
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b'{"ok":true}'
+        response.headers.get.return_value = "application/json"
+        with patch("supabase_client.urlopen", return_value=response) as urlopen_mock:
+            client._request("GET", "/rest/v1/live_snapshots")
+
+        request = urlopen_mock.call_args.args[0]
+        self.assertEqual(request.headers["Apikey"], "sb_publishable_public-key")
+        self.assertNotIn("Authorization", request.headers)
+
+    def test_authenticated_requests_use_the_user_access_token(self) -> None:
+        client = SupabaseClient(
+            SupabaseConfig("https://example.supabase.co", "sb_publishable_public-key")
+        )
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b'{"ok":true}'
+        response.headers.get.return_value = "application/json"
+        with patch("supabase_client.urlopen", return_value=response) as urlopen_mock:
+            client._request(
+                "GET",
+                "/rest/v1/community_reports",
+                access_token="signed-in-user-jwt",
+            )
+
+        request = urlopen_mock.call_args.args[0]
+        self.assertEqual(request.headers["Apikey"], "sb_publishable_public-key")
+        self.assertEqual(
+            request.headers["Authorization"], "Bearer signed-in-user-jwt"
+        )
 
     def test_parses_konrad3d_snapshot_into_existing_map_model(self) -> None:
         rows = [

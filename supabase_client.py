@@ -13,6 +13,7 @@ from urllib.request import Request, urlopen
 
 import keyring
 
+from config import SUPABASE_PUBLISHABLE_KEY, SUPABASE_URL
 from lightning import LightningStrike
 from radar import (
     RadarFrame,
@@ -39,7 +40,7 @@ class SupabaseError(RuntimeError):
 @dataclass(frozen=True)
 class SupabaseConfig:
     url: str
-    anon_key: str
+    api_key: str
 
     def __post_init__(self) -> None:
         parsed = urlsplit(self.url)
@@ -54,18 +55,29 @@ class SupabaseConfig:
             raise ValueError("Supabase URL must be an origin without embedded credentials.")
         if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
             raise ValueError("Supabase URL must be a project origin without a path or query.")
-        if not self.anon_key.strip():
-            raise ValueError("Supabase anon key cannot be empty.")
+        if not self.api_key.strip():
+            raise ValueError("Supabase public API key cannot be empty.")
 
     @classmethod
     def from_environment(cls) -> SupabaseConfig:
-        url = os.environ.get("STORMCHASE_SUPABASE_URL", "").strip().rstrip("/")
-        anon_key = os.environ.get("STORMCHASE_SUPABASE_ANON_KEY", "").strip()
+        url = (
+            os.environ.get("STORMCHASE_SUPABASE_URL", "").strip()
+            or SUPABASE_URL.strip()
+        ).rstrip("/")
+        api_key = (
+            os.environ.get("STORMCHASE_SUPABASE_PUBLISHABLE_KEY", "").strip()
+            or os.environ.get("STORMCHASE_SUPABASE_ANON_KEY", "").strip()
+            or SUPABASE_PUBLISHABLE_KEY.strip()
+        )
         missing = [
             name
             for name, value in (
                 ("STORMCHASE_SUPABASE_URL", url),
-                ("STORMCHASE_SUPABASE_ANON_KEY", anon_key),
+                (
+                    "STORMCHASE_SUPABASE_PUBLISHABLE_KEY (or legacy "
+                    "STORMCHASE_SUPABASE_ANON_KEY)",
+                    api_key,
+                ),
             )
             if not value
         ]
@@ -74,7 +86,7 @@ class SupabaseConfig:
                 "Missing Supabase configuration: " + ", ".join(missing)
             )
         try:
-            return cls(url=url, anon_key=anon_key)
+            return cls(url=url, api_key=api_key)
         except ValueError as error:
             raise SupabaseError(f"Invalid Supabase configuration: {error}") from error
 
@@ -106,7 +118,7 @@ def _parse_datetime(value: object, field: str) -> datetime:
 
 
 class SupabaseClient:
-    """Small typed REST/Auth client using only the public Supabase anon key."""
+    """Small typed REST/Auth client using only a public Supabase API key."""
 
     def __init__(self, config: SupabaseConfig, timeout: float = 20.0) -> None:
         if timeout <= 0 or not math.isfinite(timeout):
@@ -136,10 +148,13 @@ class SupabaseClient:
         if query:
             url = f"{url}?{urlencode(query)}"
         headers = {
-            "apikey": self.config.anon_key,
-            "Authorization": f"Bearer {access_token or self.config.anon_key}",
+            "apikey": self.config.api_key,
             "Accept": "application/json",
         }
+        if access_token:
+            headers["Authorization"] = f"Bearer {access_token}"
+        elif not self.config.api_key.startswith("sb_publishable_"):
+            headers["Authorization"] = f"Bearer {self.config.api_key}"
         body = None
         if payload is not None:
             body = json.dumps(payload, separators=(",", ":")).encode("utf-8")

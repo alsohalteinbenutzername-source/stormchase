@@ -75,27 +75,32 @@ from loading.
    only allows each signed-in user to create reports as themselves. Report
    text is limited to 2000 characters.
 3. Configure the separate publisher to publish KONRAD3D tracking and movement
-   prediction snapshots only. Keep its server-side `service_role` secret in
-   GitHub Actions only. The desktop uses its public anon key to read tracking
-   snapshots and email/password Auth for reports.
-4. Set the project URL and public anon key in the desktop launch environment:
+   prediction snapshots only. Keep its server-side secret or legacy
+   `service_role` key in GitHub Actions only. The desktop uses its public
+   publishable key to read tracking snapshots and email/password Auth for
+   reports.
+4. For a prototype release, set the project URL and publishable key in
+   `config.py`:
 
-   ```powershell
-   $env:STORMCHASE_SUPABASE_URL = "https://your-project.supabase.co"
-   $env:STORMCHASE_SUPABASE_ANON_KEY = "your-public-anon-key"
-   py -3.12 main.py
+   ```python
+   SUPABASE_URL = "https://your-project.supabase.co"
+   SUPABASE_PUBLISHABLE_KEY = "sb_publishable_..."
    ```
 
-   The anon key is intended for desktop clients and is constrained by RLS. Never
-   put the `service_role` key in this app, its source, or a distributed build.
-   Windows stores the signed-in session refresh token using the system
-   credential store; users can sign out from the app.
+   The URL and publishable key are public settings and can be bundled with the
+   desktop app. For local development, `STORMCHASE_SUPABASE_URL` and
+   `STORMCHASE_SUPABASE_PUBLISHABLE_KEY` environment variables override the
+   bundled values; the legacy `STORMCHASE_SUPABASE_ANON_KEY` variable is also
+   supported. Never put a Supabase secret or `service_role` key in this app,
+   its source, or a distributed build. Windows stores the signed-in session
+   refresh token using the system credential store; users can sign out from
+   the app.
 
-Without the URL and anon key, local live data and outlook still work, while
-Supabase tracking and report sign-in are unavailable. Automated database-client
-tests use mocked responses. Verify the live project after deploying the SQL and
-configuring the external publisher; those services are not available to the
-local test suite.
+Without the URL and publishable key, local live data and outlook still work,
+while Supabase tracking and report sign-in are unavailable. Automated
+database-client tests use mocked responses. Verify the live project after
+deploying the SQL and configuring the external publisher; those services are
+not available to the local test suite.
 
 ## Location privacy
 
