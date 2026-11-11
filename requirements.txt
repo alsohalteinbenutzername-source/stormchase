@@ -1,0 +1,12 @@
+wetterdienst[radarplus]
+matplotlib
+numpy
+h5py
+scipy
+wradlib
+xradar
+xarray
+pyinstaller
+winrt-Windows.Devices.Geolocation
+websockets
+keyring
