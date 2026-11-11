@@ -412,6 +412,21 @@ class SupabaseClient:
                     (float(point[0]), float(point[1]))
                     for point in track_payload
                 )
+                forecast_payload = item.get("forecast", [])
+                if not isinstance(forecast_payload, list) or not all(
+                    isinstance(point, dict) for point in forecast_payload
+                ):
+                    raise TypeError("forecast must be an array")
+                forecast = tuple(
+                    (
+                        _parse_datetime(point.get("timestamp"), "KONRAD3D forecast"),
+                        (
+                            float(point["latitude"]),
+                            float(point["longitude"]),
+                        ),
+                    )
+                    for point in forecast_payload
+                )
             except (KeyError, TypeError, ValueError, IndexError) as error:
                 raise SupabaseError("KONRAD3D snapshot contains invalid cell data.") from error
             if (
@@ -428,6 +443,13 @@ class SupabaseClient:
                     or not -180 <= point[1] <= 180
                     for point in track
                 )
+                or any(
+                    not math.isfinite(position[0])
+                    or not math.isfinite(position[1])
+                    or not -90 <= position[0] <= 90
+                    or not -180 <= position[1] <= 180
+                    for _timestamp, position in forecast
+                )
             ):
                 raise SupabaseError("KONRAD3D snapshot contains out-of-range coordinates.")
             cells.append(
@@ -438,6 +460,7 @@ class SupabaseClient:
                     track=track,
                     reflectivity_dbz=reflectivity,
                     severity=severity,
+                    forecast=forecast,
                 )
             )
         return StormUpdate(cells=tuple(cells), timestamp=observed_at)

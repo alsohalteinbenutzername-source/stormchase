@@ -35,19 +35,24 @@ from loctrack import (
     request_location_access,
 )
 from lightning import LightningStrike
+from lightning_stream import stream_blitzortung_lightning
 from radar import (
     GERMANY_EXTENT,
     RAIN_CELL_MAX_DBZ,
     RAIN_CELL_MIN_DBZ,
+    RainCellTracker,
     RainCell,
     RadarFrame,
     RotationDetection,
     VelocityRadarSite,
+    detect_rain_cells,
+    detect_rotations,
+    fetch_latest_radar,
+    fetch_latest_velocity_radar,
     nearest_velocity_radar_site,
 )
 from supabase_client import AuthUser, SupabaseClient, SupabaseConfig, SupabaseError
-from tracking import StormCell, StormUpdate
-from tracking import project_cell_motion
+from tracking import StormCell, StormUpdate, fetch_latest_storm_cells, project_cell_motion
 from calculations import calculate_environment, parse_time
 from stormanalyzer import analyze_storm
 
@@ -633,7 +638,7 @@ class StormRadarApp:
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("StormChase | Shared Storm Radar")
+        self.root.title("StormChase | Live Storm Radar")
         self.root.geometry("1280x820")
         self.root.minsize(1000, 680)
         self.root.configure(bg=BACKGROUND)
@@ -644,6 +649,7 @@ class StormRadarApp:
         self._closed = False
         self._refreshing = False
         self._tracking_task: asyncio.Task[None] | None = None
+        self._lightning_task: asyncio.Task[None] | None = None
         self._auth_task: asyncio.Task[None] | None = None
         self.supabase: SupabaseClient | None = None
         self.supabase_configuration_error: str | None = None
@@ -658,6 +664,7 @@ class StormRadarApp:
         self._location_changed_handler: Any | None = None
         self._has_device_fix = False
         self.radar_frame: RadarFrame | None = None
+        self.rain_cell_tracker = RainCellTracker()
         self.velocity_radar_frame: RadarFrame | None = None
         self.velocity_radar_site: VelocityRadarSite | None = None
         self.velocity_radar_frames: dict[str, RadarFrame] = {}
@@ -699,19 +706,26 @@ class StormRadarApp:
         self._outlook_metric = "Overall risk"
 
         self._build_ui()
-        self.lightning_status.set("Supabase lightning: waiting for data")
+        self.lightning_status.set("Blitzortung lightning: connecting")
         self._refresh_auth_controls()
         if self.supabase is not None:
             self._auth_task = self.loop.create_task(self._restore_auth_session())
         else:
             self.status.set(
-                f"Shared data unavailable: {self.supabase_configuration_error}"
+                "Local DWD feeds starting · Supabase reports/tracking unavailable: "
+                f"{self.supabase_configuration_error}"
             )
         self.root.after(60_000, self._expire_lightning_strikes)
         self.root.protocol("WM_DELETE_WINDOW", self._close)
         self.root.after(25, self._pump_asyncio)
         self.root.after(100, self.refresh_data)
         self.root.after(DATA_REFRESH_SECONDS * 1000, self._schedule_refresh)
+        self._lightning_task = self.loop.create_task(
+            stream_blitzortung_lightning(
+                self._on_lightning_strike,
+                self.lightning_status.set,
+            )
+        )
 
     def _build_ui(self) -> None:
         style = ttk.Style(self.root)
@@ -1106,40 +1120,44 @@ class StormRadarApp:
         reports_future = None
         try:
             client = self.supabase
-            if client is None:
-                self.status.set(
-                    f"Shared data unavailable: {self.supabase_configuration_error}"
-                )
-                self._draw_map()
-                return
-
             radar_future = self.loop.run_in_executor(
                 self.executor,
-                client.latest_radar_frame,
-                "reflectivity",
-            )
-            storms_future = self.loop.run_in_executor(
-                self.executor,
-                client.latest_storm_update,
-            )
-            rain_cells_future = self.loop.run_in_executor(
-                self.executor,
-                client.latest_rain_cells,
-            )
-            lightning_future = self.loop.run_in_executor(
-                self.executor,
-                client.recent_lightning,
+                fetch_latest_radar,
             )
             reports_future = (
                 self.loop.run_in_executor(self.executor, client.recent_reports)
-                if self.auth_user is not None
+                if client is not None and self.auth_user is not None
                 else None
             )
-            futures = [radar_future, storms_future, rain_cells_future, lightning_future]
-            if reports_future is not None:
-                futures.append(reports_future)
-            results = await asyncio.gather(*futures, return_exceptions=True)
-            radar_result, storm_result, rain_result, lightning_result = results[:4]
+
+            storm_error: BaseException | None = None
+            if client is not None:
+                try:
+                    storm_result = await self.loop.run_in_executor(
+                        self.executor,
+                        client.latest_storm_update,
+                    )
+                except Exception as error:
+                    storm_error = error
+                    storm_result = None
+            else:
+                storm_result = None
+
+            if storm_result is None:
+                try:
+                    storm_result = await self.loop.run_in_executor(
+                        self.executor,
+                        fetch_latest_storm_cells,
+                    )
+                except Exception as error:
+                    if storm_error is not None:
+                        error.add_note(
+                            f"Supabase tracking lookup also failed: {storm_error}"
+                        )
+                    storm_result = error
+
+            radar_result = await asyncio.gather(radar_future, return_exceptions=True)
+            radar_result = radar_result[0]
             errors: list[BaseException] = []
             wind_error: Exception | None = None
 
@@ -1148,6 +1166,19 @@ class StormRadarApp:
             elif radar_result is not None:
                 radar_frame = radar_result
                 self.radar_frame = radar_frame
+                try:
+                    detected_cells = await self.loop.run_in_executor(
+                        self.executor,
+                        detect_rain_cells,
+                        radar_frame,
+                    )
+                except Exception as error:
+                    errors.append(error)
+                else:
+                    self.rain_cells = self.rain_cell_tracker.update(
+                        detected_cells,
+                        radar_frame.timestamp,
+                    )
                 if self.radar_product == REFLECTIVITY_RADAR:
                     self.radar_product_status.set(
                         self._radar_status_text(REFLECTIVITY_RADAR, radar_frame)
@@ -1159,10 +1190,13 @@ class StormRadarApp:
                 self.storm_update = storm_result
                 self._remember_tracks(storm_result.cells)
                 try:
+                    cells_without_forecast = tuple(
+                        cell for cell in storm_result.cells if not cell.forecast
+                    )
                     self.cell_motion_winds = await self.loop.run_in_executor(
                         self.executor,
                         fetch_storm_cell_winds,
-                        storm_result.cells,
+                        cells_without_forecast,
                     )
                 except Exception as error:
                     self.cell_motion_winds = {}
@@ -1170,35 +1204,12 @@ class StormRadarApp:
                 else:
                     wind_error = None
 
-            if isinstance(rain_result, BaseException):
-                errors.append(rain_result)
-            elif rain_result is not None:
-                self.rain_cells = rain_result
-            elif radar_result is not None:
-                self.rain_cells = ()
-
-            if isinstance(lightning_result, BaseException):
-                errors.append(lightning_result)
-            else:
-                cutoff = datetime.now(timezone.utc) - timedelta(minutes=15)
-                self.lightning_strikes = {
-                    strike.identifier: strike
-                    for strike in lightning_result
-                    if strike.timestamp >= cutoff
-                }
-                if self.lightning_strikes:
-                    newest_strike = max(
-                        strike.timestamp for strike in self.lightning_strikes.values()
-                    )
-                    self.lightning_status.set(
-                        f"Supabase lightning · {len(self.lightning_strikes)} strokes · "
-                        f"{self._format_time(newest_strike)}"
-                    )
-                else:
-                    self.lightning_status.set("Supabase lightning · no recent strokes")
-
             if reports_future is not None and self.auth_user is not None:
-                reports_result = results[4]
+                reports_result = await asyncio.gather(
+                    reports_future,
+                    return_exceptions=True,
+                )
+                reports_result = reports_result[0]
                 if isinstance(reports_result, BaseException):
                     errors.append(reports_result)
                     self._sync_auth_state()
@@ -1216,7 +1227,12 @@ class StormRadarApp:
                     f"{type(wind_error).__name__}: {wind_error}"
                 )
             elif storm_result is not None:
-                missing_winds = len(storm_result.cells) - len(self.cell_motion_winds)
+                missing_winds = sum(
+                    1
+                    for cell in storm_result.cells
+                    if not cell.forecast
+                    and cell.identifier not in self.cell_motion_winds
+                )
                 wind_status = (
                     f" · Wind projection unavailable for {missing_winds} cells"
                     if missing_winds > 0
@@ -1224,13 +1240,22 @@ class StormRadarApp:
                 )
             else:
                 wind_status = ""
+            tracking_status = ""
+            if storm_error is not None:
+                tracking_status = (
+                    f" · Supabase tracking unavailable; using local KONRAD3D "
+                    f"({type(storm_error).__name__})"
+                )
+            elif client is None:
+                tracking_status = " · Supabase reports/tracking not configured"
             if errors:
                 self.status.set(
-                    "Shared data refresh failed: "
+                    "Local data refresh failed: "
                     + "; ".join(
                         f"{type(error).__name__}: {error}" for error in errors
                     )
                     + wind_status
+                    + tracking_status
                 )
             else:
                 radar_time = self._format_time(
@@ -1240,7 +1265,7 @@ class StormRadarApp:
                 stale_products = []
                 now = datetime.now(timezone.utc)
                 for name, timestamp in (
-                    ("radar", self.radar_frame.timestamp if self.radar_frame else None),
+                    ("reflectivity", self.radar_frame.timestamp if self.radar_frame else None),
                     ("KONRAD3D", self.storm_update.timestamp),
                 ):
                     if timestamp is not None and timestamp.tzinfo is None:
@@ -1258,17 +1283,19 @@ class StormRadarApp:
                 )
                 if self.radar_frame is None:
                     self.status.set(
-                        f"No shared radar frame is available. KONRAD3D: {storm_time}."
+                        f"No local reflectivity frame is available. KONRAD3D: {storm_time}."
                         + stale_status
                         + wind_status
+                        + tracking_status
                     )
                 else:
                     self.status.set(
-                        f"Supabase · Radar {radar_time} · KONRAD3D {storm_time} · "
+                        f"Local DWD · Radar {radar_time} · KONRAD3D {storm_time} · "
                         f"{len(self.storm_update.cells)} convective · "
                         f"{len(self.rain_cells)} rain cells"
                         + stale_status
                         + wind_status
+                        + tracking_status
                     )
             self._draw_map()
         except Exception as error:
@@ -1295,26 +1322,21 @@ class StormRadarApp:
         site: VelocityRadarSite,
     ) -> None:
         site_code = site.site.value
-        client = self.supabase
-        if client is None:
-            self.radar_product_status.set(
-                f"Velocity · {site.name}: {self.supabase_configuration_error}"
-            )
-            self._velocity_loading_sites.discard(site_code)
-            return
         try:
-            frame_future = self.loop.run_in_executor(
+            frame = await self.loop.run_in_executor(
                 self.executor,
-                client.latest_radar_frame,
-                "velocity",
-                site_code,
+                fetch_latest_velocity_radar,
+                site.site,
             )
-            rotations_future = self.loop.run_in_executor(
-                self.executor,
-                client.latest_rotation_detections,
-                site_code,
+            rotations = (
+                await self.loop.run_in_executor(
+                    self.executor,
+                    detect_rotations,
+                    frame,
+                )
+                if frame is not None
+                else ()
             )
-            frame, rotations = await asyncio.gather(frame_future, rotations_future)
         except Exception as error:
             if (
                 not self._closed
@@ -1328,10 +1350,7 @@ class StormRadarApp:
             if not self._closed:
                 if frame is not None:
                     self.velocity_radar_frames[site_code] = frame
-                if rotations is not None:
-                    self.velocity_rotation_detections[site_code] = rotations
-                elif frame is not None:
-                    self.velocity_rotation_detections[site_code] = ()
+                self.velocity_rotation_detections[site_code] = rotations
                 if self.velocity_radar_site == site and frame is not None:
                     self.velocity_radar_frame = frame
                 if (
@@ -1593,6 +1612,22 @@ class StormRadarApp:
             self.lightning_strikes = remaining
             self._draw_map()
         self.root.after(60_000, self._expire_lightning_strikes)
+
+    def _on_lightning_strike(self, strike: LightningStrike) -> None:
+        if self._closed:
+            return
+        self.lightning_strikes[strike.identifier] = strike
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=15)
+        self.lightning_strikes = {
+            identifier: observed
+            for identifier, observed in self.lightning_strikes.items()
+            if observed.timestamp >= cutoff
+        }
+        self.lightning_status.set(
+            f"Blitzortung lightning · {len(self.lightning_strikes)} strokes · "
+            f"{self._format_time(strike.timestamp)}"
+        )
+        self._draw_map()
 
     @staticmethod
     def _format_time(value: datetime | None) -> str:
@@ -1894,8 +1929,11 @@ class StormRadarApp:
             )
             if len(path) > 1:
                 self._draw_movement_track(path, color, linewidth=1.8, arrow=False)
+            forecast_path = [position for _timestamp, position in cell.forecast]
             wind = self.cell_motion_winds.get(cell.identifier)
-            if wind is not None:
+            if forecast_path:
+                projected_path = forecast_path
+            elif wind is not None:
                 wind_speed, wind_direction = wind
                 projected_path = project_cell_motion(
                     cell.latitude,
@@ -1903,6 +1941,9 @@ class StormRadarApp:
                     wind_direction,
                     wind_speed,
                 )
+            else:
+                projected_path = []
+            if projected_path:
                 self.axes.plot(
                     [longitude for _latitude, longitude in projected_path],
                     [latitude for latitude, _longitude in projected_path],
@@ -1912,7 +1953,11 @@ class StormRadarApp:
                     alpha=0.9,
                     zorder=4,
                     label=(
-                        "Estimated motion (700 hPa wind)"
+                        (
+                            "KONRAD3D movement prediction"
+                            if forecast_path
+                            else "Estimated motion (700 hPa wind)"
+                        )
                         if not motion_legend_drawn
                         else "_nolegend_"
                     ),

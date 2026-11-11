@@ -1,9 +1,9 @@
 # StormChase
 
-StormChase is a Windows desktop radar viewer built with Tkinter. Its shared live
-map reads DWD Germany-wide reflectivity and radial-velocity radar frames,
-KONRAD3D convective-cell locations, derived detections, and recent lightning
-from Supabase.
+StormChase is a Windows desktop radar viewer built with Tkinter. It fetches
+DWD reflectivity, radial velocity, rain echoes, and lightning locally while
+running. Supabase is used for sign-in, community reports, and shared KONRAD3D
+cell-tracking and movement-prediction snapshots.
 
 ## Run from source
 
@@ -11,7 +11,7 @@ Use Python 3.12 on Windows:
 
 ```powershell
 python -m pip install -r requirements.txt
-python main.py
+py -3.12 main.py
 ```
 
 In VS Code, select **StormChase desktop app** in Run and Debug and press F5 to
@@ -23,20 +23,19 @@ the background map. Zoom with the mouse wheel or the **Zoom +** / **Zoom −**
 buttons; **Reset** returns to the full map view.
 
 The live map's radar-product selector switches between reflectivity (dBZ) and
-radial velocity (m/s). Velocity frames and rotation detections are loaded from
-Supabase when selected and refreshed with the regular five-minute data updates.
+radial velocity (m/s). Radar frames and rotation detections are fetched and
+calculated locally from DWD during the regular five-minute data updates.
 In velocity mode, click the map to select the nearest active DWD Doppler
 station; its radar coverage is shown in its correct map position. The
-publisher's adjacent inbound/outbound velocity couplet detections (±15 m/s,
+local adjacent inbound/outbound velocity couplet detections (±15 m/s,
 five pixels per side) are marked with a large rotation symbol. This is a
 simple radar-velocity heuristic, not a tornado detector or official warning.
-The separate publisher runs on its configured schedule; the app polls the
-shared database.
+The separate publisher runs on its configured schedule; the app reads shared
+KONRAD3D tracking snapshots and movement predictions from Supabase when configured.
 KONRAD3D convective cells are shown with their observed movement history and a
-dashed, one-hour forward
-motion estimate based on ICON-D2 700 hPa wind speed and direction queried at
-each cell's location. Wind direction is treated as the direction the wind
-comes from. Connected 20–30 dBZ regions are
+dashed, one-hour movement prediction from Supabase when present, with an
+ICON-D2 700 hPa wind projection as a local fallback. Wind direction is treated
+as the direction the wind comes from. Connected 20–30 dBZ regions are
 shown separately as rain echoes, with persistent IDs and fading, directional
 movement tracks between scans. Echo patches are buffered by three radar pixels
 before grouping, bridging gaps of up to about six pixels; isolated detections
@@ -49,51 +48,42 @@ loaded map remains visible.
 
 Blitzortung / LightningMaps community-network lightning strokes appear as
 yellow plus markers for up to 15 minutes on the live and DWD warning maps.
-StormChase reads these recent strokes from the shared Supabase feed; the
-scheduled publisher is responsible for collecting and publishing them. The
+StormChase connects to the lightning feed locally while it is running. The
 underlying feed is community-run and non-commercial, can be delayed or
 incomplete, and is not an official safety service. Do not use it for life-safety
 decisions or as a substitute for a certified lightning-detection feed.
 
 ## Supabase shared data and reports
 
-The shared live map reads radar frames, KONRAD3D cells, rain-cell and rotation
-detections, and recent lightning from Supabase. Each desktop client polls the
-shared data during the regular five-minute refresh; it does not fetch or publish
-those feeds directly. If a refresh fails, the last successfully loaded data
-remains visible and the status bar reports the error. DWD warning overlays and
-point lookups, Esri imagery, and forecast/outlook requests remain direct
-third-party requests.
+The desktop fetches DWD reflectivity, velocity, KONRAD3D fallback data, and
+lightning directly while running. Rain echoes and rotation detections are
+derived locally from those radar frames. The StormAnalyzer outlook, warning
+overlays, point lookups, Esri imagery, and cell-motion wind projections also
+use direct third-party requests. When configured, Supabase supplies shared
+KONRAD3D tracking/prediction snapshots and authenticated community-report
+features; Supabase being unavailable does not prevent local radar or outlook
+from loading.
 
 1. In the Supabase SQL editor, run
    [`supabase/001_stormchase_schema.sql`](./supabase/001_stormchase_schema.sql).
    It creates the tables, indexes, read policies, authenticated report policies,
-   the public `stormchase-radar` Storage bucket, and a `pg_cron` job that limits
-   live database observations to two hours. The job runs every five minutes.
-   The separate publisher must also remove old radar files through the Storage
-   API; direct SQL deletion cannot safely remove the underlying files. User
-   community reports are not included in live-data retention and are preserved.
+   and a `pg_cron` job that limits live-data observations to two hours. The job
+   runs every five minutes. Storage cleanup must use the Storage API, not direct
+   SQL deletion. Community reports are excluded from live-data retention.
 2. Enable email/password authentication in Supabase Auth. Configure email
    confirmation as desired. Signed-in users can read community reports; RLS
    only allows each signed-in user to create reports as themselves. Report
    text is limited to 2000 characters.
-3. Configure the separate scheduled publisher to run about every five minutes.
-   Use a server-side `service_role` secret in that publisher's secret store
-   only. Upload raw DWD HDF5 radar frames to `stormchase-radar`, then upsert
-   their metadata, and remove radar objects older than two hours using the
-   Storage API. Upsert snapshots on `(product, scope, observed_at)` and
-   lightning strokes on `identifier`, as specified in the SQL comments. The
-   client expects KONRAD3D, rain-cell, and rotation payloads in the documented
-   JSON shapes. Publish empty cell/detection arrays when a scan finds none to
-   clear old map markers. Publish velocity frames and rotation snapshots for
-   each Doppler site the client may select. Upload objects before publishing
-   their metadata.
+3. Configure the separate publisher to publish KONRAD3D tracking and movement
+   prediction snapshots only. Keep its server-side `service_role` secret in
+   GitHub Actions only. The desktop uses its public anon key to read tracking
+   snapshots and email/password Auth for reports.
 4. Set the project URL and public anon key in the desktop launch environment:
 
    ```powershell
    $env:STORMCHASE_SUPABASE_URL = "https://your-project.supabase.co"
    $env:STORMCHASE_SUPABASE_ANON_KEY = "your-public-anon-key"
-   python main.py
+   py -3.12 main.py
    ```
 
    The anon key is intended for desktop clients and is constrained by RLS. Never
@@ -101,11 +91,11 @@ third-party requests.
    Windows stores the signed-in session refresh token using the system
    credential store; users can sign out from the app.
 
-Without the URL and anon key, shared feeds are reported as unavailable; the app
-does not silently switch back to each desktop independently fetching them.
-Automated database-client tests use mocked responses. Verify the live project
-after deploying the SQL and configuring the external publisher; those services
-are not available to the local test suite.
+Without the URL and anon key, local live data and outlook still work, while
+Supabase tracking and report sign-in are unavailable. Automated database-client
+tests use mocked responses. Verify the live project after deploying the SQL and
+configuring the external publisher; those services are not available to the
+local test suite.
 
 ## Location privacy
 

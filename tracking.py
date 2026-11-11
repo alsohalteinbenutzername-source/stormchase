@@ -181,6 +181,24 @@ def _current_cell_position(element: ElementTree.Element) -> GeoPoint | None:
     return _direct_coordinate_pair(element)
 
 
+def _cell_track(
+    element: ElementTree.Element,
+    current_position: GeoPoint,
+) -> tuple[GeoPoint, ...]:
+    track_element = next(
+        (node for node in element.iter() if _local_name(node.tag) == "track"),
+        None,
+    )
+    points = _coordinate_pairs(track_element) if track_element is not None else []
+    if not points or points[-1] != current_position:
+        points.append(current_position)
+    return tuple(
+        point
+        for index, point in enumerate(points)
+        if index == 0 or point != points[index - 1]
+    )
+
+
 def _parse_datetime(value: str | None) -> datetime | None:
     if not value:
         return None
@@ -292,9 +310,7 @@ def parse_konrad3d_xml(contents: bytes) -> StormUpdate:
                 identifier=identifier,
                 latitude=latitude,
                 longitude=longitude,
-                # Historical positions are accumulated from successive DWD
-                # analyzed scans by the UI. Forecast centroids are not history.
-                track=(current_position,),
+                track=_cell_track(element, current_position),
                 reflectivity_dbz=reflectivity,
                 severity=severity,
                 forecast=_cell_forecasts(element),
