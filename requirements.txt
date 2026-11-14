@@ -10,3 +10,4 @@ pyinstaller
 winrt-Windows.Devices.Geolocation
 websockets
 keyring
+requests-cache

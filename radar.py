@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from io import BytesIO
 import math
-from typing import Final
+from typing import Any, cast
 
 import h5py
 import numpy as np
@@ -21,18 +21,18 @@ from wetterdienst.provider.dwd.radar import (
 from wetterdienst.provider.dwd.radar.api import DwdRadarSites
 
 
-REFLECTIVITY_PRODUCT: Final = DwdRadarParameter.HX_REFLECTIVITY
-VELOCITY_PRODUCT: Final = DwdRadarParameter.PR_VELOCITY
+REFLECTIVITY_PRODUCT: DwdRadarParameter = DwdRadarParameter.HX_REFLECTIVITY
+VELOCITY_PRODUCT: DwdRadarParameter = DwdRadarParameter.PR_VELOCITY
 GERMANY_EXTENT: tuple[float, float, float, float] = (5.0, 16.0, 47.0, 56.0)
-RAIN_CELL_MIN_DBZ: Final = 20.0
-RAIN_CELL_MAX_DBZ: Final = 30.0
-RAIN_CELL_MIN_PIXELS: Final = 25
-RAIN_CELL_MERGE_RADIUS_PIXELS: Final = 3
-RAIN_TRACK_MAX_DISTANCE_KM: Final = 45.0
-RAIN_TRACK_MAX_GAP: Final = timedelta(minutes=20)
-RAIN_TRACK_MAX_POINTS: Final = 12
-ROTATION_VELOCITY_THRESHOLD_MS: Final = 15.0
-ROTATION_MIN_PIXELS: Final = 5
+RAIN_CELL_MIN_DBZ: float = 20.0
+RAIN_CELL_MAX_DBZ: float = 30.0
+RAIN_CELL_MIN_PIXELS: int = 25
+RAIN_CELL_MERGE_RADIUS_PIXELS: int = 3
+RAIN_TRACK_MAX_DISTANCE_KM: float = 45.0
+RAIN_TRACK_MAX_GAP: timedelta = timedelta(minutes=20)
+RAIN_TRACK_MAX_POINTS: int = 12
+ROTATION_VELOCITY_THRESHOLD_MS: float = 15.0
+ROTATION_MIN_PIXELS: int = 5
 
 
 class RadarDataError(ValueError):
@@ -102,6 +102,14 @@ def _attribute_value(attributes: h5py.AttributeManager, name: str) -> float | No
         return None
 
 
+def _label_components(
+    mask: NDArray[np.bool_],
+    structure: NDArray[np.uint8],
+) -> tuple[NDArray[np.intp], int]:
+    result = cast(tuple[NDArray[Any], int], label(mask, structure=structure))
+    return np.asarray(result[0], dtype=np.intp), result[1]
+
+
 def _decode_reflectivity(dataset: h5py.Dataset) -> NDArray[np.float32]:
     values = np.asarray(dataset[...])
     if values.ndim > 2:
@@ -111,14 +119,19 @@ def _decode_reflectivity(dataset: h5py.Dataset) -> NDArray[np.float32]:
             f"Expected a two-dimensional radar grid, received shape {values.shape}."
         )
 
-    metadata = dataset.parent.get("what")
+    dataset_parent = dataset.parent
+    metadata = (
+        dataset_parent.get("what")
+        if isinstance(dataset_parent, h5py.Group)
+        else None
+    )
     attributes = metadata.attrs if isinstance(metadata, h5py.Group) else dataset.attrs
     gain = _attribute_value(attributes, "gain")
     offset = _attribute_value(attributes, "offset")
     nodata = _attribute_value(attributes, "nodata")
     undetect = _attribute_value(attributes, "undetect")
 
-    decoded = values.astype(np.float32, copy=False)
+    decoded: NDArray[np.float32] = np.asarray(values, dtype=np.float32)
     if gain is not None:
         decoded = decoded * gain
     if offset is not None:
@@ -144,30 +157,48 @@ def decode_radar_file(contents: bytes, timestamp: datetime | None = None) -> Rad
             if not candidates:
                 raise RadarDataError("The DWD HDF5 file contains no radar grid.")
 
-            _dataset_name, dataset = max(
+            dataset = max(
                 candidates,
                 key=lambda candidate: (
                     candidate[0].rsplit("/", 1)[-1].lower() == "data",
                     int(np.prod(candidate[1].shape)),
                 ),
-            )
+            )[1]
             reflectivity = _decode_reflectivity(dataset)
             extent = GERMANY_EXTENT
-            dataset_group = dataset.parent.parent
-            metadata = dataset_group.get("where")
+            dataset_parent = dataset.parent
+            dataset_group = (
+                dataset_parent.parent
+                if isinstance(dataset_parent, h5py.Group)
+                else None
+            )
+            metadata = (
+                dataset_group.get("where")
+                if isinstance(dataset_group, h5py.Group)
+                else None
+            )
             if isinstance(metadata, h5py.Group):
                 attributes = metadata.attrs
                 corner_names = ("LL_lon", "LR_lon", "UL_lon", "UR_lon")
                 latitude_names = ("LL_lat", "LR_lat", "UL_lat", "UR_lat")
                 if all(name in attributes for name in (*corner_names, *latitude_names)):
-                    longitudes = [float(attributes[name]) for name in corner_names]
-                    latitudes = [float(attributes[name]) for name in latitude_names]
-                    extent = (
-                        min(longitudes),
-                        max(longitudes),
-                        min(latitudes),
-                        max(latitudes),
-                    )
+                    longitudes = [
+                        value
+                        for name in corner_names
+                        if (value := _attribute_value(attributes, name)) is not None
+                    ]
+                    latitudes = [
+                        value
+                        for name in latitude_names
+                        if (value := _attribute_value(attributes, name)) is not None
+                    ]
+                    if len(longitudes) == len(corner_names) and len(latitudes) == len(latitude_names):
+                        extent = (
+                            min(longitudes),
+                            max(longitudes),
+                            min(latitudes),
+                            max(latitudes),
+                        )
     except RadarDataError:
         raise
     except (OSError, ValueError, TypeError) as error:
@@ -234,26 +265,37 @@ def detect_rain_cells(
         raise ValueError("Minimum rain-cell area must be at least one pixel.")
 
     reflectivity = frame.reflectivity
-    echo_mask = (
+    echo_mask: NDArray[np.bool_] = np.asarray(
         np.isfinite(reflectivity)
         & (reflectivity >= minimum_dbz)
-        & (reflectivity <= maximum_dbz)
+        & (reflectivity <= maximum_dbz),
+        dtype=np.bool_,
     )
-    stronger_echoes = np.isfinite(reflectivity) & (reflectivity > maximum_dbz)
-    nearby_stronger_echoes = binary_dilation(
-        stronger_echoes,
-        structure=np.ones((3, 3), dtype=np.uint8),
+    stronger_echoes: NDArray[np.bool_] = np.asarray(
+        np.isfinite(reflectivity) & (reflectivity > maximum_dbz),
+        dtype=np.bool_,
+    )
+    structure = np.ones((3, 3), dtype=np.uint8)
+    nearby_stronger_echoes: NDArray[np.bool_] = np.asarray(
+        binary_dilation(stronger_echoes, structure=structure),
+        dtype=np.bool_,
     )
     echo_mask &= ~nearby_stronger_echoes
-    grouped_labels, component_count = label(
-        binary_dilation(echo_mask, iterations=RAIN_CELL_MERGE_RADIUS_PIXELS),
-        structure=np.ones((3, 3), dtype=np.uint8),
+    grouped_labels, component_count = _label_components(
+        np.asarray(
+            binary_dilation(echo_mask, iterations=RAIN_CELL_MERGE_RADIUS_PIXELS),
+            dtype=np.bool_,
+        ),
+        structure,
     )
     if component_count == 0:
         return ()
 
     pixel_rows, pixel_columns = np.nonzero(echo_mask)
-    pixel_labels = grouped_labels[pixel_rows, pixel_columns]
+    pixel_labels = np.asarray(
+        grouped_labels[pixel_rows, pixel_columns],
+        dtype=np.intp,
+    )
     component_sizes = np.bincount(pixel_labels, minlength=component_count + 1)
     active_labels = np.flatnonzero(component_sizes >= minimum_pixels)
     active_labels = active_labels[active_labels != 0]
@@ -357,7 +399,7 @@ class RainCellTracker:
 
         matched_cells: dict[int, str] = {}
         matched_tracks: set[str] = set()
-        for _distance, cell_index, identifier in sorted(candidate_matches):
+        for _, cell_index, identifier in sorted(candidate_matches):
             if cell_index in matched_cells or identifier in matched_tracks:
                 continue
             matched_cells[cell_index] = identifier
@@ -417,11 +459,17 @@ def detect_rotations(
     if not math.isfinite(threshold) or threshold <= 0 or min_pixels < 1:
         raise ValueError("Rotation detection parameters must be positive.")
     velocity = frame.reflectivity
-    negative_mask = np.isfinite(velocity) & (velocity <= -threshold)
-    positive_mask = np.isfinite(velocity) & (velocity >= threshold)
+    negative_mask: NDArray[np.bool_] = np.asarray(
+        np.isfinite(velocity) & (velocity <= -threshold),
+        dtype=np.bool_,
+    )
+    positive_mask: NDArray[np.bool_] = np.asarray(
+        np.isfinite(velocity) & (velocity >= threshold),
+        dtype=np.bool_,
+    )
     structure = np.ones((3, 3), dtype=np.uint8)
-    negative_labels, negative_count = label(negative_mask, structure=structure)
-    positive_labels, positive_count = label(positive_mask, structure=structure)
+    negative_labels, negative_count = _label_components(negative_mask, structure)
+    positive_labels, positive_count = _label_components(positive_mask, structure)
     if negative_count == 0 or positive_count == 0:
         return ()
     negative_sizes = np.bincount(negative_labels.ravel(), minlength=negative_count + 1)
@@ -431,10 +479,15 @@ def detect_rotations(
     for neg_label in range(1, negative_count + 1):
         if negative_sizes[neg_label] < min_pixels:
             continue
-        neg_mask = negative_labels == neg_label
-        adjacent_positive = np.unique(
-            positive_labels[binary_dilation(neg_mask, structure=structure)]
+        neg_mask: NDArray[np.bool_] = np.asarray(
+            negative_labels == neg_label,
+            dtype=np.bool_,
         )
+        adjacent_mask: NDArray[np.bool_] = np.asarray(
+            binary_dilation(neg_mask, structure=structure),
+            dtype=np.bool_,
+        )
+        adjacent_positive = np.unique(positive_labels[adjacent_mask])
         for pos_label in adjacent_positive:
             if pos_label == 0 or positive_sizes[pos_label] < min_pixels:
                 continue
@@ -462,9 +515,10 @@ def detect_rotations(
 
         negative_ids = [identifier for is_positive, identifier in component if not is_positive]
         positive_ids = [identifier for is_positive, identifier in component if is_positive]
-        detection_mask = np.isin(negative_labels, negative_ids) | np.isin(
-            positive_labels,
-            positive_ids,
+        detection_mask: NDArray[np.bool_] = np.asarray(
+            np.isin(negative_labels, negative_ids)
+            | np.isin(positive_labels, positive_ids),
+            dtype=np.bool_,
         )
         pixel_rows, pixel_columns = np.nonzero(detection_mask)
         center_row = float(np.mean(pixel_rows))

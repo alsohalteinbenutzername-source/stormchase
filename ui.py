@@ -5,6 +5,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import json
+import math
 from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox, ttk
@@ -53,8 +54,11 @@ from radar import (
 )
 from supabase_client import AuthUser, SupabaseClient, SupabaseConfig, SupabaseError
 from tracking import StormCell, StormUpdate, fetch_latest_storm_cells, project_cell_motion
-from calculations import calculate_environment, parse_time
-from stormanalyzer import analyze_storm
+from calculations import (
+    calculate_best_day_window,
+    calculate_manual_storm,
+    nearest_outlook_entry,
+)
 
 
 BACKGROUND = "#101820"
@@ -72,7 +76,7 @@ STORMANALYZER_MAP = "StormAnalyzer outlook map"
 REFLECTIVITY_RADAR = "Reflectivity"
 VELOCITY_RADAR = "Velocity"
 OUTLOOK_EXTENT = (4.0, 16.0, 47.0, 56.0)
-OUTLOOK_DAY_LABELS = tuple(f"Day {day}" for day in range(1, 6))
+OUTLOOK_DAY_LABELS = tuple(f"Day {day}" for day in range(1, 3))
 DWD_WARNING_WMS_URL = "https://maps.dwd.de/geoproxy_warnungen/service/"
 DWD_WARNING_WFS_URL = "https://maps.dwd.de/geoserver/dwd/ows"
 OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
@@ -122,30 +126,29 @@ def calculate_germany_outlook(outlines: tuple[tuple[tuple[float, float], ...], .
 
     points = germany_grid_points(outlines)
     weather = get_germany_grid_weather(points)
+    if len(weather) != len(points):
+        raise RuntimeError(
+            f"Open-Meteo returned {len(weather)} location forecasts for "
+            f"{len(points)} outlook grid points."
+        )
+
     now = datetime.now(ZoneInfo("Europe/Berlin"))
     outlook = []
     for (latitude, longitude), location in zip(points, weather):
         best_by_day: dict[int, dict[str, Any]] = {}
-        for model, first_day, last_day in (("icon_d2", 0, 1), ("icon_eu", 2, 4)):
-            hourly = location[model]
-            for index, time_string in enumerate(hourly["time"]):
-                dt = parse_time(time_string)
-                if dt is None or dt < now:
-                    continue
-                day = (dt.date() - now.date()).days
-                if not first_day <= day <= last_day:
-                    continue
-                try:
-                    result = calculate_environment(hourly, index)
-                    analysis = analyze_storm(
-                        result["cape"], result["high_shear"], result["low_shear"],
-                        result["dewpoint"], result["srh"], result["cin"], result["lcl"],
-                        result["humidity"], result["temperature"], result["lapse"],
-                    )
-                except (TypeError, ValueError, KeyError, IndexError):
-                    continue
-                if day not in best_by_day or analysis["risk"] > best_by_day[day]["risk"]:
-                    best_by_day[day] = {**analysis, "time": dt, "latitude": latitude, "longitude": longitude}
+        hourly = location["icon_d2"]
+        for day in range(2):
+            result = calculate_best_day_window(
+                hourly,
+                now.date() + timedelta(days=day),
+                now,
+            )
+            if result is not None:
+                best_by_day[day] = {
+                    **result,
+                    "latitude": latitude,
+                    "longitude": longitude,
+                }
         outlook.extend({**entry, "day": day} for day, entry in best_by_day.items())
     return outlook, now
 
@@ -701,9 +704,12 @@ class StormRadarApp:
         self._weather_location: tuple[float, float] | None = None
         self._storm_outlook: list[dict[str, Any]] = []
         self._storm_outlook_loading = False
+        self._storm_outlook_error: str | None = None
         self._storm_outlook_loaded_at: datetime | None = None
         self._outlook_day = 0
         self._outlook_metric = "Overall risk"
+        self._outlook_location: tuple[float, float] | None = None
+        self._outlook_location_source: str | None = None
 
         self._build_ui()
         self.lightning_status.set("Blitzortung lightning: connecting")
@@ -945,6 +951,14 @@ class StormRadarApp:
         self.outlook_metric_var.trace_add("write", self._on_outlook_selection_change)
         self.outlook_day_combo.configure(state="disabled")
         self.outlook_metric_combo.configure(state="disabled")
+        self.outlook_load_button = ttk.Button(
+            map_toolbar,
+            text="Load map",
+            width=11,
+            command=self._ensure_storm_outlook,
+            state="disabled",
+        )
+        self.outlook_load_button.pack(side="left", padx=(8, 0))
         ttk.Button(
             map_toolbar,
             text="Zoom +",
@@ -978,6 +992,7 @@ class StormRadarApp:
             padding=(6, 4),
             height=150,
         )
+        self.report_panel = report_panel
         report_panel.grid(row=2, column=0, sticky="ew", padx=8, pady=(8, 2))
         report_panel.grid_propagate(False)
         report_panel.columnconfigure(0, weight=1)
@@ -992,6 +1007,9 @@ class StormRadarApp:
         community_tab.rowconfigure(0, weight=1)
         self.report_notebook.add(details_tab, text="Details")
         self.report_notebook.add(community_tab, text="Community")
+        self.outlook_analysis_tab = ttk.Frame(self.report_notebook)
+        self.report_notebook.add(self.outlook_analysis_tab, text="Outlook analysis")
+        self._build_outlook_analysis_tab()
         self.report_text = tk.Text(
             details_tab,
             height=4,
@@ -1034,6 +1052,259 @@ class StormRadarApp:
         self.weather_detail.trace_add("write", self._render_click_reports)
         self.warning_detail.trace_add("write", self._render_click_reports)
         self._draw_map()
+
+    def _build_outlook_analysis_tab(self) -> None:
+        self.outlook_analysis_tab.columnconfigure(0, weight=1)
+        self.outlook_analysis_tab.rowconfigure(0, weight=1)
+        canvas = tk.Canvas(
+            self.outlook_analysis_tab,
+            bg=PANEL,
+            highlightthickness=0,
+        )
+        scrollbar = ttk.Scrollbar(
+            self.outlook_analysis_tab,
+            orient="vertical",
+            command=canvas.yview,
+        )
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        content = ttk.Frame(canvas, style="Panel.TFrame", padding=10)
+        content_window = canvas.create_window((0, 0), window=content, anchor="nw")
+        content.bind(
+            "<Configure>",
+            lambda _event: canvas.configure(scrollregion=canvas.bbox("all")),
+        )
+        canvas.bind(
+            "<Configure>",
+            lambda event: canvas.itemconfigure(content_window, width=event.width),
+        )
+        canvas.bind(
+            "<MouseWheel>",
+            lambda event: canvas.yview_scroll(-int(event.delta / 120), "units"),
+        )
+
+        coordinates_box = ttk.LabelFrame(
+            content,
+            text="Calculation location",
+            style="Panel.TLabelframe",
+            padding=8,
+        )
+        coordinates_box.pack(fill="x", pady=(0, 10))
+        self.outlook_latitude_input = tk.StringVar()
+        self.outlook_longitude_input = tk.StringVar()
+        ttk.Label(coordinates_box, text="Latitude", style="Panel.TLabel").grid(
+            row=0,
+            column=0,
+            sticky="w",
+            padx=(0, 6),
+        )
+        ttk.Entry(
+            coordinates_box,
+            textvariable=self.outlook_latitude_input,
+            width=14,
+        ).grid(row=0, column=1, sticky="w", padx=(0, 14))
+        ttk.Label(coordinates_box, text="Longitude", style="Panel.TLabel").grid(
+            row=0,
+            column=2,
+            sticky="w",
+            padx=(0, 6),
+        )
+        ttk.Entry(
+            coordinates_box,
+            textvariable=self.outlook_longitude_input,
+            width=14,
+        ).grid(row=0, column=3, sticky="w", padx=(0, 14))
+        ttk.Button(
+            coordinates_box,
+            text="Use coordinates",
+            command=self._set_manual_outlook_location,
+        ).grid(row=0, column=4, sticky="w")
+        self.outlook_location_status = tk.StringVar(
+            value="No device location set. Enter coordinates to show a calculation."
+        )
+        ttk.Label(
+            coordinates_box,
+            textvariable=self.outlook_location_status,
+            style="Status.TLabel",
+        ).grid(row=1, column=0, columnspan=5, sticky="w", pady=(6, 0))
+
+        current_box = ttk.LabelFrame(
+            content,
+            text="Current outlook calculation",
+            style="Panel.TLabelframe",
+            padding=8,
+        )
+        current_box.pack(fill="x", pady=(0, 10))
+        self.outlook_calculation_text = tk.StringVar(
+            value="Enter coordinates or enable device location to show a calculation."
+        )
+        ttk.Label(
+            current_box,
+            textvariable=self.outlook_calculation_text,
+            style="Panel.TLabel",
+            justify="left",
+            wraplength=900,
+        ).pack(anchor="w", fill="x")
+
+        manual_box = ttk.LabelFrame(
+            content,
+            text="Manual environment calculation",
+            style="Panel.TLabelframe",
+            padding=8,
+        )
+        manual_box.pack(fill="x")
+        fields = (
+            ("cape", "CAPE (J/kg)", "2000"),
+            ("cin", "CIN (J/kg)", "-50"),
+            ("temperature", "Temperature (°C)", "30"),
+            ("dewpoint", "Dewpoint (°C)", "18"),
+            ("humidity", "Humidity (%)", "70"),
+            ("snowfall", "Snowfall (cm/hour)", "0"),
+            ("precipitation", "Precipitation (mm/hour)", "0"),
+            ("wind_speed", "Surface wind (km/h)", "15"),
+            ("srh", "SRH (m²/s²)", "150"),
+            ("high_shear", "Deep layer shear (kt)", "35"),
+            ("low_shear", "Low level shear (kt)", "20"),
+            ("lapse", "Lapse rate (°C/km)", "6.5"),
+            ("lcl", "LCL (m)", "1000"),
+            ("coverage", "Coverage (0–100)", "100"),
+        )
+        self.manual_outlook_inputs: dict[str, tk.StringVar] = {}
+        for index, (key, label, default) in enumerate(fields):
+            row = index // 2
+            column = (index % 2) * 2
+            value = tk.StringVar(value=default)
+            self.manual_outlook_inputs[key] = value
+            ttk.Label(manual_box, text=label, style="Panel.TLabel").grid(
+                row=row,
+                column=column,
+                sticky="w",
+                padx=(0, 6),
+                pady=3,
+            )
+            ttk.Entry(manual_box, textvariable=value, width=12).grid(
+                row=row,
+                column=column + 1,
+                sticky="ew",
+                padx=(0, 14),
+                pady=3,
+            )
+        manual_box.columnconfigure(1, weight=1)
+        manual_box.columnconfigure(3, weight=1)
+        ttk.Button(
+            manual_box,
+            text="Calculate manual risk",
+            command=self._calculate_manual_outlook,
+        ).grid(row=7, column=0, columnspan=4, sticky="w", pady=(8, 4))
+        self.manual_outlook_result = tk.StringVar(
+            value="Enter environmental values and calculate a manual storm-risk assessment."
+        )
+        ttk.Label(
+            manual_box,
+            textvariable=self.manual_outlook_result,
+            style="Panel.TLabel",
+            justify="left",
+            wraplength=900,
+        ).grid(row=8, column=0, columnspan=4, sticky="ew", pady=(4, 0))
+
+    def _set_manual_outlook_location(self) -> None:
+        try:
+            latitude = float(self.outlook_latitude_input.get())
+            longitude = float(self.outlook_longitude_input.get())
+        except ValueError:
+            self.outlook_location_status.set("Enter numeric latitude and longitude.")
+            return
+        if (
+            not math.isfinite(latitude)
+            or not math.isfinite(longitude)
+            or not (-90 <= latitude <= 90 and -180 <= longitude <= 180)
+        ):
+            self.outlook_location_status.set(
+                "Latitude must be between -90 and 90; longitude between -180 and 180."
+            )
+            return
+
+        self._outlook_location_source = "manual"
+        self.outlook_location_status.set(
+            f"Using manual coordinates: {latitude:.4f}, {longitude:.4f}"
+        )
+        self._show_outlook_calculation(latitude, longitude)
+        if self.map_mode == STORMANALYZER_MAP:
+            self._draw_map()
+
+    def _clear_outlook_calculation(self, message: str) -> None:
+        self._outlook_location = None
+        self.outlook_calculation_text.set(message)
+
+    def _calculate_manual_outlook(self) -> None:
+        try:
+            values = {
+                key: float(value.get())
+                for key, value in self.manual_outlook_inputs.items()
+            }
+        except ValueError:
+            self.manual_outlook_result.set("Calculation error: enter a valid number in every field.")
+            return
+        if not all(math.isfinite(value) for value in values.values()):
+            self.manual_outlook_result.set("Calculation error: all values must be finite numbers.")
+            return
+
+        try:
+            analysis = calculate_manual_storm(values)
+        except ValueError as error:
+            self.manual_outlook_result.set(f"Calculation error: {error}")
+            return
+
+        threats = ", ".join(analysis["threats"]) or "No specific severe-weather threats indicated"
+        criticism = "\n".join(analysis["criticism"]) or "No additional assessment notes."
+        self.manual_outlook_result.set(
+            f"MANUAL RESULT · Overall risk {analysis['risk']}/50 · {analysis['category']}\n"
+            f"Storm type: {analysis['storm_type']}\n"
+            f"Tornado {analysis['tornado']}/40 · Hail {analysis['hail']}/40 · "
+            f"Wind {analysis['wind']}/40 · Supercell {analysis['supercell']}/20 · "
+            f"MCS {analysis['mcs']}/20\n"
+            f"Threats: {threats}\n"
+            f"Issued: {analysis['issued']}\n"
+            f"Assessment:\n{criticism}\n"
+            "Snowfall, precipitation, and surface wind are shown as context; "
+            "the severe-thunderstorm score uses the other environmental inputs."
+        )
+
+    def _show_outlook_calculation(self, latitude: float, longitude: float) -> None:
+        self._outlook_location = (longitude, latitude)
+        entry = nearest_outlook_entry(
+            self._storm_outlook,
+            self._outlook_day,
+            latitude,
+            longitude,
+        )
+        if entry is None:
+            self.outlook_calculation_text.set(
+                f"No calculation is available for Day {self._outlook_day + 1} at "
+                f"{latitude:.2f}° N, {longitude:.2f}° E yet."
+            )
+            return
+
+        environment = entry["environment"]
+        threats = ", ".join(entry["threats"]) or "No specific severe-weather threats indicated"
+        criticism = "\n".join(entry["criticism"]) or "No additional assessment notes."
+        self.outlook_calculation_text.set(
+            f"Day {self._outlook_day + 1} · nearest forecast grid point "
+            f"{entry['latitude']:.2f}° N, {entry['longitude']:.2f}° E · {entry['time']}\n"
+            f"Selected location: {latitude:.2f}° N, {longitude:.2f}° E\n"
+            f"Overall risk: {entry['risk']}/50 · {entry['category']} · {entry['storm_type']}\n"
+            f"CAPE {environment['cape']} J/kg · CIN {environment['cin']} J/kg · "
+            f"LCL {environment['lcl']} m · Lapse {environment['lapse']} °C/km\n"
+            f"Temperature {environment['temperature']} °C · "
+            f"Dewpoint {environment['dewpoint']} °C · Humidity {environment['humidity']}%\n"
+            f"SRH {environment['srh']} m²/s² · Deep shear {environment['high_shear']} kt · "
+            f"Low-level shear {environment['low_shear']} kt\n"
+            f"Tornado {entry['tornado']}/40 · Hail {entry['hail']}/40 · "
+            f"Wind {entry['wind']}/40 · Supercell {entry['supercell']}/20 · "
+            f"MCS {entry['mcs']}/20\n"
+            f"Threats: {threats}\nIssued: {entry['issued']}\nAssessment:\n{criticism}"
+        )
 
     def _on_radar_product_change(self, *_args: Any) -> None:
         self.radar_product = self.radar_product_var.get()
@@ -1817,26 +2088,72 @@ class StormRadarApp:
                     composite_risk = np.asarray([entry["risk"] for entry in entries], dtype=float)
                     risk_factor = np.clip(composite_risk / 50.0, 0.0, 1.0)
                     scores = scores * risk_factor
-                triangulation = Triangulation(longitudes, latitudes)
+                triangulation = Triangulation(longitudes, latitudes) if len(entries) >= 3 else None
 
                 if metric_key == "risk":
-                    score_levels = (*OVERALL_LEVELS, 51)
-                    level_colors = OUTLOOK_COLORS[1:]
+                    score_levels = (-1, *OVERALL_LEVELS, 51)
+                    level_colors = ("#ffffff", *OUTLOOK_COLORS[1:])
+                    contour_options: dict[str, Any] = {
+                        "hatches": ("///", "", "", "", "", ""),
+                    }
                 else:
                     tiers = THREAT_PROBABILITIES[self._outlook_metric]
                     score_levels = tuple(score for score, _ in tiers) + (41,)
                     level_colors = OUTLOOK_COLORS
+                    contour_options = {}
 
-                if scores.size and np.nanmax(scores) >= score_levels[0]:
+                if (
+                    scores.size
+                    and np.nanmax(scores) >= score_levels[0]
+                    and triangulation is not None
+                ):
                     refined_triangulation, refined_scores = UniformTriRefiner(triangulation).refine_field(scores, subdiv=4)
                     contour = self.axes.tricontourf(
                         refined_triangulation,
                         refined_scores,
                         levels=score_levels,
                         colors=level_colors,
+                        **contour_options,
                         alpha=0.78,
                         zorder=3,
                     )
+                elif len(entries) < 3:
+                    self.axes.text(
+                        0.5,
+                        0.5,
+                        f"Not enough valid grid points to render {self.outlook_day_var.get()}.",
+                        transform=self.axes.transAxes,
+                        ha="center",
+                        va="center",
+                        color="#263238",
+                        bbox={"facecolor": "white", "edgecolor": "#9aa6aa", "alpha": 0.92},
+                        zorder=8,
+                    )
+                elif metric_key != "risk":
+                    self.axes.text(
+                        0.5,
+                        0.5,
+                        f"No elevated {self._outlook_metric.lower()} tier forecast for "
+                        f"{self.outlook_day_var.get()}.",
+                        transform=self.axes.transAxes,
+                        ha="center",
+                        va="center",
+                        color="#263238",
+                        bbox={"facecolor": "white", "edgecolor": "#9aa6aa", "alpha": 0.92},
+                        zorder=8,
+                    )
+            else:
+                self.axes.text(
+                    0.5,
+                    0.5,
+                    f"No complete forecast data available for {self.outlook_day_var.get()}.",
+                    transform=self.axes.transAxes,
+                    ha="center",
+                    va="center",
+                    color="#263238",
+                    bbox={"facecolor": "white", "edgecolor": "#9aa6aa", "alpha": 0.92},
+                    zorder=8,
+                )
         if outlook_mode:
             for outline in self.outlook_boundaries:
                 self.axes.plot(
@@ -1856,7 +2173,72 @@ class StormRadarApp:
                     alpha=0.98,
                     zorder=5,
                 )
+            if self._outlook_location is not None:
+                longitude, latitude = self._outlook_location
+                self.axes.scatter(
+                    [longitude],
+                    [latitude],
+                    marker="D",
+                    s=52,
+                    color="#1687ff",
+                    edgecolors="white",
+                    linewidths=1.2,
+                    zorder=7,
+                )
             self._draw_outlook_legend()
+            if self._storm_outlook_loading:
+                self.axes.text(
+                    0.5,
+                    0.5,
+                    "Loading the two-day outlook grid.\nThis may take several minutes due to API rate limits.",
+                    transform=self.axes.transAxes,
+                    ha="center",
+                    va="center",
+                    color="#263238",
+                    bbox={"facecolor": "white", "edgecolor": "#9aa6aa", "alpha": 0.92},
+                    zorder=8,
+                )
+            elif self._storm_outlook_error:
+                self.axes.text(
+                    0.5,
+                    0.5,
+                    f"Outlook unavailable: {self._storm_outlook_error}",
+                    transform=self.axes.transAxes,
+                    ha="center",
+                    va="center",
+                    color="#8b1e1e",
+                    wrap=True,
+                    bbox={"facecolor": "white", "edgecolor": "#9aa6aa", "alpha": 0.96},
+                    zorder=8,
+                )
+        elif outlook_mode:
+            if self._storm_outlook_loading:
+                message = (
+                    "Loading the two-day outlook grid.\n"
+                    "This may take several minutes due to API rate limits."
+                )
+                color = "#263238"
+            elif self._storm_outlook_error:
+                message = f"Outlook unavailable: {self._storm_outlook_error}"
+                color = "#8b1e1e"
+            elif self._storm_outlook_loaded_at is None:
+                message = "Click Load map to fetch the two-day outlook."
+                color = "#263238"
+            else:
+                message = "No complete forecast data is available for this outlook."
+                color = "#263238"
+            self.axes.text(
+                0.5,
+                0.5,
+                message,
+                transform=self.axes.transAxes,
+                ha="center",
+                va="center",
+                color=color,
+                wrap=True,
+                bbox={"facecolor": "white", "edgecolor": "#9aa6aa", "alpha": 0.96},
+                zorder=8,
+            )
         radar_frame = (
             self.velocity_radar_frame
             if self.radar_product == VELOCITY_RADAR
@@ -2225,8 +2607,31 @@ class StormRadarApp:
         outlook_controls_state = "readonly" if self.map_mode == STORMANALYZER_MAP else "disabled"
         self.outlook_day_combo.configure(state=outlook_controls_state)
         self.outlook_metric_combo.configure(state=outlook_controls_state)
+        self._update_outlook_load_button()
         if self.map_mode == STORMANALYZER_MAP:
-            self._ensure_storm_outlook()
+            self.report_panel.configure(height=260)
+            self.report_notebook.select(self.outlook_analysis_tab)
+            if self._has_device_fix and self.location is not None:
+                self._outlook_location_source = "device"
+                self.outlook_location_status.set("Using current device location.")
+                self.outlook_latitude_input.set(f"{self.location.latitude:.4f}")
+                self.outlook_longitude_input.set(f"{self.location.longitude:.4f}")
+                self._show_outlook_calculation(
+                    self.location.latitude,
+                    self.location.longitude,
+                )
+            elif self._outlook_location_source == "manual" and self._outlook_location is not None:
+                longitude, latitude = self._outlook_location
+                self._show_outlook_calculation(latitude, longitude)
+            else:
+                self._outlook_location_source = None
+                self._clear_outlook_calculation(
+                    "No device location set. Enter coordinates above to show a calculation."
+                )
+        else:
+            self.report_panel.configure(height=150)
+            if self.report_notebook.select() == str(self.outlook_analysis_tab):
+                self.report_notebook.select(0)
         if self.map_mode != DWD_WARNING_MAP:
             self._warning_click_request_id += 1
             self._warning_requested_key = None
@@ -2241,18 +2646,25 @@ class StormRadarApp:
     def _on_outlook_selection_change(self, *_args: Any) -> None:
         self._outlook_day = OUTLOOK_DAY_LABELS.index(self.outlook_day_var.get())
         self._outlook_metric = self.outlook_metric_var.get()
+        if self._outlook_location is not None:
+            self._show_outlook_calculation(
+                self._outlook_location[1],
+                self._outlook_location[0],
+            )
         if self.map_mode == STORMANALYZER_MAP:
             self._draw_map()
 
     def _ensure_storm_outlook(self) -> None:
         if self._storm_outlook_loading:
             return
-        if (
-            self._storm_outlook_loaded_at is not None
-            and (datetime.now(ZoneInfo("Europe/Berlin")) - self._storm_outlook_loaded_at).total_seconds() < 3600
-        ):
-            return
         self._storm_outlook_loading = True
+        self._storm_outlook_error = None
+        self._update_outlook_load_button()
+        point_count = len(germany_grid_points(self.germany_outline))
+        self.status.set(
+            f"Loading the two-day StormAnalyzer outlook for {point_count} grid points; "
+            "this may take several minutes."
+        )
         self._draw_map()
         self.loop.create_task(self._load_storm_outlook())
 
@@ -2263,16 +2675,47 @@ class StormRadarApp:
             )
         except Exception as error:
             self._storm_outlook_loading = False
-            self.status.set("StormAnalyzer Germany outlook could not be loaded.")
+            self._storm_outlook_error = f"{type(error).__name__}: {error}"
+            self._update_outlook_load_button()
+            self.status.set(f"StormAnalyzer Germany outlook unavailable: {self._storm_outlook_error}")
+            if self._outlook_location is not None:
+                self.outlook_calculation_text.set(
+                    f"StormAnalyzer outlook calculation unavailable: "
+                    f"{self._storm_outlook_error}"
+                )
             if self.map_mode == STORMANALYZER_MAP:
                 self._draw_map()
             return
         self._storm_outlook = outlook
         self._storm_outlook_loaded_at = issued_at
         self._storm_outlook_loading = False
+        self._storm_outlook_error = None
+        self._update_outlook_load_button()
         self.status.set(f"StormAnalyzer Germany grid updated {issued_at:%H:%M} CET/CEST.")
+        if self._outlook_location is not None:
+            self._show_outlook_calculation(
+                self._outlook_location[1],
+                self._outlook_location[0],
+            )
         if self.map_mode == STORMANALYZER_MAP:
             self._draw_map()
+
+    def _update_outlook_load_button(self) -> None:
+        if self._storm_outlook_loading:
+            text = "Loading..."
+        elif self._storm_outlook_error:
+            text = "Retry load"
+        elif self._storm_outlook_loaded_at is not None:
+            text = "Refresh map"
+        else:
+            text = "Load map"
+
+        state = (
+            "normal"
+            if self.map_mode == STORMANALYZER_MAP and not self._storm_outlook_loading
+            else "disabled"
+        )
+        self.outlook_load_button.configure(text=text, state=state)
 
     def _schedule_warning_refresh(self) -> None:
         if self._closed or self.map_mode != DWD_WARNING_MAP:
@@ -3022,6 +3465,15 @@ class StormRadarApp:
             f"Tracking · ±{location.accuracy_meters:.0f} m · "
             f"{location.latitude:.4f}, {location.longitude:.4f}"
         )
+        if (
+            self.map_mode == STORMANALYZER_MAP
+            and self._outlook_location_source in (None, "device")
+        ):
+            self._outlook_location_source = "device"
+            self.outlook_location_status.set("Using current device location.")
+            self.outlook_latitude_input.set(f"{location.latitude:.4f}")
+            self.outlook_longitude_input.set(f"{location.longitude:.4f}")
+            self._show_outlook_calculation(location.latitude, location.longitude)
         self._center_on_location(location, initial=initial)
         self._draw_map()
 
@@ -3046,6 +3498,14 @@ class StormRadarApp:
         self.location_status.set("Location tracking stopped")
         self.location = None
         self._has_device_fix = False
+        if self._outlook_location_source == "device":
+            self._outlook_location_source = None
+            self.outlook_location_status.set(
+                "Device location stopped. Enter coordinates to show a calculation."
+            )
+            self._clear_outlook_calculation(
+                "No device location set. Enter coordinates above to show a calculation."
+            )
         self._draw_map()
 
     def _close(self) -> None:

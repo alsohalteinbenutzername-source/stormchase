@@ -46,6 +46,19 @@ An internet connection and a valid Windows certificate store are required. If a
 data refresh fails, the status bar shows the error and the last successfully
 loaded map remains visible.
 
+The **StormAnalyzer outlook** includes an **Outlook analysis** panel below the
+map. When device location is enabled, the forecast calculation follows your
+current location. Otherwise, enter latitude and longitude in the panel to show
+one. Scroll within the panel to run a manual storm-risk calculation using the
+same StormAnalyzer scoring.
+The two-day risk map evaluates all 744 grid points across its displayed extent
+using ICON-D2. Days 3–5 are not included, avoiding the additional ICON-EU grid
+requests. Click **Load map** to fetch the outlook; opening the Outlook view does
+not make a forecast request. Initial loading can take several minutes due to
+upstream request pacing; loading and errors are shown on the map. Use **Refresh
+map** to request updated data. Very-low overall-risk areas are hatched, while a
+threat map with no qualifying areas reports that no elevated tier was forecast.
+
 Blitzortung / LightningMaps community-network lightning strokes appear as
 yellow plus markers for up to 15 minutes on the live and DWD warning maps.
 StormChase connects to the lightning feed locally while it is running. The

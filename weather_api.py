@@ -293,7 +293,7 @@ def _request_hourly(url, request_params):
 
 
 def get_germany_grid_weather(locations):
-    """Fetch ICON-D2 and ICON-EU hourly data for outlook points in paced batches."""
+    """Fetch ICON-D2 hourly data for outlook points in paced batches."""
     if not locations:
         return []
 
@@ -312,7 +312,7 @@ def get_germany_grid_weather(locations):
     batch_interval = 60.0 / max_batches_per_minute + 2.0
     network_request_index = 0
     payload_by_model = {}
-    for model, forecast_days in (("icon_d2", 2), ("icon_eu", 5)):
+    for model, forecast_days in (("icon_d2", 2),):
         model_payload = []
         for batch in batches:
             request_params = {

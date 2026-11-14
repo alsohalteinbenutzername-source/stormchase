@@ -1,11 +1,9 @@
 import math
-from datetime import datetime
+from collections.abc import Mapping
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 from stormanalyzer import analyze_snowstorm, analyze_storm
-
-
-print("CALCULATIONS FILE LOADED")
 
 
 GERMANY_TZ = ZoneInfo(
@@ -471,6 +469,132 @@ def calculate_environment(
     }
 
 
+def calculate_manual_storm(values: Mapping[str, float]) -> dict:
+    fields = (
+        "cape",
+        "high_shear",
+        "low_shear",
+        "dewpoint",
+        "srh",
+        "cin",
+        "lcl",
+        "humidity",
+        "temperature",
+        "lapse",
+        "coverage",
+    )
+    parameters = {}
+    for field in fields:
+        try:
+            value = float(values[field])
+        except KeyError as error:
+            raise ValueError(f"Missing manual input: {field}.") from error
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"Manual input {field} must be a number.") from error
+        if not math.isfinite(value):
+            raise ValueError(f"Manual input {field} must be finite.")
+        parameters[field] = value
+
+    return analyze_storm(
+        parameters["cape"],
+        parameters["high_shear"],
+        parameters["low_shear"],
+        parameters["dewpoint"],
+        parameters["srh"],
+        parameters["cin"],
+        parameters["lcl"],
+        parameters["humidity"],
+        parameters["temperature"],
+        parameters["lapse"],
+        parameters["coverage"],
+    )
+
+
+def nearest_outlook_entry(
+    outlook: list[dict],
+    day: int,
+    latitude: float,
+    longitude: float,
+) -> dict | None:
+    candidates = [
+        entry
+        for entry in outlook
+        if entry.get("day") == day and isinstance(entry.get("environment"), dict)
+    ]
+    if not candidates:
+        return None
+    return min(
+        candidates,
+        key=lambda entry: (
+            (entry["latitude"] - latitude) ** 2
+            + ((entry["longitude"] - longitude) * math.cos(math.radians(latitude))) ** 2
+        ),
+    )
+
+
+def _has_required_environment_data(hourly, index):
+    required_variables = (
+        "cape",
+        "temperature_2m",
+        "dew_point_2m",
+        "relative_humidity_2m",
+        "temperature_700hPa",
+        "temperature_500hPa",
+        "wind_speed_10m",
+        "wind_direction_10m",
+        "wind_speed_925hPa",
+        "wind_direction_925hPa",
+        "wind_speed_850hPa",
+        "wind_direction_850hPa",
+        "wind_speed_700hPa",
+        "wind_direction_700hPa",
+        "wind_speed_500hPa",
+        "wind_direction_500hPa",
+    )
+    return all(hourly[variable][index] is not None for variable in required_variables)
+
+
+def calculate_best_day_window(hourly, target_day: date, now: datetime | None = None):
+    current_time = now or datetime.now(GERMANY_TZ)
+    best = None
+    best_score = float("-inf")
+
+    for index, time_string in enumerate(hourly["time"]):
+        dt = parse_time(time_string)
+        if (
+            dt is None
+            or dt.date() != target_day
+            or dt < current_time
+            or not _has_required_environment_data(hourly, index)
+        ):
+            continue
+
+        environment = calculate_environment(hourly, index)
+        analysis = analyze_storm(
+            environment["cape"],
+            environment["high_shear"],
+            environment["low_shear"],
+            environment["dewpoint"],
+            environment["srh"],
+            environment["cin"],
+            environment["lcl"],
+            environment["humidity"],
+            environment["temperature"],
+            environment["lapse"],
+            environment.get("coverage", 50),
+        )
+        if analysis["risk"] > best_score:
+            best_score = analysis["risk"]
+            best = {
+                **analysis,
+                "environment": environment,
+                "time": dt,
+                "selection_score": best_score,
+            }
+
+    return best
+
+
 
 def calculate_timeline(
     hourly
@@ -488,6 +612,9 @@ def calculate_timeline(
     for i in range(
         len(times)
     ):
+
+        if not _has_required_environment_data(hourly, i):
+            continue
 
         result = calculate_environment(
             hourly,
@@ -725,6 +852,9 @@ def calculate_best_window(
 
         if dt < now:
 
+            continue
+
+        if not _has_required_environment_data(hourly, i):
             continue
 
         result = calculate_environment(

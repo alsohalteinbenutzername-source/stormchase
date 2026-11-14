@@ -176,7 +176,7 @@ def generate_storm_forecast(outlook_areas):
 
         forecast_lines.append(
             f"A {risk} risk has been issued for "
-            f"Schweinfurt mainly for {threat_text}."
+            f"this area of interest mainly for {threat_text}."
         )
 
     if not forecast_lines:
