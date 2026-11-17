@@ -51,6 +51,7 @@ from radar import (
     fetch_latest_radar,
     fetch_latest_velocity_radar,
     nearest_velocity_radar_site,
+    project_rain_cell_direction,
 )
 from supabase_client import AuthUser, SupabaseClient, SupabaseConfig, SupabaseError
 from tracking import StormCell, StormUpdate, fetch_latest_storm_cells, project_cell_motion
@@ -833,7 +834,7 @@ class StormRadarApp:
         self.weather_detail = tk.StringVar()
         self.warning_detail = tk.StringVar()
         self.cell_detail = tk.StringVar()
-        self.auth_status = tk.StringVar(value="Sign in to file reports")
+        self.auth_status = tk.StringVar(value="Set a report username")
         self.latitude_input = tk.StringVar()
         self.longitude_input = tk.StringVar()
 
@@ -842,7 +843,7 @@ class StormRadarApp:
         ttk.Label(header, text="STORMCHASE", style="Title.TLabel").pack(side="left")
         self.auth_button = ttk.Button(
             header,
-            text="Sign in",
+            text="Set username",
             command=self._on_auth_button,
         )
         self.auth_button.pack(side="right", pady=(5, 0), padx=(8, 0))
@@ -1429,7 +1430,11 @@ class StormRadarApp:
             )
             reports_future = (
                 self.loop.run_in_executor(self.executor, client.recent_reports)
-                if client is not None and self.auth_user is not None
+                if (
+                    client is not None
+                    and self.auth_user is not None
+                    and self.auth_user.username is not None
+                )
                 else None
             )
 
@@ -1507,7 +1512,11 @@ class StormRadarApp:
                 else:
                     wind_error = None
 
-            if reports_future is not None and self.auth_user is not None:
+            if (
+                reports_future is not None
+                and self.auth_user is not None
+                and self.auth_user.username is not None
+            ):
                 reports_result = await asyncio.gather(
                     reports_future,
                     return_exceptions=True,
@@ -1684,10 +1693,10 @@ class StormRadarApp:
             )
         except Exception as error:
             self.status.set(
-                f"Could not restore sign-in: {type(error).__name__}: {error}"
+                f"Could not restore reporter identity: {type(error).__name__}: {error}"
             )
             self.auth_user = None
-            restore_warning = f"Sign-in restore failed: {type(error).__name__}"
+            restore_warning = f"Identity restore failed: {type(error).__name__}"
         else:
             self.auth_user = user
             if client.session_persistence_error:
@@ -1698,11 +1707,11 @@ class StormRadarApp:
         if restore_warning is not None:
             self.auth_status.set(restore_warning)
         elif client.session_persistence_error:
-            self.auth_status.set("Session storage failed")
+            self.auth_status.set("Reporter identity storage failed")
         elif client.session_restore_notice:
-            self.auth_status.set("Saved session expired · sign in again")
+            self.auth_status.set("Reporter identity needs to be set again")
         self._render_community_reports()
-        if self.auth_user is not None:
+        if self.auth_user is not None and self.auth_user.username is not None:
             self.refresh_data()
 
     def _refresh_auth_controls(self) -> None:
@@ -1711,14 +1720,22 @@ class StormRadarApp:
         if self.supabase is None:
             self.auth_status.set("Supabase not configured")
         else:
+            username = self.auth_user.username if self.auth_user is not None else None
             self.auth_status.set(
-                self.auth_user.username
-                if self.auth_user is not None
-                else "Sign in to file reports"
+                f"Reporter: {username}" if username else "Set a report username"
             )
         self.auth_button.configure(
-            text="Sign out" if self.auth_user is not None else "Sign in",
-            state="normal" if self.supabase is not None else "disabled",
+            text=(
+                f"Reporter: {self.auth_user.username}"
+                if self.auth_user is not None and self.auth_user.username is not None
+                else "Set username"
+            ),
+            state=(
+                "disabled"
+                if self.supabase is None
+                or (self.auth_user is not None and self.auth_user.username is not None)
+                else "normal"
+            ),
         )
         eligible_cell = isinstance(self.selected_cell, StormCell)
         self.file_report_button_widget.configure(
@@ -1741,29 +1758,8 @@ class StormRadarApp:
             self._render_community_reports()
 
     def _on_auth_button(self) -> None:
-        if self.auth_user is None:
+        if self.auth_user is None or self.auth_user.username is None:
             self._open_auth_dialog()
-            return
-        if messagebox.askyesno(
-            "Sign out",
-            f"Sign out {self.auth_user.username}?",
-            parent=self.root,
-        ):
-            self.loop.create_task(self._sign_out())
-
-    async def _sign_out(self) -> None:
-        client = self.supabase
-        if client is None:
-            return
-        try:
-            await self.loop.run_in_executor(self.executor, client.sign_out)
-        except Exception as error:
-            self.status.set(f"Sign-out failed: {type(error).__name__}: {error}")
-        finally:
-            self.auth_user = None
-            self.community_reports = ()
-            self._refresh_auth_controls()
-            self._render_community_reports()
 
     def _open_auth_dialog(self) -> None:
         if self.supabase is None:
@@ -1774,7 +1770,7 @@ class StormRadarApp:
             )
             return
         dialog = tk.Toplevel(self.root)
-        dialog.title("StormChase sign in")
+        dialog.title("Set report username")
         dialog.transient(self.root)
         dialog.resizable(False, False)
         dialog.grab_set()
@@ -1783,81 +1779,62 @@ class StormRadarApp:
         ttk.Label(frame, text="Username").grid(row=0, column=0, sticky="w", pady=4)
         username_entry = ttk.Entry(frame, width=36)
         username_entry.grid(row=0, column=1, sticky="ew", pady=4)
-        ttk.Label(frame, text="Password").grid(row=1, column=0, sticky="w", pady=4)
-        password_entry = ttk.Entry(frame, width=36, show="•")
-        password_entry.grid(row=1, column=1, sticky="ew", pady=4)
-        status_text = tk.StringVar(value="")
+        status_text = tk.StringVar(
+            value=(
+                "3–24 letters, numbers, or underscores. This name is permanent "
+                "for this device and cannot be recovered if its saved identity is lost."
+            )
+        )
         ttk.Label(
             frame,
             textvariable=status_text,
             wraplength=320,
             justify="left",
-        ).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 4))
+        ).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 4))
 
-        def start_auth(sign_up: bool) -> None:
-            for button in (sign_in_button, sign_up_button):
-                button.configure(state="disabled")
+        def save_username() -> None:
+            save_button.configure(state="disabled")
             dialog.protocol("WM_DELETE_WINDOW", lambda: None)
             self.loop.create_task(
-                self._authenticate(
+                self._set_reporter_username(
                     username_entry.get(),
-                    password_entry.get(),
-                    sign_up,
                     dialog,
                     status_text,
-                    sign_in_button,
-                    sign_up_button,
+                    save_button,
                 )
             )
 
-        sign_in_button = ttk.Button(
+        save_button = ttk.Button(
             frame,
-            text="Sign in",
-            command=lambda: start_auth(False),
+            text="Save username",
+            command=save_username,
         )
-        sign_in_button.grid(row=3, column=0, sticky="ew", pady=(6, 0), padx=(0, 4))
-        sign_up_button = ttk.Button(
-            frame,
-            text="Create account",
-            command=lambda: start_auth(True),
-        )
-        sign_up_button.grid(row=3, column=1, sticky="ew", pady=(6, 0), padx=(4, 0))
+        save_button.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         frame.columnconfigure(1, weight=1)
         username_entry.focus_set()
 
-    async def _authenticate(
+    async def _set_reporter_username(
         self,
         username: str,
-        password: str,
-        sign_up: bool,
         dialog: tk.Toplevel,
         status_text: tk.StringVar,
-        sign_in_button: ttk.Button,
-        sign_up_button: ttk.Button,
+        save_button: ttk.Button,
     ) -> None:
         client = self.supabase
         if client is None:
             return
         try:
-            if sign_up:
-                user = await self.loop.run_in_executor(
-                    self.executor,
-                    client.sign_up,
-                    username,
-                    password,
-                )
-            else:
-                user = await self.loop.run_in_executor(
-                    self.executor,
-                    client.sign_in,
-                    username,
-                    password,
-                )
+            user = await self.loop.run_in_executor(
+                self.executor,
+                client.set_reporter_username,
+                username,
+            )
         except Exception as error:
             status_text.set(f"{type(error).__name__}: {error}")
-            self.status.set(f"Authentication failed: {type(error).__name__}: {error}")
-            sign_in_button.configure(state="normal")
-            sign_up_button.configure(state="normal")
+            self.status.set(
+                f"Could not set reporter identity: {type(error).__name__}: {error}"
+            )
+            save_button.configure(state="normal")
             dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
             return
 
@@ -1865,29 +1842,38 @@ class StormRadarApp:
         self._refresh_auth_controls()
         if client.session_persistence_error:
             self.status.set(client.session_persistence_error)
-            self.auth_status.set("Signed in · session not saved")
         else:
-            self.status.set(f"Signed in as {user.username}.")
+            self.status.set(f"Reports will be filed as {user.username}.")
         self._render_community_reports()
         if dialog.winfo_exists():
             dialog.grab_release()
             dialog.destroy()
+        try:
+            self.community_reports = await self.loop.run_in_executor(
+                self.executor,
+                client.recent_reports,
+            )
+        except Exception as error:
+            self.status.set(
+                f"Username saved, but reports could not load: {type(error).__name__}: {error}"
+            )
         self.refresh_data()
 
     def _render_community_reports(self) -> None:
         if not hasattr(self, "community_report_text"):
             return
-        if self.auth_user is None:
-            content = "Sign in to view community storm reports."
+        if self.auth_user is None or self.auth_user.username is None:
+            content = "Set a report username to view and file community storm reports."
         elif not self.community_reports:
             content = "No community reports have been filed yet."
         else:
             entries = []
             for report in self.community_reports:
                 created_at = report.get("created_at", "time unavailable")
+                username = report.get("reporter_username", "unknown reporter")
                 cell_id = report.get("cell_id", "unknown cell")
                 body = report.get("report", "")
-                entries.append(f"{created_at} · {cell_id}\n{body}")
+                entries.append(f"{username} · {created_at} · {cell_id}\n{body}")
             content = "\n\n".join(entries)
         self.community_report_text.configure(state="normal")
         self.community_report_text.delete("1.0", tk.END)
@@ -2420,7 +2406,30 @@ class StormRadarApp:
                 for point in cell.track
             ]
             if len(path) > 1:
-                self._draw_movement_track(path, "#72f1cf", linewidth=1.5)
+                self._draw_movement_track(
+                    path,
+                    "#72f1cf",
+                    linewidth=1.5,
+                    arrow=False,
+                )
+                projected_position = project_rain_cell_direction(
+                    cell.track,
+                    (cell.latitude, cell.longitude),
+                )
+                if projected_position is not None:
+                    self.axes.annotate(
+                        "",
+                        xy=(projected_position[1], projected_position[0]),
+                        xytext=(cell.longitude, cell.latitude),
+                        arrowprops={
+                            "arrowstyle": "-|>",
+                            "color": "#72f1cf",
+                            "linewidth": 1.5,
+                            "mutation_scale": 11,
+                            "shrinkA": 8,
+                        },
+                        zorder=6,
+                    )
 
         if self.map_mode == LIVE_MAP and self.rain_cells:
             self._rain_artist = self.axes.scatter(
@@ -2793,10 +2802,10 @@ class StormRadarApp:
                 parent=self.root,
             )
             return
-        if self.auth_user is None:
+        if self.auth_user is None or self.auth_user.username is None:
             messagebox.showinfo(
-                "Sign in required",
-                "Sign in to file a community storm report.",
+                "Set a reporter username",
+                "Set your username once to file a community storm report.",
                 parent=self.root,
             )
             self._open_auth_dialog()
@@ -2849,8 +2858,12 @@ class StormRadarApp:
         if not report or len(report) > 2000:
             status_text.set("Enter a report between 1 and 2000 characters.")
             return
-        if self.supabase is None or self.auth_user is None:
-            status_text.set("Sign in is required to submit a report.")
+        if self.supabase is None:
+            status_text.set("Supabase is required to submit a report.")
+            return
+        if self.auth_user is None or self.auth_user.username is None:
+            status_text.set("Set your report username first.")
+            self._open_auth_dialog()
             return
         submit_button.configure(state="disabled")
         dialog.protocol("WM_DELETE_WINDOW", lambda: None)
@@ -3139,14 +3152,7 @@ class StormRadarApp:
                 nearest_velocity_radar_site(latitude, longitude)
             )
         self._weather_location = (longitude, latitude)
-        self._weather_request_id += 1
-        weather_request_id = self._weather_request_id
-        self.weather_detail.set(
-            f"Loading ICON-D2 nowcast for {latitude:.4f}° N, {longitude:.4f}° E…"
-        )
-        self.loop.create_task(
-            self._load_point_nowcast(weather_request_id, latitude, longitude)
-        )
+        self.weather_detail.set("Point nowcast is disabled to conserve API limits.")
         if self.map_mode == DWD_WARNING_MAP:
             self._warning_click_request_id += 1
             warning_request_id = self._warning_click_request_id

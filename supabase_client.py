@@ -28,17 +28,16 @@ from tracking import StormCell, StormUpdate
 
 RADAR_BUCKET = "stormchase-radar"
 KEYRING_SERVICE = "StormChase Supabase"
-USERNAME_AUTH_DOMAIN = "login.stormchase.invalid"
 USERNAME_PATTERN = re.compile(r"[a-z0-9_]{3,24}\Z")
 
 
-def _username_auth_email(username: str) -> tuple[str, str]:
+def _normalized_username(username: str) -> str:
     normalized = username.strip().lower()
     if not USERNAME_PATTERN.fullmatch(normalized):
         raise ValueError(
             "Username must be 3–24 characters and contain only letters, numbers, or underscores."
         )
-    return normalized, f"{normalized}@{USERNAME_AUTH_DOMAIN}"
+    return normalized
 
 
 class SupabaseError(RuntimeError):
@@ -47,6 +46,21 @@ class SupabaseError(RuntimeError):
     def __init__(self, message: str, status_code: int | None = None) -> None:
         super().__init__(message)
         self.status_code = status_code
+
+
+def _anonymous_auth_setup_required(error: SupabaseError) -> bool:
+    message = str(error).lower().replace("-", " ")
+    return any(
+        detail in message
+        for detail in (
+            "anonymous sign ins are disabled",
+            "anonymous sign in is disabled",
+            "anonymous signups are disabled",
+            "anonymous sign up is disabled",
+            "signups are disabled",
+            "signups not allowed",
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -106,7 +120,7 @@ class SupabaseConfig:
 @dataclass(frozen=True)
 class AuthUser:
     identifier: str
-    username: str
+    username: str | None
 
 
 @dataclass(frozen=True)
@@ -207,34 +221,29 @@ class SupabaseClient:
         except json.JSONDecodeError as error:
             raise SupabaseError("Supabase returned malformed JSON.") from error
 
-    def _session_payload(self, payload: Any) -> _AuthSession:
+    def _session_payload(
+        self,
+        payload: Any,
+        *,
+        username: str | None = None,
+    ) -> _AuthSession:
         if not isinstance(payload, dict):
             raise SupabaseError("Supabase returned an invalid authentication response.")
         user_payload = payload.get("user")
         if not isinstance(user_payload, dict):
             raise SupabaseError("Supabase did not return a user for this session.")
         identifier = user_payload.get("id")
-        email = user_payload.get("email")
         access_token = payload.get("access_token")
         refresh_token = payload.get("refresh_token")
         expires_in = payload.get("expires_in")
         if (
             not isinstance(identifier, str)
             or not identifier
-            or not isinstance(email, str)
             or not isinstance(access_token, str)
             or not isinstance(refresh_token, str)
             or not isinstance(expires_in, (int, float))
         ):
             raise SupabaseError("Supabase returned incomplete authentication data.")
-        expected_domain = f"@{USERNAME_AUTH_DOMAIN}"
-        if not email.lower().endswith(expected_domain):
-            raise SupabaseError(
-                "This Supabase account is not configured for StormChase username sign-in."
-            )
-        username = email[: -len(expected_domain)].lower()
-        if not USERNAME_PATTERN.fullmatch(username):
-            raise SupabaseError("Supabase returned an invalid StormChase username.")
         return _AuthSession(
             access_token=access_token,
             refresh_token=refresh_token,
@@ -255,7 +264,7 @@ class SupabaseClient:
             keyring.set_password(KEYRING_SERVICE, self.config.url, value)
         except Exception as error:
             self.session_persistence_error = (
-                f"Sign-in succeeded, but Windows secure session storage failed: "
+                f"Windows secure session storage failed: "
                 f"{type(error).__name__}: {error}"
             )
         else:
@@ -268,7 +277,7 @@ class SupabaseClient:
             pass
         except Exception as error:
             self.session_persistence_error = (
-                f"Could not remove the saved sign-in session: "
+                f"Could not remove the saved report identity: "
                 f"{type(error).__name__}: {error}"
             )
 
@@ -286,45 +295,113 @@ class SupabaseClient:
         self._save_session(session)
         return session.user
 
-    def sign_in(self, username: str, password: str) -> AuthUser:
-        _username, auth_email = _username_auth_email(username)
-        if not password:
-            raise ValueError("Enter both a username and password.")
-        payload = self._request(
-            "POST",
-            "/auth/v1/token",
-            query={"grant_type": "password"},
-            payload={"email": auth_email, "password": password},
-        )
-        return self._install_session(payload)
-
-    def sign_up(self, username: str, password: str) -> AuthUser:
-        _username, auth_email = _username_auth_email(username)
-        if len(password) < 8:
-            raise ValueError("Password must contain at least 8 characters.")
-        payload = self._request(
-            "POST",
-            "/auth/v1/signup",
-            payload={"email": auth_email, "password": password},
-        )
-        if not isinstance(payload, dict):
-            raise SupabaseError("Supabase returned an invalid sign-up response.")
-        if payload.get("access_token") and payload.get("refresh_token"):
-            return self._install_session(payload)
-        user_payload = payload.get("user") or payload
-        if isinstance(user_payload, dict) and user_payload.get("id"):
-            raise SupabaseError(
-                "Supabase created the account but did not sign in. "
-                "Disable email confirmation in Supabase Auth to use username-only accounts."
+    def _set_session_user(self, user: AuthUser) -> None:
+        with self._session_lock:
+            session = self._session
+            if session is None or session.user.identifier != user.identifier:
+                raise SupabaseError("The report identity changed during the request.")
+            updated_session = _AuthSession(
+                access_token=session.access_token,
+                refresh_token=session.refresh_token,
+                user=user,
+                expires_at=session.expires_at,
             )
-        raise SupabaseError("Supabase did not return a user for sign-up.")
+            self._session = updated_session
+        self._save_session(updated_session)
+
+    def _load_reporter_profile(self, user: AuthUser) -> AuthUser:
+        try:
+            rows = self._table_rows(
+                "stormchase_profiles",
+                {
+                    "select": "username",
+                    "user_id": f"eq.{user.identifier}",
+                    "limit": "1",
+                },
+                authenticated=True,
+            )
+        except SupabaseError as error:
+            if error.status_code == 401:
+                self._clear_session(
+                    "The saved report identity expired. Without a linked sign-in "
+                    "method, it cannot be recovered."
+                )
+            raise
+        if not rows:
+            updated_user = AuthUser(user.identifier, None)
+        else:
+            username = rows[0].get("username")
+            if (
+                not isinstance(username, str)
+                or not USERNAME_PATTERN.fullmatch(username)
+                or username != username.lower()
+            ):
+                raise SupabaseError("Supabase returned an invalid reporter username.")
+            updated_user = AuthUser(user.identifier, username)
+        self._set_session_user(updated_user)
+        return updated_user
+
+    def ensure_anonymous_session(self) -> AuthUser:
+        user = self.current_user
+        if user is None:
+            try:
+                payload = self._request(
+                    "POST",
+                    "/auth/v1/signup",
+                    payload={"data": {}},
+                )
+            except SupabaseError as error:
+                if _anonymous_auth_setup_required(error):
+                    raise SupabaseError(
+                        "StormChase report identities require Anonymous Sign-Ins "
+                        "to be enabled in Supabase Auth."
+                    ) from error
+                raise
+            user = self._install_session(payload)
+        else:
+            self._access_token()
+            user = self.current_user
+            if user is None:
+                raise SupabaseError("The report identity is no longer available.")
+        return self._load_reporter_profile(user)
+
+    def set_reporter_username(self, username: str) -> AuthUser:
+        normalized = _normalized_username(username)
+        user = self.ensure_anonymous_session()
+        if user.username is not None:
+            if user.username == normalized:
+                return user
+            raise ValueError("A reporter username can only be set once.")
+        token = self._access_token()
+        try:
+            self._request(
+                "POST",
+                "/rest/v1/stormchase_profiles",
+                payload={"user_id": user.identifier, "username": normalized},
+                access_token=token,
+            )
+        except SupabaseError as error:
+            message = str(error).lower()
+            if error.status_code == 409 or "duplicate key" in message:
+                existing_user = self._load_reporter_profile(user)
+                if existing_user.username == normalized:
+                    return existing_user
+                raise SupabaseError("That reporter username is already in use.") from error
+            if error.status_code == 401:
+                self._clear_session(
+                    "The saved report identity expired. Choose a new username."
+                )
+            raise
+        updated_user = AuthUser(user.identifier, normalized)
+        self._set_session_user(updated_user)
+        return updated_user
 
     def restore_session(self) -> AuthUser | None:
         try:
             saved = keyring.get_password(KEYRING_SERVICE, self.config.url)
         except Exception as error:
             raise SupabaseError(
-                f"Unable to read the saved Windows sign-in session: "
+                f"Unable to read the saved Windows report identity: "
                 f"{type(error).__name__}: {error}"
             ) from error
         if not saved:
@@ -334,10 +411,10 @@ class SupabaseClient:
             refresh_token = saved_payload["refresh_token"]
         except (json.JSONDecodeError, KeyError, TypeError) as error:
             self._remove_saved_session()
-            raise SupabaseError("The saved sign-in session is invalid.") from error
+            raise SupabaseError("The saved report identity is invalid.") from error
         if not isinstance(refresh_token, str) or not refresh_token:
             self._remove_saved_session()
-            raise SupabaseError("The saved sign-in session has no refresh token.")
+            raise SupabaseError("The saved report identity has no refresh token.")
         try:
             payload = self._request(
                 "POST",
@@ -345,12 +422,13 @@ class SupabaseClient:
                 query={"grant_type": "refresh_token"},
                 payload={"refresh_token": refresh_token},
             )
-            return self._install_session(payload)
+            user = self._install_session(payload)
+            return self._load_reporter_profile(user)
         except SupabaseError as error:
             if error.status_code in {400, 401}:
-                self._remove_saved_session()
-                self.session_restore_notice = (
-                    "The saved sign-in expired. Sign in again to file and view reports."
+                self._clear_session(
+                    "The saved report identity expired. Without a linked sign-in method, "
+                    "it cannot be recovered."
                 )
                 return None
             raise
@@ -359,7 +437,7 @@ class SupabaseClient:
         with self._session_lock:
             session = self._session
             if session is None:
-                raise SupabaseError("Sign in is required for this operation.")
+                raise SupabaseError("A report identity is required for this operation.")
             if session.expires_at <= datetime.now(timezone.utc) + timedelta(seconds=60):
                 try:
                     payload = self._request(
@@ -371,28 +449,17 @@ class SupabaseClient:
                 except SupabaseError as error:
                     if error.status_code in {400, 401}:
                         self._clear_session(
-                            "The saved sign-in expired. Sign in again to file and view reports."
+                            "The saved report identity expired. Without a linked sign-in "
+                            "method, it cannot be recovered."
                         )
                     raise
-                session = self._session_payload(payload)
+                session = self._session_payload(
+                    payload,
+                    username=session.user.username,
+                )
                 self._session = session
                 self._save_session(session)
             return session.access_token
-
-    def sign_out(self) -> None:
-        with self._session_lock:
-            session = self._session
-        if session is not None:
-            try:
-                self._request(
-                    "POST",
-                    "/auth/v1/logout",
-                    access_token=self._access_token(),
-                )
-            finally:
-                with self._session_lock:
-                    self._session = None
-                self._remove_saved_session()
 
     def _table_rows(
         self,
@@ -758,11 +825,14 @@ class SupabaseClient:
     def recent_reports(self, limit: int = 100) -> tuple[dict[str, Any], ...]:
         if not 1 <= limit <= 500:
             raise ValueError("Community report limit must be between 1 and 500.")
+        user = self.current_user
+        if user is None or user.username is None:
+            raise SupabaseError("Choose a reporter username to view community reports.")
         try:
             rows = self._table_rows(
                 "storm_reports",
                 {
-                    "select": "id,cell_id,latitude,longitude,report,created_at",
+                    "select": "id,reporter_username,cell_id,latitude,longitude,report,created_at",
                     "order": "created_at.desc",
                     "limit": str(limit),
                 },
@@ -771,7 +841,8 @@ class SupabaseClient:
         except SupabaseError as error:
             if error.status_code == 401:
                 self._clear_session(
-                    "The saved sign-in expired. Sign in again to file and view reports."
+                    "The saved report identity expired. Without a linked sign-in method, "
+                    "it cannot be recovered."
                 )
             raise
         return tuple(rows)
@@ -782,14 +853,15 @@ class SupabaseClient:
             raise ValueError("Report text must contain between 1 and 2000 characters.")
         token = self._access_token()
         user = self.current_user
-        if user is None:
-            raise SupabaseError("Sign in is required to submit a report.")
+        if user is None or user.username is None:
+            raise SupabaseError("Choose a reporter username before submitting a report.")
         try:
             self._request(
                 "POST",
                 "/rest/v1/storm_reports",
                 payload={
                     "user_id": user.identifier,
+                    "reporter_username": user.username,
                     "cell_id": cell.identifier,
                     "latitude": cell.latitude,
                     "longitude": cell.longitude,
@@ -800,6 +872,7 @@ class SupabaseClient:
         except SupabaseError as error:
             if error.status_code == 401:
                 self._clear_session(
-                    "The saved sign-in expired. Sign in again to file and view reports."
+                    "The saved report identity expired. Without a linked sign-in method, "
+                    "it cannot be recovered."
                 )
             raise

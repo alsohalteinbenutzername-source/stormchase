@@ -2,8 +2,8 @@
 
 StormChase is a Windows desktop radar viewer built with Tkinter. It fetches
 DWD reflectivity, radial velocity, rain echoes, and lightning locally while
-running. Supabase is used for sign-in, community reports, and shared KONRAD3D
-cell-tracking and movement-prediction snapshots.
+running. Supabase is used for pseudonymous report identities, community reports,
+and shared KONRAD3D cell-tracking and movement-prediction snapshots.
 
 ## Run from source
 
@@ -72,11 +72,11 @@ The desktop fetches DWD reflectivity, velocity, KONRAD3D fallback data, and
 lightning directly while running. Rain echoes and rotation detections are
 derived locally from those radar frames. The StormAnalyzer outlook reads
 today's shared ICON-D2 grid from Supabase when a publisher has populated it,
-and otherwise fetches it from Open-Meteo. Point nowcasts, warning overlays,
-point lookups, Esri imagery, and cell-motion wind projections continue to use
-their existing live third-party requests. When configured, Supabase also
-supplies shared KONRAD3D tracking/prediction snapshots and
-authenticated community-report features.
+and otherwise fetches it from Open-Meteo. Point nowcasts are disabled to
+conserve API limits. Warning overlays, point lookups, Esri imagery, and
+cell-motion wind projections continue to use live third-party requests. When
+configured, Supabase also supplies shared KONRAD3D tracking/prediction
+snapshots and authenticated community-report features.
 
 1. In the Supabase SQL editor, run
    [`supabase/001_stormchase_schema.sql`](./supabase/001_stormchase_schema.sql).
@@ -92,18 +92,24 @@ authenticated community-report features.
    `forecast_date` in `Europe/Berlin` and API `issued_at`. The app requests
    Open-Meteo if today's row is not available. The publisher should refresh the
    row once per day; a database job retains only today's and yesterday's rows.
-2. Enable email/password authentication in Supabase Auth and disable email
-   confirmation. The app accepts 3–24 character usernames (letters, numbers,
-   and underscores) and maps them to non-deliverable internal email identities
-   for Supabase Auth. Users sign in with their username and password; passwords
-   remain managed by Supabase and are never stored by the app. Username-only
-   accounts cannot use email password recovery; this confirmation setting
-   applies to the whole Supabase project. Signed-in users can read community
-   reports; RLS only allows each signed-in user to create reports as themselves.
+   Then run
+   [`supabase/004_anonymous_reporters.sql`](./supabase/004_anonymous_reporters.sql)
+   to configure pseudonymous report identities and posting limits.
+2. In Supabase Auth, enable **Anonymous Sign-Ins**. The first time someone files
+   a report, StormChase creates an anonymous Supabase session and asks for a
+   unique 3–24 character username (letters, numbers, and underscores). The
+   username is tied to that session, cannot be changed, and is attached to each
+   report; passwords and email addresses are not collected. The session refresh
+   token is stored in Windows Credential Manager. If the saved identity is
+   lost, it cannot be recovered, and the old username remains reserved.
+   Supabase RLS verifies the session and username for each report. The database
+   limits each identity to five reports per ten minutes; because identities are
+   anonymous, this does not prevent someone from creating another identity.
    Report text is limited to 2000 characters.
 3. Configure the separate publisher to publish KONRAD3D tracking and movement
    prediction snapshots, and to populate the daily outlook cache using its
-   trusted `service_role` key. The desktop app does not write to Supabase.
+   trusted `service_role` key. The desktop app never writes shared snapshots;
+   it writes community reports only through the user's RLS-protected session.
    Supabase Cron dispatches the publisher's GitHub Actions workflow every five
    minutes; it can also be started manually. Create a
    fine-grained GitHub token restricted to the publisher repository with
@@ -112,8 +118,8 @@ authenticated community-report features.
    [`supabase/002_github_publisher_scheduler.sql`](./supabase/002_github_publisher_scheduler.sql)
    after adding that Vault secret. Keep the publisher's server-side secret or
    legacy `service_role` key in GitHub Actions only. The desktop uses its
-   public publishable key to read tracking snapshots and username/password Auth
-   for reports.
+   public publishable key to read tracking snapshots and anonymous Supabase
+   sessions for community reports.
 4. For a prototype release, set the project URL and publishable key in
    `config.py`:
 
@@ -127,12 +133,11 @@ authenticated community-report features.
    `STORMCHASE_SUPABASE_PUBLISHABLE_KEY` environment variables override the
    bundled values; the legacy `STORMCHASE_SUPABASE_ANON_KEY` variable is also
    supported. Never put a Supabase secret or `service_role` key in this app,
-   its source, or a distributed build. Windows stores the signed-in session
-   refresh token using the system credential store; users can sign out from
-   the app.
+   its source, or a distributed build. Windows stores the anonymous session
+   refresh token using the system credential store.
 
 Without the URL and publishable key, local live data and outlook still work,
-while Supabase tracking and report sign-in are unavailable. Automated
+while Supabase tracking and report identities are unavailable. Automated
 database-client tests use mocked responses. Verify the live project after
 deploying the SQL and configuring the external publisher; those services are
 not available to the local test suite.

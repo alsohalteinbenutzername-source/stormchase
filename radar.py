@@ -31,6 +31,7 @@ RAIN_CELL_MERGE_RADIUS_PIXELS: int = 3
 RAIN_TRACK_MAX_DISTANCE_KM: float = 45.0
 RAIN_TRACK_MAX_GAP: timedelta = timedelta(minutes=20)
 RAIN_TRACK_MAX_POINTS: int = 12
+RAIN_CELL_POINTER_DISTANCE_KM: float = 25.0
 ROTATION_VELOCITY_THRESHOLD_MS: float = 15.0
 ROTATION_MIN_PIXELS: int = 5
 
@@ -66,6 +67,64 @@ class RainTrackPoint:
     longitude: float
     timestamp: datetime
     reflectivity_dbz: float
+
+
+def project_rain_cell_direction(
+    track: tuple[RainTrackPoint, ...],
+    current_position: tuple[float, float] | None = None,
+) -> tuple[float, float] | None:
+    if len(track) < 2:
+        return None
+
+    previous, latest = track[-2:]
+    start_latitude, start_longitude = current_position or (
+        latest.latitude,
+        latest.longitude,
+    )
+    previous_latitude = math.radians(previous.latitude)
+    latest_latitude = math.radians(latest.latitude)
+    longitude_delta = math.radians(
+        (latest.longitude - previous.longitude + 180.0) % 360.0 - 180.0
+    )
+    latitude_delta = latest_latitude - previous_latitude
+    angular_distance = 2.0 * math.asin(
+        math.sqrt(
+            math.sin(latitude_delta / 2.0) ** 2
+            + math.cos(previous_latitude)
+            * math.cos(latest_latitude)
+            * math.sin(longitude_delta / 2.0) ** 2
+        )
+    )
+    if angular_distance == 0:
+        return None
+
+    bearing = math.atan2(
+        math.sin(longitude_delta) * math.cos(latest_latitude),
+        math.cos(previous_latitude) * math.sin(latest_latitude)
+        - math.sin(previous_latitude)
+        * math.cos(latest_latitude)
+        * math.cos(longitude_delta),
+    )
+    projection_distance = RAIN_CELL_POINTER_DISTANCE_KM / 6371.0
+    start_latitude_radians = math.radians(start_latitude)
+    start_longitude_radians = math.radians(start_longitude)
+    projected_latitude = math.asin(
+        math.sin(start_latitude_radians) * math.cos(projection_distance)
+        + math.cos(start_latitude_radians)
+        * math.sin(projection_distance)
+        * math.cos(bearing)
+    )
+    projected_longitude = start_longitude_radians + math.atan2(
+        math.sin(bearing)
+        * math.sin(projection_distance)
+        * math.cos(start_latitude_radians),
+        math.cos(projection_distance)
+        - math.sin(start_latitude_radians) * math.sin(projected_latitude),
+    )
+    return (
+        math.degrees(projected_latitude),
+        (math.degrees(projected_longitude) + 540.0) % 360.0 - 180.0,
+    )
 
 
 @dataclass(frozen=True)

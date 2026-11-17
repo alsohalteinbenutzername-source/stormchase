@@ -6,9 +6,11 @@ import numpy as np
 from radar import (
     GERMANY_EXTENT,
     RainCell,
+    RainTrackPoint,
     RainCellTracker,
     RadarFrame,
     detect_rain_cells,
+    project_rain_cell_direction,
 )
 
 
@@ -104,6 +106,29 @@ class RainCellTrackerTests(unittest.TestCase):
         )[0]
 
         self.assertNotEqual(first.identifier, other.identifier)
+
+
+class RainCellDirectionTests(unittest.TestCase):
+    def test_projects_pointer_ahead_along_latest_track_direction(self) -> None:
+        start = datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc)
+        track = (
+            RainTrackPoint(51.0, 7.0, start, 24.0),
+            RainTrackPoint(51.1, 7.1, start + timedelta(minutes=5), 25.0),
+        )
+
+        projected = project_rain_cell_direction(track)
+
+        if projected is None:
+            self.fail("Expected a projected pointer for a moving rain cell.")
+        self.assertGreater(projected[0], track[-1].latitude)
+        self.assertGreater(projected[1], track[-1].longitude)
+
+    def test_returns_no_pointer_without_a_track_direction(self) -> None:
+        start = datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc)
+        point = RainTrackPoint(51.0, 7.0, start, 24.0)
+
+        self.assertIsNone(project_rain_cell_direction((point,)))
+        self.assertIsNone(project_rain_cell_direction((point, point)))
 
 
 if __name__ == "__main__":

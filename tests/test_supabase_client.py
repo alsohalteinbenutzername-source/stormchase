@@ -285,83 +285,152 @@ class SupabaseDataContractTests(unittest.TestCase):
         with patch.object(self.client, "_request") as request:
             self.client.submit_report(cell, "  rotation observed  ")
 
-        self.assertEqual(request.call_args.kwargs["payload"], {
-            "user_id": "user-1",
-            "cell_id": "K3D-4",
-            "latitude": 51.2,
-            "longitude": 7.4,
-            "report": "rotation observed",
-        })
+        self.assertEqual(
+            request.call_args.kwargs["payload"],
+            {
+                "user_id": "user-1",
+                "reporter_username": "stormchaser_1",
+                "cell_id": "K3D-4",
+                "latitude": 51.2,
+                "longitude": 7.4,
+                "report": "rotation observed",
+            },
+        )
 
-    def test_sign_in_persists_only_refresh_token_and_sets_current_user(self) -> None:
+    def test_anonymous_session_starts_without_email_or_password(self) -> None:
         auth_payload = {
             "access_token": "short-lived-access",
             "refresh_token": "rotating-refresh",
             "expires_in": 3600,
-            "user": {
-                "id": "user-1",
-                "email": "stormchaser_1@login.stormchase.invalid",
-            },
+            "user": {"id": "user-1", "is_anonymous": True},
         }
         with (
-            patch.object(self.client, "_request", return_value=auth_payload) as request,
+            patch.object(self.client, "_request", side_effect=[auth_payload, []]) as request,
             patch("supabase_client.keyring.set_password") as save_session,
         ):
-            user = self.client.sign_in("StormChaser_1", "secret-password")
+            user = self.client.ensure_anonymous_session()
 
-        self.assertEqual(user, AuthUser("user-1", "stormchaser_1"))
+        self.assertEqual(user, AuthUser("user-1", None))
         self.assertEqual(self.client.current_user, user)
-        self.assertEqual(
-            request.call_args.kwargs["payload"],
-            {
-                "email": "stormchaser_1@login.stormchase.invalid",
-                "password": "secret-password",
-            },
-        )
+        self.assertEqual(request.call_args_list[0].args[1], "/auth/v1/signup")
+        self.assertEqual(request.call_args_list[0].kwargs["payload"], {"data": {}})
         saved = json.loads(save_session.call_args.args[2])
         self.assertEqual(saved["refresh_token"], "rotating-refresh")
         self.assertNotIn("access_token", saved)
-        self.assertEqual(saved["username"], "stormchaser_1")
 
-    def test_sign_up_creates_a_username_identity_and_signs_in(self) -> None:
+    def test_set_reporter_username_creates_a_unique_profile(self) -> None:
         auth_payload = {
             "access_token": "short-lived-access",
             "refresh_token": "rotating-refresh",
             "expires_in": 3600,
-            "user": {
-                "id": "user-1",
-                "email": "stormchaser_1@login.stormchase.invalid",
-            },
+            "user": {"id": "user-1", "is_anonymous": True},
         }
         with (
-            patch.object(self.client, "_request", return_value=auth_payload) as request,
-            patch("supabase_client.keyring.set_password"),
+            patch.object(
+                self.client,
+                "_request",
+                side_effect=[auth_payload, [], None],
+            ) as request,
+            patch("supabase_client.keyring.set_password") as save_session,
         ):
-            user = self.client.sign_up("StormChaser_1", "secret-password")
+            user = self.client.set_reporter_username("StormChaser_1")
 
         self.assertEqual(user, AuthUser("user-1", "stormchaser_1"))
         self.assertEqual(
-            request.call_args.kwargs["payload"],
-            {
-                "email": "stormchaser_1@login.stormchase.invalid",
-                "password": "secret-password",
-            },
+            request.call_args_list[2].kwargs["payload"],
+            {"user_id": "user-1", "username": "stormchaser_1"},
         )
+        self.assertEqual(
+            request.call_args_list[2].kwargs["access_token"],
+            "short-lived-access",
+        )
+        saved = json.loads(save_session.call_args.args[2])
+        self.assertEqual(saved["username"], "stormchaser_1")
 
-    def test_sign_up_explains_when_email_confirmation_blocks_username_login(self) -> None:
+    def test_anonymous_sign_in_explains_when_provider_is_disabled(self) -> None:
         with patch.object(
             self.client,
             "_request",
-            return_value={"user": {"id": "user-1"}},
+            side_effect=SupabaseError(
+                "Supabase request failed (403): Anonymous sign-ins are disabled",
+                status_code=403,
+            ),
         ):
-            with self.assertRaisesRegex(SupabaseError, "Disable email confirmation"):
-                self.client.sign_up("stormchaser_1", "secret-password")
+            with self.assertRaisesRegex(
+                SupabaseError,
+                "Anonymous Sign-Ins to be enabled",
+            ):
+                self.client.ensure_anonymous_session()
+
+    def test_restore_session_loads_the_saved_reporter_username(self) -> None:
+        auth_payload = {
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+            "expires_in": 3600,
+            "user": {"id": "user-1", "is_anonymous": True},
+        }
+        with (
+            patch(
+                "supabase_client.keyring.get_password",
+                return_value='{"refresh_token":"old-refresh"}',
+            ),
+            patch.object(
+                self.client,
+                "_request",
+                side_effect=[auth_payload, [{"username": "stormchaser_1"}]],
+            ),
+            patch("supabase_client.keyring.set_password"),
+        ):
+            user = self.client.restore_session()
+
+        self.assertEqual(user, AuthUser("user-1", "stormchaser_1"))
+        self.assertEqual(self.client.current_user, user)
 
     def test_rejects_invalid_username_before_auth_request(self) -> None:
         with patch.object(self.client, "_request") as request:
             with self.assertRaisesRegex(ValueError, "3–24 characters"):
-                self.client.sign_in("not a username", "secret-password")
+                self.client.set_reporter_username("not a username")
         request.assert_not_called()
+
+    def test_reporter_username_cannot_be_changed_after_registration(self) -> None:
+        self.client._session = _AuthSession(
+            access_token="access",
+            refresh_token="refresh",
+            user=AuthUser("user-1", "stormchaser_1"),
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+        with (
+            patch.object(
+                self.client,
+                "_table_rows",
+                return_value=[{"username": "stormchaser_1"}],
+            ),
+            patch("supabase_client.keyring.set_password"),
+        ):
+            with self.assertRaisesRegex(ValueError, "can only be set once"):
+                self.client.set_reporter_username("another_name")
+
+    def test_rejects_a_username_claimed_by_another_identity(self) -> None:
+        self.client._session = _AuthSession(
+            access_token="access",
+            refresh_token="refresh",
+            user=AuthUser("user-1", None),
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+        with (
+            patch.object(self.client, "_table_rows", side_effect=[[], []]),
+            patch.object(
+                self.client,
+                "_request",
+                side_effect=SupabaseError(
+                    "duplicate key value violates unique constraint",
+                    status_code=409,
+                ),
+            ),
+            patch("supabase_client.keyring.set_password"),
+        ):
+            with self.assertRaisesRegex(SupabaseError, "already in use"):
+                self.client.set_reporter_username("stormchaser_1")
 
     def test_restore_keeps_saved_token_when_supabase_is_temporarily_unavailable(self) -> None:
         with (
@@ -382,7 +451,7 @@ class SupabaseDataContractTests(unittest.TestCase):
         delete_session.assert_not_called()
 
     def test_community_reports_require_authentication(self) -> None:
-        with self.assertRaisesRegex(SupabaseError, "Sign in is required"):
+        with self.assertRaisesRegex(SupabaseError, "reporter username"):
             self.client.recent_reports()
 
         self.client._session = _AuthSession(
@@ -399,6 +468,10 @@ class SupabaseDataContractTests(unittest.TestCase):
             authenticated: bool = False,
         ) -> list[dict[str, object]]:
             self.assertEqual(table, "storm_reports")
+            self.assertEqual(
+                _query["select"],
+                "id,reporter_username,cell_id,latitude,longitude,report,created_at",
+            )
             self.assertEqual(_query["order"], "created_at.desc")
             self.assertTrue(authenticated)
             return []
@@ -472,10 +545,16 @@ class SupabaseDataContractTests(unittest.TestCase):
         schema = (
             Path(__file__).parents[1] / "supabase" / "001_stormchase_schema.sql"
         ).read_text(encoding="utf-8")
+        anonymous_reporters = (
+            Path(__file__).parents[1] / "supabase" / "004_anonymous_reporters.sql"
+        ).read_text(encoding="utf-8")
 
         self.assertIn("with check (auth.uid() = user_id)", schema)
         self.assertIn("for select to authenticated", schema)
         self.assertIn("stormchase-radar", schema)
+        self.assertIn("auth.jwt() ->> 'is_anonymous'", anonymous_reporters)
+        self.assertIn("profile.username = reporter_username", anonymous_reporters)
+        self.assertIn("Report limit reached", anonymous_reporters)
 
 
 if __name__ == "__main__":
