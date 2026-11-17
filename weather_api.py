@@ -4,10 +4,11 @@ import time
 import random
 import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from threading import Lock
+from zoneinfo import ZoneInfo
 
 from config import LATITUDE, LONGITUDE
 
@@ -296,6 +297,20 @@ def get_germany_grid_weather(locations):
     if not locations:
         return []
 
+    cache_now = datetime.now(ZoneInfo("Europe/Berlin"))
+    cache_expiry = (cache_now + timedelta(days=1)).replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    cache_expire_after = max(
+        1,
+        (
+            cache_expiry.astimezone(timezone.utc)
+            - cache_now.astimezone(timezone.utc)
+        ).total_seconds(),
+    )
     fields = STORMANALYZER_HOURLY_FIELDS.split(",")
     batches = [
         locations[index:index + OUTLOOK_BATCH_SIZE]
@@ -329,7 +344,11 @@ def get_germany_grid_weather(locations):
                 wait_seconds = scheduled_at - time.monotonic()
                 if wait_seconds > 0:
                     time.sleep(wait_seconds)
-            response = _get_weather_response(url, request_params)
+            response = _get_weather_response(
+                url,
+                request_params,
+                cache_expire_after=cache_expire_after,
+            )
             if not getattr(response, "from_cache", False):
                 network_request_index += 1
             batch_payload = response.json()

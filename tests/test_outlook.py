@@ -13,6 +13,14 @@ class FixedNoonDateTime(datetime):
         return datetime.now(tz).replace(hour=12, minute=0, second=0, microsecond=0)
 
 
+class ControlledDateTime(datetime):
+    current: datetime
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls.current
+
+
 class NearestOutlookEntryTests(unittest.TestCase):
     def test_uses_the_nearest_forecast_for_the_selected_day(self) -> None:
         nearby = {
@@ -173,6 +181,69 @@ class GermanyOutlookGridTests(unittest.TestCase):
         supabase.daily_outlook_grid.assert_called_once()
         self.assertEqual(returned_issued_at, issued_at)
         self.assertTrue(outlook)
+
+    def test_best_windows_stay_the_same_when_reloaded_later_in_the_day(self) -> None:
+        points = [(50.1, 7.1)]
+        times = [
+            "2026-11-17T13:00",
+            "2026-11-17T16:00",
+            "2026-11-17T20:00",
+            "2026-11-18T12:00",
+        ]
+        values = {
+            "cape": [5000, 500, 1500, 2000],
+            "cin": [-50] * 4,
+            "convective_inhibition": [-50] * 4,
+            "temperature_850hPa": [10] * 4,
+            "temperature_2m": [25] * 4,
+            "dew_point_2m": [18] * 4,
+            "relative_humidity_2m": [70] * 4,
+            "temperature_700hPa": [10] * 4,
+            "temperature_500hPa": [-10] * 4,
+            "precipitation": [0] * 4,
+            "snowfall": [0] * 4,
+            "wind_speed_10m": [10] * 4,
+            "wind_direction_10m": [180] * 4,
+            "wind_speed_925hPa": [15] * 4,
+            "wind_direction_925hPa": [180] * 4,
+            "wind_speed_850hPa": [20] * 4,
+            "wind_direction_850hPa": [180] * 4,
+            "wind_speed_700hPa": [30] * 4,
+            "wind_direction_700hPa": [180] * 4,
+            "wind_speed_500hPa": [40] * 4,
+            "wind_direction_500hPa": [180] * 4,
+        }
+        grid = [{"icon_d2": {"time": times, **values}}]
+        issued_at = datetime(2026, 11, 17, 10, tzinfo=ZoneInfo("Europe/Berlin"))
+        results = []
+
+        for use_daily_grid in (True, False):
+            daily_grid = (
+                {"issued_at": issued_at, "grid": grid}
+                if use_daily_grid
+                else None
+            )
+            supabase = Mock()
+            supabase.daily_outlook_grid.return_value = daily_grid
+            for hour in (13, 18):
+                ControlledDateTime.current = datetime(
+                    2026,
+                    11,
+                    17,
+                    hour,
+                    tzinfo=ZoneInfo("Europe/Berlin"),
+                )
+                with (
+                    patch("ui.germany_grid_points", return_value=points),
+                    patch("weather_api.get_germany_grid_weather", return_value=grid),
+                    patch("ui.datetime", ControlledDateTime),
+                ):
+                    outlook, _ = calculate_germany_outlook((), supabase)
+                results.append(outlook)
+
+        self.assertEqual(results[0], results[1])
+        self.assertEqual(results[2], results[3])
+        self.assertEqual(results[0][0]["time"].hour, 13)
 
 
 if __name__ == "__main__":

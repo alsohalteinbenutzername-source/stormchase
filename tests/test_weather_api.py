@@ -20,10 +20,12 @@ class GermanyGridWeatherTests(unittest.TestCase):
         points = germany_grid_points(())
         fields = STORMANALYZER_HOURLY_FIELDS.split(",")
 
-        def fake_get_weather_response(url, params):
+        def fake_get_weather_response(url, params, **kwargs):
             self.assertEqual(url, "https://api.open-meteo.com/v1/dwd-icon")
             self.assertEqual(params["models"], "icon_d2")
             self.assertEqual(params["forecast_days"], 2)
+            self.assertGreater(kwargs["cache_expire_after"], 0)
+            self.assertLessEqual(kwargs["cache_expire_after"], 86400)
             latitudes = [float(value) for value in params["latitude"].split(",")]
             longitudes = [float(value) for value in params["longitude"].split(",")]
             payload = []

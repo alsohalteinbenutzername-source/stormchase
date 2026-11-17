@@ -84,10 +84,63 @@ class DecodeRadarFileTests(unittest.TestCase):
                 "UR_lat": 54.2,
             }.items():
                 where.attrs[name] = value
+            where.attrs["projdef"] = "+proj=longlat +datum=WGS84 +no_defs"
+            where.attrs["xscale"] = 0.5
+            where.attrs["yscale"] = 0.5
+            where.attrs["xsize"] = 2
+            where.attrs["ysize"] = 2
 
         frame = decode_radar_file(contents.getvalue())
 
         self.assertEqual(frame.extent, (6.5, 12.5, 50.0, 54.2))
+        self.assertEqual(
+            frame.projection,
+            "+proj=longlat +datum=WGS84 +no_defs",
+        )
+        self.assertEqual((frame.xscale, frame.yscale), (0.5, 0.5))
+
+    def test_reprojects_projected_grid_for_geographic_map_display(self) -> None:
+        frame = RadarFrame(
+            np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32),
+            None,
+            extent=(-0.5, 1.5, -1.5, 0.5),
+            projection="+proj=longlat +datum=WGS84 +no_defs",
+            xscale=1.0,
+            yscale=1.0,
+        )
+
+        np.testing.assert_array_equal(
+            frame.geographic_values,
+            np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32),
+        )
+
+    def test_decodes_top_level_projection_metadata(self) -> None:
+        contents = BytesIO()
+        with h5py.File(contents, "w") as radar_file:
+            data_group = radar_file.create_group("dataset1/data1")
+            data_group.create_dataset("data", data=np.ones((2, 2), dtype="u1"))
+            where = radar_file.create_group("where")
+            for name, value in {
+                "LL_lon": 0.0,
+                "LR_lon": 2.0,
+                "UL_lon": 0.0,
+                "UR_lon": 2.0,
+                "LL_lat": 0.0,
+                "LR_lat": 0.0,
+                "UL_lat": 2.0,
+                "UR_lat": 2.0,
+                "xscale": 1.0,
+                "yscale": 1.0,
+                "xsize": 2,
+                "ysize": 2,
+            }.items():
+                where.attrs[name] = value
+            where.attrs["projdef"] = "+proj=longlat +datum=WGS84 +no_defs"
+
+        frame = decode_radar_file(contents.getvalue())
+
+        self.assertEqual(frame.extent, (0.0, 2.0, 0.0, 2.0))
+        self.assertEqual(frame.projection, "+proj=longlat +datum=WGS84 +no_defs")
 
 
 class NearestVelocityRadarSiteTests(unittest.TestCase):

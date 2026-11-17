@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from functools import lru_cache
+from functools import cached_property, lru_cache
 from io import BytesIO
 import math
 from typing import Any, cast
@@ -11,7 +11,9 @@ from typing import Any, cast
 import h5py
 import numpy as np
 from numpy.typing import NDArray
-from scipy.ndimage import binary_dilation, label
+from pyproj import CRS, Transformer
+from pyproj.exceptions import CRSError, ProjError
+from scipy.ndimage import binary_dilation, label, map_coordinates
 from wetterdienst.provider.dwd.radar import (
     DwdRadarDate,
     DwdRadarParameter,
@@ -34,6 +36,7 @@ RAIN_TRACK_MAX_POINTS: int = 12
 RAIN_CELL_POINTER_DISTANCE_KM: float = 25.0
 ROTATION_VELOCITY_THRESHOLD_MS: float = 15.0
 ROTATION_MIN_PIXELS: int = 5
+MAX_GEOGRAPHIC_IMAGE_SIZE: int = 1200
 
 
 class RadarDataError(ValueError):
@@ -45,11 +48,57 @@ class RadarFrame:
     reflectivity: NDArray[np.float32]
     timestamp: datetime | None
     extent: tuple[float, float, float, float] = GERMANY_EXTENT
+    projection: str | None = None
+    xscale: float | None = None
+    yscale: float | None = None
 
     @property
     def values(self) -> NDArray[np.float32]:
         """Return the decoded grid, whether it contains reflectivity or velocity."""
         return self.reflectivity
+
+    @cached_property
+    def geographic_values(self) -> NDArray[np.float32]:
+        if self.projection is None or self.xscale is None or self.yscale is None:
+            return self.values
+
+        rows, columns = self.values.shape
+        scale = max(
+            1,
+            math.ceil(rows / MAX_GEOGRAPHIC_IMAGE_SIZE),
+            math.ceil(columns / MAX_GEOGRAPHIC_IMAGE_SIZE),
+        )
+        output_rows = math.ceil(rows / scale)
+        output_columns = math.ceil(columns / scale)
+        west, east, south, north = self.extent
+        longitudes = west + (
+            np.arange(output_columns, dtype=np.float64) + 0.5
+        ) * (east - west) / output_columns
+        latitudes = north - (
+            np.arange(output_rows, dtype=np.float64) + 0.5
+        ) * (north - south) / output_rows
+        longitude_grid, latitude_grid = np.meshgrid(longitudes, latitudes)
+        _, to_projection = _projection_transformers(self.projection)
+        projected_x, projected_y = to_projection.transform(
+            longitude_grid,
+            latitude_grid,
+        )
+        source_columns = projected_x / self.xscale
+        source_rows = -projected_y / self.yscale
+        valid = np.isfinite(source_rows) & np.isfinite(source_columns)
+        sampled = map_coordinates(
+            self.values,
+            (
+                np.where(valid, source_rows, -1.0),
+                np.where(valid, source_columns, -1.0),
+            ),
+            order=0,
+            mode="constant",
+            cval=np.nan,
+            prefilter=False,
+        )
+        sampled[~valid] = np.nan
+        return np.asarray(sampled, dtype=np.float32)
 
 
 @dataclass(frozen=True)
@@ -161,6 +210,47 @@ def _attribute_value(attributes: h5py.AttributeManager, name: str) -> float | No
         return None
 
 
+def _attribute_text(attributes: h5py.AttributeManager, name: str) -> str | None:
+    value = attributes.get(name)
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return str(value)
+
+
+@lru_cache(maxsize=8)
+def _projection_transformers(
+    projection: str,
+) -> tuple[Transformer, Transformer]:
+    source_crs = CRS.from_user_input(projection)
+    geographic_crs = CRS.from_epsg(4326)
+    return (
+        Transformer.from_crs(source_crs, geographic_crs, always_xy=True),
+        Transformer.from_crs(geographic_crs, source_crs, always_xy=True),
+    )
+
+
+def _pixel_to_geographic(
+    frame: RadarFrame,
+    row: float,
+    column: float,
+) -> tuple[float, float]:
+    if frame.projection is None or frame.xscale is None or frame.yscale is None:
+        west, east, south, north = frame.extent
+        rows, columns = frame.values.shape
+        latitude = north - (row + 0.5) / rows * (north - south)
+        longitude = west + (column + 0.5) / columns * (east - west)
+        return latitude, longitude
+
+    to_geographic, _ = _projection_transformers(frame.projection)
+    longitude, latitude = to_geographic.transform(
+        column * frame.xscale,
+        -row * frame.yscale,
+    )
+    return float(latitude), float(longitude)
+
+
 def _label_components(
     mask: NDArray[np.bool_],
     structure: NDArray[np.uint8],
@@ -225,17 +315,20 @@ def decode_radar_file(contents: bytes, timestamp: datetime | None = None) -> Rad
             )[1]
             reflectivity = _decode_reflectivity(dataset)
             extent = GERMANY_EXTENT
+            projection = None
+            xscale = None
+            yscale = None
             dataset_parent = dataset.parent
             dataset_group = (
                 dataset_parent.parent
                 if isinstance(dataset_parent, h5py.Group)
                 else None
             )
-            metadata = (
-                dataset_group.get("where")
-                if isinstance(dataset_group, h5py.Group)
-                else None
-            )
+            metadata = None
+            if isinstance(dataset_group, h5py.Group):
+                metadata = dataset_group.get("where")
+            if not isinstance(metadata, h5py.Group):
+                metadata = radar_file.get("where")
             if isinstance(metadata, h5py.Group):
                 attributes = metadata.attrs
                 corner_names = ("LL_lon", "LR_lon", "UL_lon", "UR_lon")
@@ -258,12 +351,42 @@ def decode_radar_file(contents: bytes, timestamp: datetime | None = None) -> Rad
                             min(latitudes),
                             max(latitudes),
                         )
+                projection = _attribute_text(attributes, "projdef")
+                xscale = _attribute_value(attributes, "xscale")
+                yscale = _attribute_value(attributes, "yscale")
+                if projection is not None and xscale is not None and yscale is not None:
+                    xsize = _attribute_value(attributes, "xsize")
+                    ysize = _attribute_value(attributes, "ysize")
+                    if (
+                        xsize is None
+                        or ysize is None
+                        or int(xsize) != reflectivity.shape[1]
+                        or int(ysize) != reflectivity.shape[0]
+                        or xscale <= 0
+                        or yscale <= 0
+                    ):
+                        raise RadarDataError(
+                            "The DWD radar projection metadata does not match its grid."
+                        )
+                    try:
+                        _projection_transformers(projection)
+                    except (CRSError, ProjError, ValueError) as error:
+                        raise RadarDataError(
+                            f"Unable to read the DWD radar projection: {error}"
+                        ) from error
     except RadarDataError:
         raise
     except (OSError, ValueError, TypeError) as error:
         raise RadarDataError(f"Unable to decode the DWD HDF5 radar file: {error}") from error
 
-    return RadarFrame(reflectivity=reflectivity, timestamp=timestamp, extent=extent)
+    return RadarFrame(
+        reflectivity=reflectivity,
+        timestamp=timestamp,
+        extent=extent,
+        projection=projection,
+        xscale=xscale,
+        yscale=yscale,
+    )
 
 
 @lru_cache(maxsize=1)
@@ -378,13 +501,14 @@ def detect_rain_cells(
         reflectivity[pixel_rows, pixel_columns],
     )
 
-    west, east, south, north = frame.extent
-    rows, columns = reflectivity.shape
     cells: list[RainCell] = []
     for component_id in active_labels:
         area_pixels = int(component_sizes[component_id])
-        latitude = north - (row_sums[component_id] / area_pixels + 0.5) / rows * (north - south)
-        longitude = west + (column_sums[component_id] / area_pixels + 0.5) / columns * (east - west)
+        latitude, longitude = _pixel_to_geographic(
+            frame,
+            row_sums[component_id] / area_pixels,
+            column_sums[component_id] / area_pixels,
+        )
         maximum = float(maximum_reflectivity[component_id])
         cells.append(
             RainCell(

@@ -635,6 +635,7 @@ def analyze_storm(
     risk = min(risk, 50)
 
     tornado_score = min(tornado_score, 40)
+    tornado_score *= min(max(round(risk, 2) / 50, 0.0), 1.0)
     hail_score = min(hail_score, 40)
     damaging_wind_score = min(damaging_wind_score, 40)
 

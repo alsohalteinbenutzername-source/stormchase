@@ -64,6 +64,23 @@ class DetectRainCellsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "at least one pixel"):
             detect_rain_cells(frame, minimum_pixels=0)
 
+    def test_maps_cell_centroid_through_the_radar_projection(self) -> None:
+        reflectivity = np.array([[0.0, 0.0], [0.0, 25.0]], dtype=np.float32)
+        frame = RadarFrame(
+            reflectivity,
+            None,
+            extent=(-0.5, 1.5, -1.5, 0.5),
+            projection="+proj=longlat +datum=WGS84 +no_defs",
+            xscale=1.0,
+            yscale=1.0,
+        )
+
+        cells = detect_rain_cells(frame, minimum_pixels=1)
+
+        self.assertEqual(len(cells), 1)
+        self.assertAlmostEqual(cells[0].latitude, -1.0)
+        self.assertAlmostEqual(cells[0].longitude, 1.0)
+
 
 class RainCellTrackerTests(unittest.TestCase):
     def setUp(self) -> None:

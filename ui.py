@@ -26,7 +26,7 @@ from matplotlib.figure import Figure
 import matplotlib.patheffects as path_effects
 from matplotlib.tri import Triangulation, UniformTriRefiner
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from loctrack import (
     LocationFix,
@@ -78,7 +78,6 @@ REFLECTIVITY_RADAR = "Reflectivity"
 VELOCITY_RADAR = "Velocity"
 OUTLOOK_EXTENT = (4.0, 16.0, 47.0, 56.0)
 OUTLOOK_DAY_LABELS = tuple(f"Day {day}" for day in range(1, 3))
-DWD_WARNING_WMS_URL = "https://maps.dwd.de/geoproxy_warnungen/service/"
 DWD_WARNING_WFS_URL = "https://maps.dwd.de/geoserver/dwd/ows"
 OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 PRESSURE_LEVELS_HPA = (1000, 975, 950, 925, 900, 850, 800, 700, 600, 500, 400)
@@ -148,9 +147,11 @@ def calculate_germany_outlook(
     if cached_outlook is None:
         weather = get_germany_grid_weather(points)
         issued_at = now
+        calculation_time = now.replace(hour=0, minute=0, second=0, microsecond=0)
     else:
         weather = cached_outlook["grid"]
         issued_at = cached_outlook["issued_at"].astimezone(now.tzinfo)
+        calculation_time = issued_at
         print(f"USING SUPABASE DAILY OUTLOOK ISSUED AT {issued_at.isoformat()}")
 
     if len(weather) != len(points):
@@ -174,7 +175,7 @@ def calculate_germany_outlook(
             result = calculate_best_day_window(
                 hourly,
                 now.date() + timedelta(days=day),
-                now,
+                calculation_time,
             )
             if result is not None:
                 best_by_day[day] = {
@@ -322,27 +323,71 @@ def fetch_dwd_warning_overlay(
     width: int,
     height: int,
 ) -> tuple[np.ndarray, tuple[float, float, float, float]]:
-
     image_extent = fit_extent_to_aspect(extent, width / height)
     west, east, south, north = image_extent
     parameters = urlencode(
         {
-            "SERVICE": "WMS",
-            "VERSION": "1.1.1",
-            "REQUEST": "GetMap",
-            "LAYERS": "Warnungen_Gemeinden_vereinigt",
-            "STYLES": "",
-            "SRS": "EPSG:4326",
-            "BBOX": f"{west:.8f},{south:.8f},{east:.8f},{north:.8f}",
-            "WIDTH": str(width),
-            "HEIGHT": str(height),
-            "FORMAT": "image/png",
-            "TRANSPARENT": "TRUE",
+            "service": "WFS",
+            "version": "2.0.0",
+            "request": "GetFeature",
+            "typeNames": "dwd:Warnungen_Gemeinden_vereinigt",
+            "outputFormat": "application/json",
+            "srsName": "CRS:84",
+            "bbox": f"{west:.8f},{south:.8f},{east:.8f},{north:.8f},CRS:84",
+            "count": "2000",
         }
     )
-    with urlopen(f"{DWD_WARNING_WMS_URL}?{parameters}", timeout=20) as response:
-        with Image.open(response) as image:
-            return np.asarray(image.convert("RGBA")), image_extent
+    with urlopen(f"{DWD_WARNING_WFS_URL}?{parameters}", timeout=30) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    if payload.get("error"):
+        raise RuntimeError(payload.get("message", "DWD warning query failed"))
+
+    features = payload.get("features")
+    if not isinstance(features, list):
+        raise RuntimeError("DWD warning query returned no feature collection.")
+
+    image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    drawing = ImageDraw.Draw(image)
+    for feature in features:
+        properties = feature.get("properties", {})
+        color_values = properties.get("EC_AREA_COLOR")
+        try:
+            color = tuple(int(value) for value in color_values.split())
+        except (AttributeError, ValueError) as error:
+            raise RuntimeError("DWD warning has an invalid area color.") from error
+        if len(color) != 3 or any(value < 0 or value > 255 for value in color):
+            raise RuntimeError("DWD warning has an invalid area color.")
+
+        geometry = feature.get("geometry")
+        if not isinstance(geometry, dict):
+            raise RuntimeError("DWD warning is missing its geometry.")
+        geometry_type = geometry.get("type")
+        coordinates = geometry.get("coordinates")
+        if geometry_type == "Polygon":
+            polygons = [coordinates]
+        elif geometry_type == "MultiPolygon":
+            polygons = coordinates
+        else:
+            raise RuntimeError(f"Unsupported DWD warning geometry: {geometry_type!r}.")
+
+        for polygon in polygons:
+            if not polygon:
+                continue
+            pixels = [
+                (
+                    round((float(point[0]) - west) / (east - west) * (width - 1)),
+                    round((north - float(point[1])) / (north - south) * (height - 1)),
+                )
+                for point in polygon[0]
+            ]
+            drawing.polygon(
+                pixels,
+                fill=(*color, 110),
+                outline=(*color, 235),
+                width=2,
+            )
+
+    return np.asarray(image), image_extent
 
 
 def fetch_dwd_warning_at(latitude: float, longitude: float) -> list[dict[str, Any]]:
@@ -2097,7 +2142,8 @@ class StormRadarApp:
                 if metric_key != "risk":
                     composite_risk = np.asarray([entry["risk"] for entry in entries], dtype=float)
                     risk_factor = np.clip(composite_risk / 50.0, 0.0, 1.0)
-                    scores = scores * risk_factor
+                    if metric_key != "tornado":
+                        scores = scores * risk_factor
                 triangulation = Triangulation(longitudes, latitudes) if len(entries) >= 3 else None
 
                 if metric_key == "risk":
@@ -2264,7 +2310,7 @@ class StormRadarApp:
             )
             if radar_frame is not None:
                 self.axes.imshow(
-                    np.ma.masked_invalid(radar_frame.values),
+                    np.ma.masked_invalid(radar_frame.geographic_values),
                     extent=radar_frame.extent,
                     origin="upper",
                     cmap=radar_cmap,

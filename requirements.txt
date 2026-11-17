@@ -2,6 +2,7 @@ wetterdienst[radarplus]
 matplotlib
 numpy
 h5py
+pyproj
 scipy
 wradlib
 xradar

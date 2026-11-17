@@ -49,6 +49,15 @@ class CalculateManualStormTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cape must be finite"):
             calculate_manual_storm(non_finite)
 
+    def test_scales_tornado_score_by_the_final_overall_risk(self) -> None:
+        low_risk = analyze_storm(100, 35, 29, 20, 300, -150, 850, 85, 30, 7.5)
+        high_risk = analyze_storm(1000, 35, 29, 20, 300, -50, 850, 85, 30, 7.5)
+
+        self.assertAlmostEqual(low_risk["risk"], 3.71)
+        self.assertAlmostEqual(low_risk["tornado"], 0.57)
+        self.assertAlmostEqual(high_risk["risk"], 46.0)
+        self.assertAlmostEqual(high_risk["tornado"], 36.8)
+
 
 class CalculateBestDayWindowTests(unittest.TestCase):
     def setUp(self) -> None:
