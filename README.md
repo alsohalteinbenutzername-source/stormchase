@@ -5,6 +5,14 @@ DWD reflectivity, radial velocity, rain echoes, and lightning locally while
 running. Supabase is used for pseudonymous report identities, community reports,
 and shared KONRAD3D cell-tracking and movement-prediction snapshots.
 
+## Milestone
+
+On 17 November, from approximately 5–6 PM, StormChase produced its first
+(pretty much) verified tornado projection in a case near the Belgium-France
+border, at Estinnes. The projection was issued with a 15–30% tornado risk and
+was subsequently confirmed by a tornado debris signature observed across all
+three radar parts: correlation coefficient (CC), velocity, and reflectivity.
+
 ## Run from source
 
 Use Python 3.12 on Windows:
