@@ -1,7 +1,4 @@
--- StormChase shared-data contract.
--- Run in the Supabase SQL editor. The scheduled collector must use service_role;
--- desktop clients use only the public anon key and are constrained by RLS.
--- Live radar, snapshot, and lightning data is retained for two hours.
+-- desktop clients read shared snapshots; only trusted publishers write them.
 
 grant usage on schema public to anon, authenticated;
 
@@ -115,9 +112,6 @@ create policy "Users can create reports as themselves"
     with check (auth.uid() = user_id);
 grant select, insert on public.storm_reports to authenticated;
 
--- Prune expired live data every five minutes. Storage objects are removed
--- separately by the publisher through the Storage API; deleting rows from
--- storage.objects directly would leave orphaned files in the bucket.
 create or replace function public.cleanup_stormchase_expired_data()
 returns void
 language plpgsql
@@ -163,34 +157,4 @@ select cron.schedule(
     'select public.cleanup_stormchase_expired_data();'
 );
 
--- Apply the limit immediately as well as on the recurring schedule.
 select public.cleanup_stormchase_expired_data();
-
--- Publisher contract (all timestamps are ISO-8601 UTC):
--- * radar_frames upserts on (product, site_code, observed_at); upload the raw
---   DWD HDF5 object to stormchase-radar first, then store its relative object
---   path here. Reflectivity uses site_code=''; velocity uses the DWD site code.
--- * live_snapshots upserts on (product, scope, observed_at). Use scope='' for
---   KONRAD3D and rain_cells; use the DWD site code for rotation_detections.
---   KONRAD3D payload:
---   {"cells":[{"identifier":"...", "latitude":0, "longitude":0,
---   "reflectivity_dbz":null, "severity":null, "track":[[0,0]],
---   "forecast":[]}]} where each track point is [latitude, longitude].
---   rain_cells payload: {"cells":[{"identifier":"...", "latitude":0,
---   "longitude":0, "max_reflectivity_dbz":0, "area_pixels":0,
---   "track":[{"latitude":0,"longitude":0,"timestamp":"...",
---   "reflectivity_dbz":0}]}]}.
---   rotation_detections payload:
---   {"detections":[{"latitude":0,"longitude":0,
---   "negative_pixels":0,"positive_pixels":0}]}.
---   Rotation markers represent adjacent inbound/outbound regions with at least
---   five pixels on each side at or beyond +/-15 m/s.
---   Publish empty arrays when a scan has no cells/detections so clients can
---   clear the previous scan rather than keeping old markers on the map.
--- * lightning_strikes upserts on identifier (for example "17/42"), with
---   latitude, longitude, observed_at, quality, and uncertainty_km.
--- * storm_reports are created by authenticated app clients; the publisher
---   should not write reports or use a client-supplied user_id as authority.
--- The two-hour retention job removes expired live-feed rows. The publisher
--- must also remove expired radar files using the Storage API. Community reports
--- are intentionally retained and are not part of live-feed cleanup.

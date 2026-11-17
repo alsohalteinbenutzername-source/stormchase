@@ -108,7 +108,8 @@ THREAT_PROBABILITIES = {
 
 
 def germany_grid_points(outlines: tuple[tuple[tuple[float, float], ...], ...], spacing: float = 0.4) -> list[tuple[float, float]]:
-    del outlines  # The outlook now covers the complete requested rectangular area.
+    # the grid covers a fixed rectangle, not the country outline.
+    del outlines
 
     def axis_points(start: float, end: float) -> list[float]:
         values = [start + index * spacing for index in range(int((end - start) / spacing) + 1)]

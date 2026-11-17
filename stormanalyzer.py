@@ -160,7 +160,6 @@ def generate_storm_forecast(outlook_areas):
         if not threats:
             continue
 
-        # One threat
         if len(threats) == 1:
             threat_text = threats[0]
         elif len(threats) == 2:
@@ -598,7 +597,7 @@ def analyze_storm(
         damaging_wind_score = damaging_wind_score * 0.45
         hail_score = hail_score * 0.45
 
-# Low-CAPE convective feasibility adjustment
+    # reduce scores when low cape limits convection.
     if cape <= 100:
         risk *= 0.15
         supercell_score *= 0.40
@@ -671,7 +670,7 @@ def analyze_storm(
     storm_type = None
 
 
-    # Extreme cases
+    # label the highest-impact combinations.
     if tornado_score >= 35 and supercell and risk >= 35:
         storm_type = (
             "Extreme Tornadic Supercell Potential"

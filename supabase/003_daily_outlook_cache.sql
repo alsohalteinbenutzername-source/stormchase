@@ -1,10 +1,4 @@
--- Shared daily ICON-D2 grid cache consumed by the desktop app.
--- A trusted publisher must write grid_payload using its service_role key.
--- The desktop uses only its public key and has read-only access.
---
--- grid_payload is the 744-element JSON array returned by
--- weather_api.get_germany_grid_weather(), with each item shaped as:
--- {"icon_d2":{"time":[...],"cape":[...],...,"cin":[...]}}
+-- desktop clients read snapshots; only the trusted publisher writes them.
 
 create table if not exists public.daily_outlook_forecasts (
     forecast_date date primary key,
@@ -26,7 +20,7 @@ revoke all on public.daily_outlook_forecasts from public, anon, authenticated;
 grant select on public.daily_outlook_forecasts to anon, authenticated;
 grant all on public.daily_outlook_forecasts to service_role;
 
--- Keep only today's and yesterday's snapshots.
+-- prune old forecast payloads daily.
 do $$
 declare
     existing_job_id bigint;

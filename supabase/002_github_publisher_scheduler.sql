@@ -1,7 +1,4 @@
--- Dispatch the publisher from Supabase Cron instead of GitHub's best-effort schedule.
--- Before running this migration, save a fine-grained GitHub token in Supabase Vault:
--- name: stormchase_github_dispatch_token
--- permissions: Actions (read and write), restricted to the chasepublisher repository.
+-- dispatch the publisher with a token stored in vault.
 
 create extension if not exists pg_cron;
 create extension if not exists pg_net with schema extensions;

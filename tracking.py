@@ -53,7 +53,7 @@ def project_cell_motion(
 
     start_latitude = math.radians(latitude)
     start_longitude = math.radians(longitude)
-    # Meteorological wind direction is the direction the wind comes from.
+    # wind direction is the direction it comes from.
     bearing = math.radians((wind_direction_degrees + 180) % 360)
     points = [(latitude, longitude)]
     projection_minutes = list(range(step_minutes, duration_minutes + 1, step_minutes))

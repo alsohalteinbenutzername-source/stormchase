@@ -83,8 +83,7 @@ WEATHER_CACHE_NAME = _weather_cache_name()
 WEATHER_BUDGET_DB = str(Path(WEATHER_CACHE_NAME).with_name("openmeteo_budget.sqlite"))
 cache_session = requests_cache.CachedSession(
     WEATHER_CACHE_NAME,
-    # ECMWF runs update about every six hours; reusing one run avoids spending
-    # the daily quota again when the outlook is reopened in the same cycle.
+    # reuse recent runs to avoid repeat api quota use.
     expire_after=21600,
     stale_if_error=True,
 )
@@ -308,7 +307,7 @@ def get_germany_grid_weather(locations):
         1,
         int(OUTLOOK_CALLS_PER_MINUTE // (OUTLOOK_BATCH_SIZE * calls_per_location)),
     )
-    # A small gap keeps a rolling 60-second window below the weighted-call cap.
+    # keep weighted requests within the rolling minute cap.
     batch_interval = 60.0 / max_batches_per_minute + 2.0
     network_request_index = 0
     payload_by_model = {}
