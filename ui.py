@@ -121,22 +121,53 @@ def germany_grid_points(outlines: tuple[tuple[tuple[float, float], ...], ...], s
     return [(latitude, longitude) for latitude in latitudes for longitude in longitudes]
 
 
-def calculate_germany_outlook(outlines: tuple[tuple[tuple[float, float], ...], ...]) -> tuple[list[dict[str, Any]], datetime]:
-    from weather_api import get_germany_grid_weather
+def calculate_germany_outlook(
+    outlines: tuple[tuple[tuple[float, float], ...], ...],
+    supabase: SupabaseClient | None = None,
+) -> tuple[list[dict[str, Any]], datetime]:
+    from weather_api import (
+        STORMANALYZER_HOURLY_FIELDS,
+        _validate_hourly,
+        get_germany_grid_weather,
+    )
 
     points = germany_grid_points(outlines)
-    weather = get_germany_grid_weather(points)
+    now = datetime.now(ZoneInfo("Europe/Berlin"))
+    cached_outlook = None
+    if supabase is not None:
+        try:
+            cached_outlook = supabase.daily_outlook_grid(now.date())
+        except SupabaseError as error:
+            print(
+                "WARNING: Supabase daily outlook lookup failed; "
+                f"fetching Open-Meteo data instead: {error}"
+            )
+
+    if cached_outlook is None:
+        weather = get_germany_grid_weather(points)
+        issued_at = now
+    else:
+        weather = cached_outlook["grid"]
+        issued_at = cached_outlook["issued_at"].astimezone(now.tzinfo)
+        print(f"USING SUPABASE DAILY OUTLOOK ISSUED AT {issued_at.isoformat()}")
+
     if len(weather) != len(points):
         raise RuntimeError(
             f"Open-Meteo returned {len(weather)} location forecasts for "
             f"{len(points)} outlook grid points."
         )
 
-    now = datetime.now(ZoneInfo("Europe/Berlin"))
+    fields = STORMANALYZER_HOURLY_FIELDS.split(",")
     outlook = []
     for (latitude, longitude), location in zip(points, weather):
         best_by_day: dict[int, dict[str, Any]] = {}
-        hourly = location["icon_d2"]
+        hourly = location.get("icon_d2")
+        if not isinstance(hourly, dict):
+            raise RuntimeError("Daily outlook is missing ICON-D2 hourly data.")
+        _validate_hourly(hourly, fields)
+        cin = hourly.get("cin")
+        if not isinstance(cin, list) or len(cin) != len(hourly["time"]):
+            raise RuntimeError("Daily outlook is missing matching CIN data.")
         for day in range(2):
             result = calculate_best_day_window(
                 hourly,
@@ -150,7 +181,7 @@ def calculate_germany_outlook(outlines: tuple[tuple[tuple[float, float], ...], .
                     "longitude": longitude,
                 }
         outlook.extend({**entry, "day": day} for day, entry in best_by_day.items())
-    return outlook, now
+    return outlook, issued_at
 
 
 def load_germany_outline() -> tuple[tuple[tuple[float, float], ...], ...]:
@@ -1680,7 +1711,7 @@ class StormRadarApp:
             self.auth_status.set("Supabase not configured")
         else:
             self.auth_status.set(
-                self.auth_user.email
+                self.auth_user.username
                 if self.auth_user is not None
                 else "Sign in to file reports"
             )
@@ -1714,7 +1745,7 @@ class StormRadarApp:
             return
         if messagebox.askyesno(
             "Sign out",
-            f"Sign out {self.auth_user.email}?",
+            f"Sign out {self.auth_user.username}?",
             parent=self.root,
         ):
             self.loop.create_task(self._sign_out())
@@ -1748,9 +1779,9 @@ class StormRadarApp:
         dialog.grab_set()
         frame = ttk.Frame(dialog, padding=18)
         frame.pack(fill="both", expand=True)
-        ttk.Label(frame, text="Email").grid(row=0, column=0, sticky="w", pady=4)
-        email_entry = ttk.Entry(frame, width=36)
-        email_entry.grid(row=0, column=1, sticky="ew", pady=4)
+        ttk.Label(frame, text="Username").grid(row=0, column=0, sticky="w", pady=4)
+        username_entry = ttk.Entry(frame, width=36)
+        username_entry.grid(row=0, column=1, sticky="ew", pady=4)
         ttk.Label(frame, text="Password").grid(row=1, column=0, sticky="w", pady=4)
         password_entry = ttk.Entry(frame, width=36, show="•")
         password_entry.grid(row=1, column=1, sticky="ew", pady=4)
@@ -1768,7 +1799,7 @@ class StormRadarApp:
             dialog.protocol("WM_DELETE_WINDOW", lambda: None)
             self.loop.create_task(
                 self._authenticate(
-                    email_entry.get(),
+                    username_entry.get(),
                     password_entry.get(),
                     sign_up,
                     dialog,
@@ -1791,11 +1822,11 @@ class StormRadarApp:
         )
         sign_up_button.grid(row=3, column=1, sticky="ew", pady=(6, 0), padx=(4, 0))
         frame.columnconfigure(1, weight=1)
-        email_entry.focus_set()
+        username_entry.focus_set()
 
     async def _authenticate(
         self,
-        email: str,
+        username: str,
         password: str,
         sign_up: bool,
         dialog: tk.Toplevel,
@@ -1811,22 +1842,14 @@ class StormRadarApp:
                 user = await self.loop.run_in_executor(
                     self.executor,
                     client.sign_up,
-                    email,
+                    username,
                     password,
                 )
-                if user is None:
-                    status_text.set(
-                        "Account created. Check your email to confirm it, then sign in."
-                    )
-                    sign_in_button.configure(state="normal")
-                    sign_up_button.configure(state="normal")
-                    dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
-                    return
             else:
                 user = await self.loop.run_in_executor(
                     self.executor,
                     client.sign_in,
-                    email,
+                    username,
                     password,
                 )
         except Exception as error:
@@ -1843,7 +1866,7 @@ class StormRadarApp:
             self.status.set(client.session_persistence_error)
             self.auth_status.set("Signed in · session not saved")
         else:
-            self.status.set(f"Signed in as {user.email}.")
+            self.status.set(f"Signed in as {user.username}.")
         self._render_community_reports()
         if dialog.winfo_exists():
             dialog.grab_release()
@@ -2671,7 +2694,10 @@ class StormRadarApp:
     async def _load_storm_outlook(self) -> None:
         try:
             outlook, issued_at = await self.loop.run_in_executor(
-                self.executor, calculate_germany_outlook, self.germany_outline
+                self.executor,
+                calculate_germany_outlook,
+                self.germany_outline,
+                self.supabase,
             )
         except Exception as error:
             self._storm_outlook_loading = False

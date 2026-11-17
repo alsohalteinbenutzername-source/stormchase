@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 import json
 from pathlib import Path
 import unittest
@@ -192,6 +192,52 @@ class SupabaseDataContractTests(unittest.TestCase):
         self.assertEqual(rain_cells[0].track[0].timestamp, datetime(2026, 11, 11, 10, tzinfo=timezone.utc))
         self.assertEqual(rotations, (RotationDetection(51.5, 7.5, 8, 9),))
 
+    def test_reads_daily_outlook_grid_for_the_requested_date(self) -> None:
+        issued_at = "2026-11-11T10:00:00Z"
+        grid = [{"icon_d2": {"time": ["2026-11-11T10:00"], "cin": [0]}}]
+        with patch.object(
+            self.client,
+            "_table_rows",
+            return_value=[
+                {
+                    "forecast_date": "2026-11-11",
+                    "issued_at": issued_at,
+                    "grid_payload": grid,
+                }
+            ],
+        ) as table_rows:
+            result = self.client.daily_outlook_grid(date(2026, 11, 11))
+
+        self.assertEqual(result["grid"], grid)
+        self.assertEqual(result["issued_at"], datetime(2026, 11, 11, 10, tzinfo=timezone.utc))
+        table_rows.assert_called_once_with(
+            "daily_outlook_forecasts",
+            {
+                "select": "forecast_date,issued_at,grid_payload",
+                "forecast_date": "eq.2026-11-11",
+                "limit": "1",
+            },
+        )
+
+    def test_returns_none_when_daily_outlook_is_not_published(self) -> None:
+        with patch.object(self.client, "_table_rows", return_value=[]):
+            self.assertIsNone(self.client.daily_outlook_grid(date(2026, 11, 11)))
+
+    def test_rejects_malformed_daily_outlook_grid(self) -> None:
+        with patch.object(
+            self.client,
+            "_table_rows",
+            return_value=[
+                {
+                    "forecast_date": "2026-11-11",
+                    "issued_at": "2026-11-11T10:00:00Z",
+                    "grid_payload": [{"ecmwf": {}}],
+                }
+            ],
+        ):
+            with self.assertRaisesRegex(SupabaseError, "ICON-D2"):
+                self.client.daily_outlook_grid(date(2026, 11, 11))
+
     def test_returns_latest_timestamped_radar_file_from_storage(self) -> None:
         rows = [
             {
@@ -225,7 +271,7 @@ class SupabaseDataContractTests(unittest.TestCase):
         self.client._session = _AuthSession(
             access_token="access",
             refresh_token="refresh",
-            user=AuthUser("user-1", "storm@example.com"),
+            user=AuthUser("user-1", "stormchaser_1"),
             expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
         )
         cell = StormCell(
@@ -252,19 +298,70 @@ class SupabaseDataContractTests(unittest.TestCase):
             "access_token": "short-lived-access",
             "refresh_token": "rotating-refresh",
             "expires_in": 3600,
-            "user": {"id": "user-1", "email": "storm@example.com"},
+            "user": {
+                "id": "user-1",
+                "email": "stormchaser_1@login.stormchase.invalid",
+            },
         }
         with (
-            patch.object(self.client, "_request", return_value=auth_payload),
+            patch.object(self.client, "_request", return_value=auth_payload) as request,
             patch("supabase_client.keyring.set_password") as save_session,
         ):
-            user = self.client.sign_in("storm@example.com", "secret-password")
+            user = self.client.sign_in("StormChaser_1", "secret-password")
 
-        self.assertEqual(user, AuthUser("user-1", "storm@example.com"))
+        self.assertEqual(user, AuthUser("user-1", "stormchaser_1"))
         self.assertEqual(self.client.current_user, user)
+        self.assertEqual(
+            request.call_args.kwargs["payload"],
+            {
+                "email": "stormchaser_1@login.stormchase.invalid",
+                "password": "secret-password",
+            },
+        )
         saved = json.loads(save_session.call_args.args[2])
         self.assertEqual(saved["refresh_token"], "rotating-refresh")
         self.assertNotIn("access_token", saved)
+        self.assertEqual(saved["username"], "stormchaser_1")
+
+    def test_sign_up_creates_a_username_identity_and_signs_in(self) -> None:
+        auth_payload = {
+            "access_token": "short-lived-access",
+            "refresh_token": "rotating-refresh",
+            "expires_in": 3600,
+            "user": {
+                "id": "user-1",
+                "email": "stormchaser_1@login.stormchase.invalid",
+            },
+        }
+        with (
+            patch.object(self.client, "_request", return_value=auth_payload) as request,
+            patch("supabase_client.keyring.set_password"),
+        ):
+            user = self.client.sign_up("StormChaser_1", "secret-password")
+
+        self.assertEqual(user, AuthUser("user-1", "stormchaser_1"))
+        self.assertEqual(
+            request.call_args.kwargs["payload"],
+            {
+                "email": "stormchaser_1@login.stormchase.invalid",
+                "password": "secret-password",
+            },
+        )
+
+    def test_sign_up_explains_when_email_confirmation_blocks_username_login(self) -> None:
+        with patch.object(
+            self.client,
+            "_request",
+            return_value={"user": {"id": "user-1"}},
+        ):
+            with self.assertRaisesRegex(SupabaseError, "Disable email confirmation"):
+                self.client.sign_up("stormchaser_1", "secret-password")
+
+    def test_rejects_invalid_username_before_auth_request(self) -> None:
+        with patch.object(self.client, "_request") as request:
+            with self.assertRaisesRegex(ValueError, "3–24 characters"):
+                self.client.sign_in("not a username", "secret-password")
+        request.assert_not_called()
 
     def test_restore_keeps_saved_token_when_supabase_is_temporarily_unavailable(self) -> None:
         with (
@@ -291,7 +388,7 @@ class SupabaseDataContractTests(unittest.TestCase):
         self.client._session = _AuthSession(
             access_token="access",
             refresh_token="refresh",
-            user=AuthUser("user-1", "storm@example.com"),
+            user=AuthUser("user-1", "stormchaser_1"),
             expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
         )
 
@@ -314,7 +411,7 @@ class SupabaseDataContractTests(unittest.TestCase):
         self.client._session = _AuthSession(
             access_token="expired-access",
             refresh_token="expired-refresh",
-            user=AuthUser("user-1", "storm@example.com"),
+            user=AuthUser("user-1", "stormchaser_1"),
             expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
         )
         cell = StormCell(

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 import json
 import math
 import os
+import re
 from threading import RLock
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -27,6 +28,17 @@ from tracking import StormCell, StormUpdate
 
 RADAR_BUCKET = "stormchase-radar"
 KEYRING_SERVICE = "StormChase Supabase"
+USERNAME_AUTH_DOMAIN = "login.stormchase.invalid"
+USERNAME_PATTERN = re.compile(r"[a-z0-9_]{3,24}\Z")
+
+
+def _username_auth_email(username: str) -> tuple[str, str]:
+    normalized = username.strip().lower()
+    if not USERNAME_PATTERN.fullmatch(normalized):
+        raise ValueError(
+            "Username must be 3–24 characters and contain only letters, numbers, or underscores."
+        )
+    return normalized, f"{normalized}@{USERNAME_AUTH_DOMAIN}"
 
 
 class SupabaseError(RuntimeError):
@@ -94,7 +106,7 @@ class SupabaseConfig:
 @dataclass(frozen=True)
 class AuthUser:
     identifier: str
-    email: str
+    username: str
 
 
 @dataclass(frozen=True)
@@ -215,10 +227,18 @@ class SupabaseClient:
             or not isinstance(expires_in, (int, float))
         ):
             raise SupabaseError("Supabase returned incomplete authentication data.")
+        expected_domain = f"@{USERNAME_AUTH_DOMAIN}"
+        if not email.lower().endswith(expected_domain):
+            raise SupabaseError(
+                "This Supabase account is not configured for StormChase username sign-in."
+            )
+        username = email[: -len(expected_domain)].lower()
+        if not USERNAME_PATTERN.fullmatch(username):
+            raise SupabaseError("Supabase returned an invalid StormChase username.")
         return _AuthSession(
             access_token=access_token,
             refresh_token=refresh_token,
-            user=AuthUser(identifier, email),
+            user=AuthUser(identifier, username),
             expires_at=datetime.now(timezone.utc) + timedelta(seconds=expires_in),
         )
 
@@ -227,7 +247,7 @@ class SupabaseClient:
             {
                 "refresh_token": session.refresh_token,
                 "user_id": session.user.identifier,
-                "email": session.user.email,
+                "username": session.user.username,
             },
             separators=(",", ":"),
         )
@@ -266,26 +286,26 @@ class SupabaseClient:
         self._save_session(session)
         return session.user
 
-    def sign_in(self, email: str, password: str) -> AuthUser:
-        email = email.strip()
-        if not email or not password:
-            raise ValueError("Enter both an email address and password.")
+    def sign_in(self, username: str, password: str) -> AuthUser:
+        _username, auth_email = _username_auth_email(username)
+        if not password:
+            raise ValueError("Enter both a username and password.")
         payload = self._request(
             "POST",
             "/auth/v1/token",
             query={"grant_type": "password"},
-            payload={"email": email, "password": password},
+            payload={"email": auth_email, "password": password},
         )
         return self._install_session(payload)
 
-    def sign_up(self, email: str, password: str) -> AuthUser | None:
-        email = email.strip()
-        if not email or len(password) < 8:
-            raise ValueError("Enter an email address and a password of at least 8 characters.")
+    def sign_up(self, username: str, password: str) -> AuthUser:
+        _username, auth_email = _username_auth_email(username)
+        if len(password) < 8:
+            raise ValueError("Password must contain at least 8 characters.")
         payload = self._request(
             "POST",
             "/auth/v1/signup",
-            payload={"email": email, "password": password},
+            payload={"email": auth_email, "password": password},
         )
         if not isinstance(payload, dict):
             raise SupabaseError("Supabase returned an invalid sign-up response.")
@@ -293,7 +313,10 @@ class SupabaseClient:
             return self._install_session(payload)
         user_payload = payload.get("user") or payload
         if isinstance(user_payload, dict) and user_payload.get("id"):
-            return None
+            raise SupabaseError(
+                "Supabase created the account but did not sign in. "
+                "Disable email confirmation in Supabase Auth to use username-only accounts."
+            )
         raise SupabaseError("Supabase did not return a user for sign-up.")
 
     def restore_session(self) -> AuthUser | None:
@@ -589,6 +612,35 @@ class SupabaseClient:
             },
         )
         return rows[0] if rows else None
+
+    def daily_outlook_grid(self, forecast_date: date) -> dict[str, Any] | None:
+        rows = self._table_rows(
+            "daily_outlook_forecasts",
+            {
+                "select": "forecast_date,issued_at,grid_payload",
+                "forecast_date": f"eq.{forecast_date.isoformat()}",
+                "limit": "1",
+            },
+        )
+        if not rows:
+            return None
+
+        row = rows[0]
+        if row.get("forecast_date") != forecast_date.isoformat():
+            raise SupabaseError("Daily outlook row has an unexpected forecast date.")
+        grid = row.get("grid_payload")
+        if not isinstance(grid, list) or not all(
+            isinstance(point, dict)
+            and isinstance(point.get("icon_d2"), dict)
+            for point in grid
+        ):
+            raise SupabaseError(
+                "Daily outlook payload must contain ICON-D2 grid forecasts."
+            )
+        return {
+            "issued_at": _parse_datetime(row.get("issued_at"), "daily outlook"),
+            "grid": grid,
+        }
 
     def latest_rain_cells(self) -> tuple[RainCell, ...] | None:
         snapshot = self.latest_snapshot("rain_cells")
