@@ -56,6 +56,7 @@ from radar import (
 from supabase_client import AuthUser, SupabaseClient, SupabaseConfig, SupabaseError
 from tracking import StormCell, StormUpdate, fetch_latest_storm_cells, project_cell_motion
 from calculations import (
+    NO_LFC_SENTINEL_M,
     calculate_best_day_window,
     calculate_manual_storm,
     nearest_outlook_entry,
@@ -155,28 +156,61 @@ def calculate_germany_outlook(
         calculation_time = issued_at
         print(f"USING SUPABASE DAILY OUTLOOK ISSUED AT {issued_at.isoformat()}")
 
-    if len(weather) != len(points):
-        raise RuntimeError(
-            f"Open-Meteo returned {len(weather)} location forecasts for "
-            f"{len(points)} outlook grid points."
-        )
-
     fields = STORMANALYZER_HOURLY_FIELDS.split(",")
     required_fields = [
         field
         for field in fields
         if field not in OPTIONAL_STORMANALYZER_HOURLY_FIELDS
     ]
+
+    def validate_grid_profiles(grid_weather: list[dict[str, Any]]) -> None:
+        if len(grid_weather) != len(points):
+            raise RuntimeError(
+                f"Open-Meteo returned {len(grid_weather)} location forecasts for "
+                f"{len(points)} outlook grid points."
+            )
+        for location in grid_weather:
+            hourly = location.get("icon_d2")
+            if not isinstance(hourly, dict):
+                raise RuntimeError("Daily outlook is missing ICON-D2 hourly data.")
+            _validate_hourly(hourly, required_fields)
+            try:
+                elevation = float(hourly["surface_elevation_m"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise RuntimeError(
+                    "Daily outlook is missing ICON-D2 surface elevation data."
+                ) from error
+            if not math.isfinite(elevation):
+                raise RuntimeError(
+                    "Daily outlook is missing ICON-D2 surface elevation data."
+                )
+            cin = hourly.get("cin")
+            if not isinstance(cin, list) or len(cin) != len(hourly["time"]):
+                raise RuntimeError("Daily outlook is missing matching CIN data.")
+
+    if cached_outlook is not None:
+        try:
+            validate_grid_profiles(weather)
+        except RuntimeError as error:
+            print(
+                "WARNING: Supabase daily outlook lacks the required "
+                f"thermodynamic profile; refreshing from ICON-D2: {error}"
+            )
+            weather = get_germany_grid_weather(points)
+            issued_at = now
+            calculation_time = now.replace(
+                hour=0,
+                minute=0,
+                second=0,
+                microsecond=0,
+            )
+
+    validate_grid_profiles(weather)
+
     outlook = []
     for (latitude, longitude), location in zip(points, weather):
         best_by_day: dict[int, dict[str, Any]] = {}
         hourly = location.get("icon_d2")
-        if not isinstance(hourly, dict):
-            raise RuntimeError("Daily outlook is missing ICON-D2 hourly data.")
-        _validate_hourly(hourly, required_fields)
-        cin = hourly.get("cin")
-        if not isinstance(cin, list) or len(cin) != len(hourly["time"]):
-            raise RuntimeError("Daily outlook is missing matching CIN data.")
         for day in range(2):
             result = calculate_best_day_window(
                 hourly,
@@ -1276,11 +1310,57 @@ class StormRadarApp:
             )
         manual_box.columnconfigure(1, weight=1)
         manual_box.columnconfigure(3, weight=1)
+        advanced_box = ttk.LabelFrame(
+            manual_box,
+            text="Required near-surface tornado inputs",
+            style="Panel.TLabelframe",
+            padding=6,
+        )
+        advanced_box.grid(row=7, column=0, columnspan=4, sticky="ew", pady=(6, 0))
+        ttk.Label(
+            advanced_box,
+            text=(
+                "All fields are required. Enter "
+                f"{NO_LFC_SENTINEL_M:g} m when no LFC is found in the profile."
+            ),
+            style="Panel.TLabel",
+        ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 3))
+        profile_fields = (
+            ("srh_0_1km", "0–1 km SRH (m²/s²)"),
+            ("srh_0_3km", "0–3 km SRH (m²/s²)"),
+            ("srh_efficiency", "SRH efficiency (0–1)"),
+            ("shear_0_500m", "0–500 m shear (m/s)"),
+            ("critical_angle", "Critical angle (°)"),
+            ("low_level_lapse", "0–2 km lapse rate (°C/km)"),
+            ("cape_0_3km", "0–3 km CAPE (J/kg)"),
+            ("lfc", "LFC height (m)"),
+        )
+        for index, (key, label) in enumerate(profile_fields):
+            row = index // 2 + 1
+            column = (index % 2) * 2
+            value = tk.StringVar()
+            self.manual_outlook_inputs[key] = value
+            ttk.Label(advanced_box, text=label, style="Panel.TLabel").grid(
+                row=row,
+                column=column,
+                sticky="w",
+                padx=(0, 6),
+                pady=3,
+            )
+            ttk.Entry(advanced_box, textvariable=value, width=12).grid(
+                row=row,
+                column=column + 1,
+                sticky="ew",
+                padx=(0, 14),
+                pady=3,
+            )
+        advanced_box.columnconfigure(1, weight=1)
+        advanced_box.columnconfigure(3, weight=1)
         ttk.Button(
             manual_box,
             text="Calculate manual risk",
             command=self._calculate_manual_outlook,
-        ).grid(row=7, column=0, columnspan=4, sticky="w", pady=(8, 4))
+        ).grid(row=8, column=0, columnspan=4, sticky="w", pady=(8, 4))
         self.manual_outlook_result = tk.StringVar(
             value="Enter environmental values and calculate a manual storm-risk assessment."
         )
@@ -1290,7 +1370,7 @@ class StormRadarApp:
             style="Panel.TLabel",
             justify="left",
             wraplength=900,
-        ).grid(row=8, column=0, columnspan=4, sticky="ew", pady=(4, 0))
+        ).grid(row=9, column=0, columnspan=4, sticky="ew", pady=(4, 0))
 
     def _set_manual_outlook_location(self) -> None:
         try:
@@ -1323,12 +1403,13 @@ class StormRadarApp:
 
     def _calculate_manual_outlook(self) -> None:
         try:
-            values = {
-                key: float(value.get())
-                for key, value in self.manual_outlook_inputs.items()
-            }
+            values = {}
+            for key, value in self.manual_outlook_inputs.items():
+                values[key] = float(value.get().strip())
         except ValueError:
-            self.manual_outlook_result.set("Calculation error: enter a valid number in every field.")
+            self.manual_outlook_result.set(
+                "Calculation error: enter a valid number in every field."
+            )
             return
         if not all(math.isfinite(value) for value in values.values()):
             self.manual_outlook_result.set("Calculation error: all values must be finite numbers.")
@@ -1348,6 +1429,14 @@ class StormRadarApp:
             f"Tornado {analysis['tornado']}/80 · Hail {analysis['hail']}/80 · "
             f"Wind {analysis['wind']}/80 · Supercell {analysis['supercell']}/20 · "
             f"MCS {analysis['mcs']}/20\n"
+            f"Low-level profile: 0–1 km SRH {values['srh_0_1km']:.0f} · "
+            f"0–3 km SRH {values['srh_0_3km']:.0f} · "
+            f"SRH efficiency {values['srh_efficiency']:.2f} · "
+            f"0–500 m shear {values['shear_0_500m']:.1f} m/s · "
+            f"critical angle {values['critical_angle']:.0f}°\n"
+            f"0–2 km lapse {values['low_level_lapse']:.1f} °C/km · "
+            f"0–3 km CAPE {values['cape_0_3km']:.0f} J/kg · "
+            f"LFC {values['lfc']:.0f} m\n"
             f"Threats: {threats}\n"
             f"Issued: {analysis['issued']}\n"
             f"Assessment:\n{criticism}\n"
@@ -1384,6 +1473,14 @@ class StormRadarApp:
             f"Dewpoint {environment['dewpoint']} °C · Humidity {environment['humidity']}%\n"
             f"SRH {environment['srh']} m²/s² · Deep shear {environment['high_shear']} kt · "
             f"Low-level shear {environment['low_shear']} kt\n"
+            f"Near-surface: 0–1 km SRH {environment['srh_0_1km']:.0f} · "
+            f"0–3 km SRH {environment['srh_0_3km']:.0f} · "
+            f"efficiency {environment['srh_efficiency']:.2f} · "
+            f"0–500 m shear {environment['shear_0_500m']:.1f} m/s · "
+            f"critical angle {environment['critical_angle']:.0f}°\n"
+            f"0–2 km lapse {environment['low_level_lapse']:.1f} °C/km · "
+            f"0–3 km CAPE {environment['cape_0_3km']:.0f} J/kg · "
+            f"LFC {environment['lfc']:.0f} m\n"
             f"Tornado {entry['tornado']}/80 · Hail {entry['hail']}/80 · "
             f"Wind {entry['wind']}/80 · Supercell {entry['supercell']}/20 · "
             f"MCS {entry['mcs']}/20\n"

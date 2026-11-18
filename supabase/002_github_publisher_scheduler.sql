@@ -37,7 +37,7 @@ begin
     end if;
 
     return net.http_post(
-        url := 'https://api.github.com/repos/alsohalteinbenutzername-source/chasepublisher/actions/workflows/publish.yml/dispatches',
+        url := 'https://api.github.com/repos/alsohalteinbenutzername-source/stormchase/actions/workflows/publish.yml/dispatches',
         body := jsonb_build_object('ref', 'main'),
         headers := jsonb_build_object(
             'Accept', 'application/vnd.github+json',

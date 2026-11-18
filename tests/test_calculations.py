@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 from calculations import (
     calculate_best_day_window,
     calculate_environment,
+    calculate_low_level_buoyancy_metrics,
     calculate_manual_storm,
     calculate_storm_motion_features,
 )
@@ -26,6 +27,14 @@ class CalculateManualStormTests(unittest.TestCase):
             "temperature": 30,
             "lapse": 6.5,
             "coverage": 100,
+            "srh_0_1km": 150,
+            "srh_0_3km": 250,
+            "srh_efficiency": 0.6,
+            "shear_0_500m": 10,
+            "critical_angle": 90,
+            "low_level_lapse": 6.5,
+            "cape_0_3km": 300,
+            "lfc": 800,
         }
 
     def test_calculates_manual_values_with_stormanalyzer(self) -> None:
@@ -41,28 +50,91 @@ class CalculateManualStormTests(unittest.TestCase):
             self.values["temperature"],
             self.values["lapse"],
             self.values["coverage"],
+            **{
+                key: self.values[key]
+                for key in (
+                    "srh_0_1km",
+                    "srh_0_3km",
+                    "srh_efficiency",
+                    "shear_0_500m",
+                    "critical_angle",
+                    "low_level_lapse",
+                    "cape_0_3km",
+                    "lfc",
+                )
+            },
         )
 
         self.assertEqual(calculate_manual_storm(self.values), expected)
+
+    def test_passes_low_level_profile_values_to_stormanalyzer(self) -> None:
+        profile = {
+            "srh_0_1km": 400,
+            "srh_0_3km": 450,
+            "srh_efficiency": 0.8,
+            "shear_0_500m": 12,
+            "critical_angle": 90,
+            "low_level_lapse": 6.0,
+            "cape_0_3km": 250,
+            "lfc": 500,
+        }
+        expected = analyze_storm(
+            self.values["cape"],
+            self.values["high_shear"],
+            self.values["low_shear"],
+            self.values["dewpoint"],
+            self.values["srh"],
+            self.values["cin"],
+            self.values["lcl"],
+            self.values["humidity"],
+            self.values["temperature"],
+            self.values["lapse"],
+            self.values["coverage"],
+            **profile,
+        )
+
+        self.assertEqual(calculate_manual_storm({**self.values, **profile}), expected)
 
     def test_rejects_missing_or_non_finite_manual_values(self) -> None:
         missing = dict(self.values)
         del missing["cape"]
         with self.assertRaisesRegex(ValueError, "Missing manual input: cape"):
             calculate_manual_storm(missing)
+        missing_profile = dict(self.values)
+        del missing_profile["srh_0_1km"]
+        with self.assertRaisesRegex(ValueError, "Missing manual input: srh_0_1km"):
+            calculate_manual_storm(missing_profile)
 
         non_finite = dict(self.values, cape=float("nan"))
         with self.assertRaisesRegex(ValueError, "cape must be finite"):
             calculate_manual_storm(non_finite)
 
+        invalid_profile = dict(self.values, critical_angle=float("inf"))
+        with self.assertRaisesRegex(ValueError, "critical_angle must be finite"):
+            calculate_manual_storm(invalid_profile)
+
     def test_calibrates_tornado_score_by_the_final_overall_risk(self) -> None:
-        low_risk = analyze_storm(100, 35, 29, 20, 300, -150, 850, 85, 30, 7.5)
-        high_risk = analyze_storm(1000, 35, 29, 20, 300, -50, 850, 85, 30, 7.5)
+        profile = {
+            "srh_0_1km": 300,
+            "srh_0_3km": 300,
+            "srh_efficiency": 1.0,
+            "shear_0_500m": 15,
+            "critical_angle": 90,
+            "low_level_lapse": 7.5,
+            "cape_0_3km": 400,
+            "lfc": 500,
+        }
+        low_risk = analyze_storm(
+            100, 35, 29, 20, 300, -150, 850, 85, 30, 7.5, **profile
+        )
+        high_risk = analyze_storm(
+            1000, 35, 29, 20, 300, -50, 850, 85, 30, 7.5, **profile
+        )
 
         self.assertAlmostEqual(low_risk["risk"], 0.58)
-        self.assertAlmostEqual(low_risk["tornado"], 0.82)
+        self.assertAlmostEqual(low_risk["tornado"], 43.21)
         self.assertAlmostEqual(high_risk["risk"], 75.24)
-        self.assertAlmostEqual(high_risk["tornado"], 61.08)
+        self.assertAlmostEqual(high_risk["tornado"], 68.0)
 
     def test_distinguishes_hslc_tornadoes_from_warm_season_hail_supercells(self) -> None:
         hslc = analyze_storm(
@@ -133,12 +205,12 @@ class CalculateManualStormTests(unittest.TestCase):
         self.assertEqual(strong_cin["supercell"], weak_cin["supercell"])
         self.assertEqual(strong_cin["hail"], weak_cin["hail"])
 
-    def test_derives_near_surface_vector_shear_and_tolerates_nan_optional_winds(self) -> None:
+    def test_requires_finite_180m_winds_and_derives_near_surface_shear(self) -> None:
         sounding = {
             "wind10": 10,
             "dir10": 180,
-            "wind180": float("nan"),
-            "dir180": float("nan"),
+            "wind180": 20,
+            "dir180": 180,
             "wind925": 30,
             "dir925": 180,
             "wind850": 40,
@@ -147,17 +219,43 @@ class CalculateManualStormTests(unittest.TestCase):
             "dir700": 180,
             "wind500": 60,
             "dir500": 180,
+            "height925": 750,
+            "height850": 1500,
+            "height700": 3000,
+            "height500": 5500,
         }
 
         features = calculate_storm_motion_features(sounding)
 
         self.assertTrue(math.isfinite(features["shear_10m_180m"]))
         self.assertTrue(math.isfinite(features["shear_0_500m"]))
-        expected_shear = (20 * (180 - 10) / (750 - 10)) / 3.6
-        self.assertAlmostEqual(features["shear_10m_180m"], expected_shear)
+        self.assertAlmostEqual(features["shear_10m_180m"], 10 / 3.6)
+
+        sounding["wind180"] = float("nan")
+        with self.assertRaisesRegex(ValueError, "complete surface-to-3 km"):
+            calculate_storm_motion_features(sounding)
 
     def test_keeps_extreme_environment_scores_out_of_the_near_100_range(self) -> None:
-        analysis = analyze_storm(3700, 35, 29, 20, 300, 0, 850, 85, 30, 7.5)
+        analysis = analyze_storm(
+            3700,
+            35,
+            29,
+            20,
+            300,
+            0,
+            850,
+            85,
+            30,
+            7.5,
+            srh_0_1km=300,
+            srh_0_3km=300,
+            srh_efficiency=1.0,
+            shear_0_500m=15,
+            critical_angle=90,
+            low_level_lapse=7.5,
+            cape_0_3km=400,
+            lfc=500,
+        )
 
         self.assertAlmostEqual(analysis["risk"], 89.22)
         self.assertLess(analysis["risk"], 95)
@@ -187,12 +285,25 @@ class CalculateBestDayWindowTests(unittest.TestCase):
             "temperature_2m": [25, 25, 25, 25],
             "dew_point_2m": [None, 18, 18, 18],
             "relative_humidity_2m": [70, 70, 70, 70],
+            "surface_pressure": [1000, 1000, 1000, 1000],
+            "temperature_925hPa": [15, 15, 15, 15],
+            "temperature_850hPa": [20, 20, 20, 20],
             "temperature_700hPa": [10, 10, 10, 10],
             "temperature_500hPa": [-10, -10, -10, -10],
+            "relative_humidity_925hPa": [80, 80, 80, 80],
+            "relative_humidity_850hPa": [75, 75, 75, 75],
+            "relative_humidity_700hPa": [60, 60, 60, 60],
+            "relative_humidity_500hPa": [40, 40, 40, 40],
+            "geopotential_height_925hPa": [600, 600, 600, 600],
+            "geopotential_height_850hPa": [1500, 1500, 1500, 1500],
+            "geopotential_height_700hPa": [3000, 3000, 3000, 3000],
+            "geopotential_height_500hPa": [5500, 5500, 5500, 5500],
             "precipitation": [0, 0, 0, 0],
             "snowfall": [0, 0, 0, 0],
             "wind_speed_10m": [10, 10, 10, 10],
             "wind_direction_10m": [180, 180, 180, 180],
+            "wind_speed_180m": [12, 12, 12, 12],
+            "wind_direction_180m": [180, 180, 180, 180],
             "wind_speed_925hPa": [15, 15, 15, 15],
             "wind_direction_925hPa": [180, 180, 180, 180],
             "wind_speed_850hPa": [20, 20, 20, 20],
@@ -201,6 +312,7 @@ class CalculateBestDayWindowTests(unittest.TestCase):
             "wind_direction_700hPa": [180, 180, 180, 180],
             "wind_speed_500hPa": [40, 40, 40, 40],
             "wind_direction_500hPa": [180, 180, 180, 180],
+            "surface_elevation_m": 100,
         }
 
     def test_selects_best_valid_hour_separately_for_day_one_and_two(self) -> None:
@@ -222,23 +334,48 @@ class CalculateBestDayWindowTests(unittest.TestCase):
         self.assertEqual(day_two["time"].hour, 12)
         self.assertEqual(day_two["environment"]["cape"], 2500)
 
-    def test_extracts_optional_low_level_fields_and_skips_nan_required_values(self) -> None:
+    def test_derives_required_low_level_fields_and_skips_incomplete_profiles(self) -> None:
         hourly = dict(self.hourly)
-        hourly["temperature_850hPa"] = [10, 10, 10, 10]
-        hourly["wind_speed_180m"] = [float("nan")] * 4
-        hourly["wind_direction_180m"] = [float("nan")] * 4
-        hourly["cape_0_3km"] = [float("nan")] * 4
-        hourly["lfc_height_m"] = [float("nan")] * 4
+        hourly["wind_speed_180m"] = [12, 12, float("nan"), 12]
         hourly["temperature_2m"] = [25, 25, float("nan"), 25]
 
         environment = calculate_environment(hourly, 1)
         best = calculate_best_day_window(hourly, self.now.date(), self.now)
 
-        self.assertIsNone(environment["cape_0_3km"])
-        self.assertIsNone(environment["lfc"])
+        self.assertGreaterEqual(environment["cape_0_3km"], 0)
+        self.assertGreater(environment["lfc"], 0)
         self.assertTrue(math.isfinite(environment["shear_0_500m"]))
-        self.assertIsNotNone(environment["low_level_lapse"])
         self.assertEqual(best["time"].hour, 19)
+        for field in (
+            "srh_0_1km",
+            "srh_0_3km",
+            "srh_efficiency",
+            "critical_angle",
+            "low_level_lapse",
+            "cape_0_3km",
+            "lfc",
+        ):
+            self.assertTrue(math.isfinite(environment[field]), field)
+
+    def test_uses_finite_lfc_sentinel_when_profile_never_reaches_free_convection(self) -> None:
+        hourly = dict(self.hourly)
+        hourly.update({
+            "temperature_2m": [20] * 4,
+            "dew_point_2m": [10] * 4,
+            "temperature_925hPa": [17] * 4,
+            "temperature_850hPa": [14] * 4,
+            "temperature_700hPa": [5] * 4,
+            "temperature_500hPa": [-15] * 4,
+            "relative_humidity_925hPa": [55] * 4,
+            "relative_humidity_850hPa": [50] * 4,
+            "relative_humidity_700hPa": [35] * 4,
+            "relative_humidity_500hPa": [20] * 4,
+        })
+
+        features = calculate_low_level_buoyancy_metrics(hourly, 1)
+
+        self.assertEqual(features["cape_0_3km"], 0.0)
+        self.assertEqual(features["lfc"], 6000.0)
 
 
 if __name__ == "__main__":

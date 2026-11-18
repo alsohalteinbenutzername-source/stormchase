@@ -6,6 +6,8 @@ On **17 November 2026**, StormChase's **StormAnalyzer** outlook model and real-t
 
 During a cold-season **High-Shear, Low-CAPE (HSLC)** Atlantic frontal passage, StormAnalyzer's 744-point ICON-D2 scoring grid highlighted a primary **15–30% tornado threat corridor** stretching from northern France into southern Belgium, alongside lower marginal risk tiers across the Benelux region and northern North Rhine-Westphalia (NRW). Between **17:45 and 19:15 CET**, a fast-moving convective cell (92–115 km/h ENE) intensified along the French–Belgian border near **Maubeuge, Jeumont, and Estinnes**, producing a textbook dual-polarization **Tornado Debris Signature (TDS)** before crossing into DWD's volumetric radar footprint near Namur and later re-organizing into a squall line with embedded mesocyclones over western Germany.
 
+The [Keraunos report](https://www.keraunos.org/actualites/fil-infos/2026/novembre/tornade-possible-boiry-becquerelle-pas-de-calais-arras-17-novembre-2026) covers damage from an intense wind phenomenon at Boiry-Becquerelle in Pas-de-Calais, France. It says Doppler data did not distinguish a distinct rotation and that an investigation was underway to determine the event's nature. It is an additional report from the same date, but it does not confirm a tornado near Estinnes or in Belgium.
+
 ---
 
 ## 1. Synoptic & Mesoscale Setup

@@ -65,16 +65,28 @@ class GermanyOutlookGridTests(unittest.TestCase):
                 "cape": cape,
                 "cin": -50,
                 "convective_inhibition": -50,
+                "surface_pressure": 1000,
                 "temperature_850hPa": 10,
                 "temperature_2m": 25,
                 "dew_point_2m": 18,
                 "relative_humidity_2m": 70,
+                "temperature_925hPa": 15,
+                "relative_humidity_925hPa": 80,
+                "relative_humidity_850hPa": 75,
+                "relative_humidity_700hPa": 60,
+                "relative_humidity_500hPa": 40,
+                "geopotential_height_925hPa": 600,
+                "geopotential_height_850hPa": 1500,
+                "geopotential_height_700hPa": 3000,
+                "geopotential_height_500hPa": 5500,
                 "temperature_700hPa": 10,
                 "temperature_500hPa": -10,
                 "precipitation": 0,
                 "snowfall": 0,
                 "wind_speed_10m": 10,
                 "wind_direction_10m": 180,
+                "wind_speed_180m": 12,
+                "wind_direction_180m": 180,
                 "wind_speed_925hPa": 15,
                 "wind_direction_925hPa": 180,
                 "wind_speed_850hPa": 20,
@@ -84,10 +96,12 @@ class GermanyOutlookGridTests(unittest.TestCase):
                 "wind_speed_500hPa": 40,
                 "wind_direction_500hPa": 180,
             }
-            return {
+            hourly = {
                 "time": times,
                 **{field: [value] * hours for field, value in values.items()},
             }
+            hourly["surface_elevation_m"] = 100
+            return hourly
 
         forecasts = [
             {
@@ -144,9 +158,19 @@ class GermanyOutlookGridTests(unittest.TestCase):
             "time": times,
             "cape": [500] * 48,
             "convective_inhibition": [-50] * 48,
+            "surface_pressure": [1000] * 48,
             "temperature_850hPa": [10] * 48,
+            "temperature_925hPa": [15] * 48,
             "temperature_700hPa": [10] * 48,
             "temperature_500hPa": [-10] * 48,
+            "relative_humidity_925hPa": [80] * 48,
+            "relative_humidity_850hPa": [75] * 48,
+            "relative_humidity_700hPa": [60] * 48,
+            "relative_humidity_500hPa": [40] * 48,
+            "geopotential_height_925hPa": [600] * 48,
+            "geopotential_height_850hPa": [1500] * 48,
+            "geopotential_height_700hPa": [3000] * 48,
+            "geopotential_height_500hPa": [5500] * 48,
             "temperature_2m": [25] * 48,
             "dew_point_2m": [18] * 48,
             "relative_humidity_2m": [70] * 48,
@@ -154,6 +178,8 @@ class GermanyOutlookGridTests(unittest.TestCase):
             "snowfall": [0] * 48,
             "wind_speed_10m": [10] * 48,
             "wind_direction_10m": [180] * 48,
+            "wind_speed_180m": [12] * 48,
+            "wind_direction_180m": [180] * 48,
             "wind_speed_925hPa": [15] * 48,
             "wind_direction_925hPa": [180] * 48,
             "wind_speed_850hPa": [20] * 48,
@@ -163,6 +189,7 @@ class GermanyOutlookGridTests(unittest.TestCase):
             "wind_speed_500hPa": [40] * 48,
             "wind_direction_500hPa": [180] * 48,
             "cin": [-50] * 48,
+            "surface_elevation_m": 100,
         }
         issued_at = datetime.now(ZoneInfo("Europe/Berlin"))
         supabase = Mock()
@@ -182,6 +209,25 @@ class GermanyOutlookGridTests(unittest.TestCase):
         self.assertEqual(returned_issued_at, issued_at)
         self.assertTrue(outlook)
 
+        legacy_hourly = dict(hourly)
+        legacy_hourly.pop("surface_pressure")
+        supabase.daily_outlook_grid.return_value = {
+            "issued_at": issued_at,
+            "grid": [{"icon_d2": legacy_hourly}],
+        }
+        with (
+            patch("ui.germany_grid_points", return_value=points),
+            patch(
+                "weather_api.get_germany_grid_weather",
+                return_value=[{"icon_d2": hourly}],
+            ) as fetch,
+        ):
+            refreshed_outlook, refreshed_at = calculate_germany_outlook((), supabase)
+
+        fetch.assert_called_once_with(points)
+        self.assertNotEqual(refreshed_at, issued_at)
+        self.assertTrue(refreshed_outlook)
+
     def test_best_windows_stay_the_same_when_reloaded_later_in_the_day(self) -> None:
         points = [(50.1, 7.1)]
         times = [
@@ -194,16 +240,28 @@ class GermanyOutlookGridTests(unittest.TestCase):
             "cape": [5000, 500, 1500, 2000],
             "cin": [-50] * 4,
             "convective_inhibition": [-50] * 4,
+            "surface_pressure": [1000] * 4,
             "temperature_850hPa": [10] * 4,
+            "temperature_925hPa": [15] * 4,
             "temperature_2m": [25] * 4,
             "dew_point_2m": [18] * 4,
             "relative_humidity_2m": [70] * 4,
+            "relative_humidity_925hPa": [80] * 4,
+            "relative_humidity_850hPa": [75] * 4,
+            "relative_humidity_700hPa": [60] * 4,
+            "relative_humidity_500hPa": [40] * 4,
+            "geopotential_height_925hPa": [600] * 4,
+            "geopotential_height_850hPa": [1500] * 4,
+            "geopotential_height_700hPa": [3000] * 4,
+            "geopotential_height_500hPa": [5500] * 4,
             "temperature_700hPa": [10] * 4,
             "temperature_500hPa": [-10] * 4,
             "precipitation": [0] * 4,
             "snowfall": [0] * 4,
             "wind_speed_10m": [10] * 4,
             "wind_direction_10m": [180] * 4,
+            "wind_speed_180m": [12] * 4,
+            "wind_direction_180m": [180] * 4,
             "wind_speed_925hPa": [15] * 4,
             "wind_direction_925hPa": [180] * 4,
             "wind_speed_850hPa": [20] * 4,
@@ -213,7 +271,13 @@ class GermanyOutlookGridTests(unittest.TestCase):
             "wind_speed_500hPa": [40] * 4,
             "wind_direction_500hPa": [180] * 4,
         }
-        grid = [{"icon_d2": {"time": times, **values}}]
+        grid = [{
+            "icon_d2": {
+                "time": times,
+                "surface_elevation_m": 100,
+                **values,
+            }
+        }]
         issued_at = datetime(2026, 11, 17, 10, tzinfo=ZoneInfo("Europe/Berlin"))
         results = []
 

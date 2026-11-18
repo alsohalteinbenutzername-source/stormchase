@@ -19,9 +19,7 @@ def _unit_interval(value):
 
 
 def _tornado_interaction_gate(
-    cape,
     lcl,
-    srh,
     srh_0_1km,
     srh_0_3km,
     srh_efficiency,
@@ -31,83 +29,50 @@ def _tornado_interaction_gate(
     cape_0_3km,
     lfc,
     cin,
-    low_shear,
 ):
     """Combine low-level buoyancy, shear, helicity, and boundary-layer factors."""
-    cape_value = _finite_score_value(cape_0_3km)
-    cape_scale = 400.0
-    if cape_value is None:
-        cape_value = _finite_score_value(cape)
-        cape_scale = 1500.0
-    cape_factor = 0.7 + 0.3 * _unit_interval((cape_value or 0.0) / cape_scale)
-
-    lcl_value = _finite_score_value(lcl)
+    cape_factor = 0.7 + 0.3 * _unit_interval(cape_0_3km / 400.0)
     lcl_factor = (
         1.0
-        if lcl_value is None or lcl_value <= 1100.0
-        else _unit_interval((1800.0 - lcl_value) / 700.0)
+        if lcl <= 1100.0
+        else _unit_interval((1800.0 - lcl) / 700.0)
     )
 
-    helicity = _finite_score_value(srh_0_1km)
-    if helicity is None:
-        helicity = _finite_score_value(srh)
-    helicity = max(helicity or 0.0, 0.0)
+    helicity = max(srh_0_1km, 0.0)
     helicity_factor = 0.25 + 0.75 * math.sqrt(
         _unit_interval(helicity / 300.0)
     )
 
-    helicity_efficiency = _finite_score_value(srh_efficiency)
-    efficiency_factor = (
-        1.0
-        if helicity_efficiency is None
-        else 0.25 + 0.75 * _unit_interval(helicity_efficiency)
-    )
+    efficiency_factor = 0.25 + 0.75 * _unit_interval(srh_efficiency)
+    concentration = _unit_interval(helicity / max(abs(srh_0_3km), 1.0))
+    concentration_factor = 0.25 + 0.75 * concentration
+    shear_factor = 0.2 + 0.8 * _unit_interval(shear_0_500m / 15.0)
 
-    helicity_3km = _finite_score_value(srh_0_3km)
-    concentration_factor = 1.0
-    if helicity_3km is not None:
-        concentration = _unit_interval(helicity / max(abs(helicity_3km), 1.0))
-        concentration_factor = 0.25 + 0.75 * concentration
+    if critical_angle < 45.0 or critical_angle > 135.0:
+        angle_factor = 0.2
+    elif critical_angle < 70.0:
+        angle_factor = 0.2 + 0.8 * (critical_angle - 45.0) / 25.0
+    elif critical_angle > 110.0:
+        angle_factor = 0.2 + 0.8 * (135.0 - critical_angle) / 25.0
+    else:
+        angle_factor = 1.0
 
-    shear = _finite_score_value(shear_0_500m)
-    if shear is None:
-        old_shear = _finite_score_value(low_shear)
-        shear = old_shear * 0.5144 if old_shear is not None else None
-    shear_factor = (
-        1.0
-        if shear is None
-        else 0.2 + 0.8 * _unit_interval(shear / 15.0)
-    )
+    if low_level_lapse < 4.5:
+        lapse_factor = max(0.75, 1.0 - 0.08 * (4.5 - low_level_lapse))
+    elif low_level_lapse > 8.5:
+        lapse_factor = max(0.75, 1.0 - 0.08 * (low_level_lapse - 8.5))
+    else:
+        lapse_factor = 1.0
 
-    angle = _finite_score_value(critical_angle)
-    angle_factor = 1.0
-    if angle is not None:
-        if angle < 45.0 or angle > 135.0:
-            angle_factor = 0.2
-        elif angle < 70.0:
-            angle_factor = 0.2 + 0.8 * (angle - 45.0) / 25.0
-        elif angle > 110.0:
-            angle_factor = 0.2 + 0.8 * (135.0 - angle) / 25.0
-
-    lapse = _finite_score_value(low_level_lapse)
-    lapse_factor = 1.0
-    if lapse is not None and lapse < 4.5:
-        lapse_factor = max(0.75, 1.0 - 0.08 * (4.5 - lapse))
-    elif lapse is not None and lapse > 8.5:
-        lapse_factor = max(0.75, 1.0 - 0.08 * (lapse - 8.5))
-
-    lfc_value = _finite_score_value(lfc)
     lfc_factor = (
         1.0
-        if lfc_value is None or lfc_value <= 1000.0
-        else max(0.4, 1.0 - (lfc_value - 1000.0) / 2500.0)
+        if lfc <= 1000.0
+        else max(0.4, 1.0 - (lfc - 1000.0) / 2500.0)
     )
-
-    cin_value = _finite_score_value(cin)
     cin_factor = (
         1.0
-        if cin_value is None or cin_value >= -50.0
-        else max(0.45, 1.0 - (abs(cin_value) - 50.0) / 300.0)
+        if cin >= -50.0
+        else max(0.45, 1.0 - (abs(cin) - 50.0) / 300.0)
     )
 
     factors = (
@@ -437,14 +402,14 @@ def analyze_storm(
     lapse,
     coverage=50,
     *,
-    srh_0_1km=None,
-    srh_0_3km=None,
-    srh_efficiency=None,
-    shear_0_500m=None,
-    critical_angle=None,
-    low_level_lapse=None,
-    cape_0_3km=None,
-    lfc=None,
+    srh_0_1km,
+    srh_0_3km,
+    srh_efficiency,
+    shear_0_500m,
+    critical_angle,
+    low_level_lapse,
+    cape_0_3km,
+    lfc,
 ):
 
     mcs_score = 0
@@ -477,9 +442,35 @@ def analyze_storm(
 
         return points[-1][1]
 
-    tornado_helicity = _finite_score_value(srh_0_1km)
-    if tornado_helicity is None:
-        tornado_helicity = srh
+    profile_values = {
+        "srh_0_1km": srh_0_1km,
+        "srh_0_3km": srh_0_3km,
+        "srh_efficiency": srh_efficiency,
+        "shear_0_500m": shear_0_500m,
+        "critical_angle": critical_angle,
+        "low_level_lapse": low_level_lapse,
+        "cape_0_3km": cape_0_3km,
+        "lfc": lfc,
+    }
+    for name, value in profile_values.items():
+        normalized_value = _finite_score_value(value)
+        if normalized_value is None:
+            raise ValueError(f"{name} must be a finite number.")
+        profile_values[name] = normalized_value
+    srh_0_1km = profile_values["srh_0_1km"]
+    srh_0_3km = profile_values["srh_0_3km"]
+    srh_efficiency = profile_values["srh_efficiency"]
+    shear_0_500m = profile_values["shear_0_500m"]
+    critical_angle = profile_values["critical_angle"]
+    low_level_lapse = profile_values["low_level_lapse"]
+    cape_0_3km = profile_values["cape_0_3km"]
+    lfc = profile_values["lfc"]
+    if not 0.0 <= critical_angle <= 180.0:
+        raise ValueError("critical_angle must be between 0 and 180 degrees.")
+    if not 0.0 <= srh_efficiency <= 1.0:
+        raise ValueError("srh_efficiency must be between 0 and 1.")
+
+    tornado_helicity = srh_0_1km
 
     risk += min(interpolate_cape_value([
         (0, 0),
@@ -773,16 +764,9 @@ def analyze_storm(
         max(round(risk, 2) / 100, 0.0),
         1.0,
     ) ** TORNADO_RISK_WEIGHT_EXPONENT
-    has_low_level_profile = all(
-        _finite_score_value(value) is not None
-        for value in (srh_0_1km, srh_efficiency, shear_0_500m, critical_angle)
-    )
-    if has_low_level_profile:
-        risk_weight = max(risk_weight, 0.85)
+    risk_weight = max(risk_weight, 0.85)
     interaction_gate = _tornado_interaction_gate(
-        cape,
         lcl,
-        srh,
         srh_0_1km,
         srh_0_3km,
         srh_efficiency,
@@ -792,7 +776,6 @@ def analyze_storm(
         cape_0_3km,
         lfc,
         cin,
-        low_shear,
     )
     tornado_score *= risk_weight * (0.55 + 0.45 * interaction_gate)
     hail_score = min(hail_score, 40) * 2

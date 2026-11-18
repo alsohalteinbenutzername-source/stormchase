@@ -10,8 +10,13 @@ and shared KONRAD3D cell-tracking and movement-prediction snapshots.
 On 17 November, from approximately 5–6 PM, StormChase produced its first
 (pretty much) verified tornado projection in a case near the Belgium-France
 border, at Estinnes. The projection was issued with a 15–30% tornado risk and
-was subsequently confirmed by a tornado debris signature observed across all
+was subsequently supported by a tornado debris signature observed across all
 three radar parts: correlation coefficient (CC), velocity, and reflectivity.
+Keraunos later reported a damaging wind phenomenon at Boiry-Becquerelle in
+Pas-de-Calais, France, but noted that Doppler data showed no distinct rotation
+and that the event's nature was still under investigation. That report does not
+confirm a tornado at Estinnes or in Belgium
+([Keraunos report](https://www.keraunos.org/actualites/fil-infos/2026/novembre/tornade-possible-boiry-becquerelle-pas-de-calais-arras-17-novembre-2026)).
 
 ## Run from source
 
@@ -38,7 +43,7 @@ station; its radar coverage is shown in its correct map position. The
 local adjacent inbound/outbound velocity couplet detections (±15 m/s,
 five pixels per side) are marked with a large rotation symbol. This is a
 simple radar-velocity heuristic, not a tornado detector or official warning.
-The separate publisher runs on its configured schedule; the app reads shared
+The integrated publisher runs from this repository on its configured schedule; the app reads shared
 KONRAD3D tracking snapshots and movement predictions from Supabase when configured.
 KONRAD3D convective cells are shown with their observed movement history and a
 dashed, one-hour movement prediction from Supabase when present, with an
@@ -72,9 +77,12 @@ locally until the next Berlin midnight, so reopening does not change the day's
 inputs or selected window. The overall risk score is out of 100; tornado,
 hail, and wind scores are out of 80. The tornado sub-threat uses a
 low-level interaction gate based on 0–500 m shear, 0–1 km storm-relative
-helicity and efficiency, hodograph critical angle, LCL, and CIN. Low-level
-lapse rate and optional 0–3 km CAPE/LFC values are also considered. The
-additional 180 m wind fields are optional when reading older cached outlooks.
+helicity and efficiency, hodograph critical angle, LCL, and CIN. The manual
+calculator requires all low-level profile inputs. Automated ICON-D2 outlooks
+derive them from required wind, temperature, humidity, and geopotential-height
+fields; surface-parcel 0–3 km CAPE and LFC are estimated locally. A 6000 m LFC
+value denotes that no LFC was found in the profile. Cached outlooks missing the
+required profile are refreshed before scoring.
 
 Blitzortung / LightningMaps community-network lightning strokes appear as
 yellow plus markers for up to 15 minutes on the live and DWD warning maps.
@@ -123,20 +131,29 @@ snapshots and authenticated community-report features.
    limits each identity to five reports per ten minutes; because identities are
    anonymous, this does not prevent someone from creating another identity.
    Report text is limited to 2000 characters.
-3. Configure the separate publisher to publish KONRAD3D tracking and movement
-   prediction snapshots, and to populate the daily outlook cache using its
-   trusted `service_role` key. The desktop app never writes shared snapshots;
-   it writes community reports only through the user's RLS-protected session.
-   Supabase Cron dispatches the publisher's GitHub Actions workflow every five
-   minutes; it can also be started manually. Create a
-   fine-grained GitHub token restricted to the publisher repository with
-   **Actions: read and write**, then add it to Supabase Vault as
-   `stormchase_github_dispatch_token`. Run
+3. The publisher is included in `publisher/` and runs from this repository's
+   GitHub Actions workflows. Add these repository **Actions secrets**:
+
+   - `SUPABASE_URL`: the HTTPS URL of this Supabase project.
+   - `SUPABASE_SERVICE_ROLE_KEY`: the server-side service-role key. Keep it
+     only in GitHub Actions; never add it to `config.py`, the desktop app, or a
+     distributed build.
+
+   The live-data workflow runs every five minutes and can be started manually.
+   The daily-outlook workflow refreshes the shared ICON-D2 grid shortly after
+   midnight in Germany and can also be started manually. GitHub Actions and
+   scheduled workflows must be enabled in this repository's **Settings →
+   Actions**.
+
+   Supabase Cron can dispatch the live-data workflow every five minutes too.
+   To enable that, create a fine-grained GitHub token restricted to this
+   `stormchase` repository with **Actions: read and write** permission. Store
+   it in Supabase Vault as `stormchase_github_dispatch_token`, then run
    [`supabase/002_github_publisher_scheduler.sql`](./supabase/002_github_publisher_scheduler.sql)
-   after adding that Vault secret. Keep the publisher's server-side secret or
-   legacy `service_role` key in GitHub Actions only. The desktop uses its
-   public publishable key to read tracking snapshots and anonymous Supabase
-   sessions for community reports.
+   in the Supabase SQL Editor. This Vault token is separate from the two
+   GitHub Actions secrets above. The desktop uses only its public publishable
+   key to read snapshots and anonymous Supabase sessions for community
+   reports.
 4. For a prototype release, set the project URL and publishable key in
    `config.py`:
 
@@ -156,8 +173,8 @@ snapshots and authenticated community-report features.
 Without the URL and publishable key, local live data and outlook still work,
 while Supabase tracking and report identities are unavailable. Automated
 database-client tests use mocked responses. Verify the live project after
-deploying the SQL and configuring the external publisher; those services are
-not available to the local test suite.
+deploying the SQL and configuring the publisher; those services are not
+available to the local test suite.
 
 ## Location privacy
 

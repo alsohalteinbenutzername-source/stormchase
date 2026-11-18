@@ -1,3 +1,4 @@
+import math
 import requests
 import requests_cache
 import time
@@ -14,57 +15,27 @@ from config import LATITUDE, LONGITUDE
 
 
 STORMANALYZER_HOURLY_FIELDS = (
-    "cape,convective_inhibition,temperature_850hPa,temperature_700hPa,"
-    "temperature_500hPa,temperature_2m,dew_point_2m,relative_humidity_2m,"
+    "cape,convective_inhibition,surface_pressure,"
+    "temperature_2m,dew_point_2m,relative_humidity_2m,"
+    "temperature_925hPa,temperature_850hPa,temperature_700hPa,"
+    "temperature_500hPa,relative_humidity_925hPa,relative_humidity_850hPa,"
+    "relative_humidity_700hPa,relative_humidity_500hPa,"
+    "geopotential_height_925hPa,geopotential_height_850hPa,"
+    "geopotential_height_700hPa,geopotential_height_500hPa,"
     "precipitation,snowfall,wind_speed_10m,wind_direction_10m,"
     "wind_speed_180m,wind_direction_180m,"
     "wind_speed_925hPa,wind_direction_925hPa,wind_speed_850hPa,"
     "wind_direction_850hPa,wind_speed_700hPa,wind_direction_700hPa,"
     "wind_speed_500hPa,wind_direction_500hPa"
 )
-OPTIONAL_STORMANALYZER_HOURLY_FIELDS = (
-    "wind_speed_180m",
-    "wind_direction_180m",
-)
+OPTIONAL_STORMANALYZER_HOURLY_FIELDS = ()
 
 
 
 params = {
     "latitude": LATITUDE,
     "longitude": LONGITUDE,
-
-    "hourly": ",".join([
-        "cape",
-
-        "temperature_925hPa",
-        "temperature_850hPa",
-        "temperature_700hPa",
-        "temperature_500hPa",
-
-        "temperature_2m",
-        "dew_point_2m",
-        "relative_humidity_2m",
-        "precipitation",
-        "snowfall",
-
-        "wind_speed_10m",
-        "wind_direction_10m",
-
-        "wind_speed_180m",
-        "wind_direction_180m",
-
-        "wind_speed_925hPa",
-        "wind_direction_925hPa",
-
-        "wind_speed_850hPa",
-        "wind_direction_850hPa",
-
-        "wind_speed_700hPa",
-        "wind_direction_700hPa",
-
-        "wind_speed_500hPa",
-        "wind_direction_500hPa"
-    ]),
+    "hourly": STORMANALYZER_HOURLY_FIELDS,
 
     "past_hours": 24,
     "forecast_hours": 48,
@@ -296,6 +267,13 @@ def _request_hourly(url, request_params):
     hourly = data.get("hourly")
     if not isinstance(hourly, dict):
         raise RuntimeError(f"No hourly weather data returned from {url}.")
+    try:
+        elevation = float(data["elevation"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise RuntimeError(f"No valid surface elevation returned from {url}.") from error
+    if not math.isfinite(elevation):
+        raise RuntimeError(f"No valid surface elevation returned from {url}.")
+    hourly["surface_elevation_m"] = elevation
 
     return hourly
 
@@ -369,6 +347,17 @@ def get_germany_grid_weather(locations):
         for point in model_payload:
             hourly = point.get("hourly", {})
             _validate_hourly(hourly, fields)
+            try:
+                elevation = float(point["elevation"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise RuntimeError(
+                    "Open-Meteo did not return a valid surface elevation."
+                ) from error
+            if not math.isfinite(elevation):
+                raise RuntimeError(
+                    "Open-Meteo did not return a valid surface elevation."
+                )
+            hourly["surface_elevation_m"] = elevation
             times = hourly["time"]
             cape_values = hourly["cape"]
             cin_values = hourly["convective_inhibition"]
@@ -421,6 +410,7 @@ def _fetch_hourly_in_batches(url, request_params, variables):
     )
     values_by_variable = {}
     timestamps_by_batch = []
+    elevations = []
 
     for batch_index, variable_batch in enumerate(variable_batches):
         if not variable_batch:
@@ -437,6 +427,7 @@ def _fetch_hourly_in_batches(url, request_params, variables):
         batch_params["hourly"] = ",".join(variable_batch)
         hourly_batch = _request_hourly(url, batch_params)
         _validate_hourly(hourly_batch, variable_batch)
+        elevations.append(hourly_batch["surface_elevation_m"])
 
         batch_times = hourly_batch["time"]
         timestamps_by_batch.append(batch_times)
@@ -462,8 +453,16 @@ def _fetch_hourly_in_batches(url, request_params, variables):
         raise RuntimeError(
             "Hourly data batches did not return matching timestamps."
         )
+    if any(
+        not math.isclose(elevation, elevations[0], abs_tol=0.1)
+        for elevation in elevations[1:]
+    ):
+        raise RuntimeError("Hourly data batches returned inconsistent elevations.")
 
-    hourly = {"time": times}
+    hourly = {
+        "time": times,
+        "surface_elevation_m": elevations[0],
+    }
     for variable in variables:
         hourly[variable] = [
             values_by_variable[variable][timestamp]
