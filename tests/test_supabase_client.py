@@ -194,45 +194,115 @@ class SupabaseDataContractTests(unittest.TestCase):
 
     def test_reads_daily_outlook_grid_for_the_requested_date(self) -> None:
         issued_at = "2026-11-11T10:00:00Z"
-        grid = [{"icon_d2": {"time": ["2026-11-11T10:00"], "cin": [0]}}]
+        point = {"icon_d2": {"time": ["2026-11-11T10:00"], "cin": [0]}}
+        grid = [point] * 744
         with patch.object(
             self.client,
             "_table_rows",
-            return_value=[
-                {
-                    "forecast_date": "2026-11-11",
-                    "issued_at": issued_at,
-                    "grid_payload": grid,
-                }
+            side_effect=[
+                [{"forecast_date": "2026-11-11", "issued_at": issued_at}],
+                [
+                    {"point_index": index, "grid_payload": point}
+                    for index in range(744)
+                ],
             ],
         ) as table_rows:
             result = self.client.daily_outlook_grid(date(2026, 11, 11))
 
         self.assertEqual(result["grid"], grid)
         self.assertEqual(result["issued_at"], datetime(2026, 11, 11, 10, tzinfo=timezone.utc))
-        table_rows.assert_called_once_with(
-            "daily_outlook_forecasts",
-            {
-                "select": "forecast_date,issued_at,grid_payload",
-                "forecast_date": "eq.2026-11-11",
-                "limit": "1",
-            },
+        self.assertEqual(
+            table_rows.call_args_list[0].args,
+            (
+                "daily_outlook_forecasts",
+                {
+                    "select": "forecast_date,issued_at",
+                    "forecast_date": "eq.2026-11-11",
+                    "limit": "1",
+                },
+            ),
         )
+        self.assertEqual(
+            table_rows.call_args_list[1].args,
+            (
+                "daily_outlook_forecast_points",
+                {
+                    "select": "point_index,grid_payload",
+                    "forecast_date": "eq.2026-11-11",
+                    "order": "point_index.asc",
+                    "limit": "744",
+                },
+            ),
+        )
+
+    def test_reads_legacy_daily_outlook_when_no_point_rows_exist(self) -> None:
+        issued_at = "2026-11-11T10:00:00Z"
+        grid = [{"icon_d2": {"time": ["2026-11-11T10:00"], "cin": [0]}}]
+        with patch.object(
+            self.client,
+            "_table_rows",
+            side_effect=[
+                [{"forecast_date": "2026-11-11", "issued_at": issued_at}],
+                [],
+                [{"grid_payload": grid}],
+            ],
+        ):
+            result = self.client.daily_outlook_grid(date(2026, 11, 11))
+
+        self.assertEqual(result["grid"], grid)
 
     def test_returns_none_when_daily_outlook_is_not_published(self) -> None:
         with patch.object(self.client, "_table_rows", return_value=[]):
             self.assertIsNone(self.client.daily_outlook_grid(date(2026, 11, 11)))
 
-    def test_rejects_malformed_daily_outlook_grid(self) -> None:
+    def test_rejects_incomplete_daily_outlook_points(self) -> None:
         with patch.object(
             self.client,
             "_table_rows",
-            return_value=[
-                {
-                    "forecast_date": "2026-11-11",
-                    "issued_at": "2026-11-11T10:00:00Z",
-                    "grid_payload": [{"ecmwf": {}}],
-                }
+            side_effect=[
+                [
+                    {
+                        "forecast_date": "2026-11-11",
+                        "issued_at": "2026-11-11T10:00:00Z",
+                    }
+                ],
+                [{"point_index": 0, "grid_payload": {"icon_d2": {}}}],
+            ],
+        ):
+            with self.assertRaisesRegex(SupabaseError, "1 of 744"):
+                self.client.daily_outlook_grid(date(2026, 11, 11))
+
+    def test_rejects_malformed_legacy_daily_outlook_grid(self) -> None:
+        with patch.object(
+            self.client,
+            "_table_rows",
+            side_effect=[
+                [
+                    {
+                        "forecast_date": "2026-11-11",
+                        "issued_at": "2026-11-11T10:00:00Z",
+                    }
+                ],
+                [],
+                [{"grid_payload": [{"ecmwf": {}}]}],
+            ],
+        ):
+            with self.assertRaisesRegex(SupabaseError, "ICON-D2"):
+                self.client.daily_outlook_grid(date(2026, 11, 11))
+
+    def test_rejects_empty_legacy_daily_outlook_grid(self) -> None:
+        with patch.object(
+            self.client,
+            "_table_rows",
+            side_effect=[
+                [
+                    {
+                        "forecast_date": "2026-11-11",
+                        "issued_at": "2026-11-11T10:00:00Z",
+                    }
+                ],
+                [],
+                [{"grid_payload": []}],
             ],
         ):
             with self.assertRaisesRegex(SupabaseError, "ICON-D2"):

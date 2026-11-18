@@ -27,6 +27,7 @@ from tracking import StormCell, StormUpdate
 
 
 RADAR_BUCKET = "stormchase-radar"
+DAILY_OUTLOOK_GRID_POINT_COUNT = 744
 KEYRING_SERVICE = "StormChase Supabase"
 USERNAME_PATTERN = re.compile(r"[a-z0-9_]{3,24}\Z")
 
@@ -684,7 +685,7 @@ class SupabaseClient:
         rows = self._table_rows(
             "daily_outlook_forecasts",
             {
-                "select": "forecast_date,issued_at,grid_payload",
+                "select": "forecast_date,issued_at",
                 "forecast_date": f"eq.{forecast_date.isoformat()}",
                 "limit": "1",
             },
@@ -695,15 +696,51 @@ class SupabaseClient:
         row = rows[0]
         if row.get("forecast_date") != forecast_date.isoformat():
             raise SupabaseError("Daily outlook row has an unexpected forecast date.")
-        grid = row.get("grid_payload")
-        if not isinstance(grid, list) or not all(
-            isinstance(point, dict)
-            and isinstance(point.get("icon_d2"), dict)
-            for point in grid
-        ):
+        point_rows = self._table_rows(
+            "daily_outlook_forecast_points",
+            {
+                "select": "point_index,grid_payload",
+                "forecast_date": f"eq.{forecast_date.isoformat()}",
+                "order": "point_index.asc",
+                "limit": str(DAILY_OUTLOOK_GRID_POINT_COUNT),
+            },
+        )
+        if len(point_rows) == DAILY_OUTLOOK_GRID_POINT_COUNT:
+            grid = []
+            for expected_index, point_row in enumerate(point_rows):
+                payload = point_row.get("grid_payload")
+                if (
+                    point_row.get("point_index") != expected_index
+                    or not isinstance(payload, dict)
+                    or not isinstance(payload.get("icon_d2"), dict)
+                ):
+                    raise SupabaseError(
+                        "Daily outlook points must contain a complete ICON-D2 grid."
+                    )
+                grid.append(payload)
+        elif point_rows:
             raise SupabaseError(
-                "Daily outlook payload must contain ICON-D2 grid forecasts."
+                f"Daily outlook contains {len(point_rows)} of "
+                f"{DAILY_OUTLOOK_GRID_POINT_COUNT} grid points."
             )
+        else:
+            legacy_rows = self._table_rows(
+                "daily_outlook_forecasts",
+                {
+                    "select": "grid_payload",
+                    "forecast_date": f"eq.{forecast_date.isoformat()}",
+                    "limit": "1",
+                },
+            )
+            grid = legacy_rows[0].get("grid_payload") if legacy_rows else None
+            if not isinstance(grid, list) or not grid or not all(
+                isinstance(point, dict)
+                and isinstance(point.get("icon_d2"), dict)
+                for point in grid
+            ):
+                raise SupabaseError(
+                    "Daily outlook payload must contain ICON-D2 grid forecasts."
+                )
         return {
             "issued_at": _parse_datetime(row.get("issued_at"), "daily outlook"),
             "grid": grid,

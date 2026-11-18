@@ -126,14 +126,16 @@ snapshots and authenticated community-report features.
    runs every five minutes. Storage cleanup must use the Storage API, not direct
    SQL deletion. Community reports are excluded from live-data retention. Then
    run [`supabase/003_daily_outlook_cache.sql`](./supabase/003_daily_outlook_cache.sql)
-   to create the daily outlook cache. The desktop can read today's snapshot
-   from this table; only a trusted publisher using `service_role` can write it.
-   Publish the 744-point ICON-D2 grid in `grid_payload`, in the same shape
-   returned by `weather_api.get_germany_grid_weather()`, with its local
-   `forecast_date` in `Europe/Berlin` and API `issued_at`. The app requests
-   Open-Meteo if today's row is not available. The publisher should refresh the
-   row once per day; a database job retains only today's and yesterday's rows.
-   Then run
+   to create the daily outlook cache. Then run
+   [`supabase/005_daily_outlook_forecast_points.sql`](./supabase/005_daily_outlook_forecast_points.sql)
+   to create the chunked outlook-point table. The desktop reads today's
+   744-point ICON-D2 grid from that table; only a trusted publisher using
+   `service_role` can write it. The publisher stores each location's
+   `grid_payload` separately, keyed by its index and the local
+   `forecast_date` in `Europe/Berlin`, and records the API `issued_at` in the
+   daily cache table. The app requests Open-Meteo if today's snapshot is not
+   available. The publisher should refresh the grid once per day; a database
+   job retains only today's and yesterday's rows. Then run
    [`supabase/004_anonymous_reporters.sql`](./supabase/004_anonymous_reporters.sql)
    to configure pseudonymous report identities and posting limits.
 2. In Supabase Auth, enable **Anonymous Sign-Ins**. The first time someone files
