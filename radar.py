@@ -36,6 +36,7 @@ RAIN_TRACK_MAX_POINTS: int = 2
 RAIN_CELL_POINTER_DISTANCE_KM: float = 25.0
 ROTATION_VELOCITY_THRESHOLD_MS: float = 20.0
 ROTATION_MIN_PIXELS: int = 10
+ROTATION_MAX_ASPECT_RATIO: float = 8.0
 MAX_GEOGRAPHIC_IMAGE_SIZE: int = 1200
 
 
@@ -639,9 +640,15 @@ def detect_rotations(
     threshold: float = ROTATION_VELOCITY_THRESHOLD_MS,
     min_pixels: int = ROTATION_MIN_PIXELS,
 ) -> tuple[RotationDetection, ...]:
+    """Find compact inbound/outbound velocity couplets in a gridded scan.
+
+    Candidate lobes must meet the per-pixel velocity and area thresholds,
+    touch one another, and retain a strong robust velocity difference. Very
+    elongated regions are discarded as likely shear boundaries.
+    """
     if not math.isfinite(threshold) or threshold <= 0 or min_pixels < 1:
         raise ValueError("Rotation detection parameters must be positive.")
-    velocity = frame.reflectivity
+    velocity = frame.values
     negative_mask: NDArray[np.bool_] = np.asarray(
         np.isfinite(velocity) & (velocity <= -threshold),
         dtype=np.bool_,
@@ -698,18 +705,61 @@ def detect_rotations(
 
         negative_ids = [identifier for is_positive, identifier in component if not is_positive]
         positive_ids = [identifier for is_positive, identifier in component if is_positive]
+        negative_values = velocity[np.isin(negative_labels, negative_ids)]
+        positive_values = velocity[np.isin(positive_labels, positive_ids)]
+        if not negative_values.size or not positive_values.size:
+            continue
+
+        # Use the inner quartiles so one unfolded gate cannot make a weak
+        # positive/negative pair look like a strong velocity couplet.
+        delta_velocity = float(
+            np.percentile(positive_values, 25)
+            - np.percentile(negative_values, 75)
+        )
+        if delta_velocity < threshold:
+            continue
+
         detection_mask: NDArray[np.bool_] = np.asarray(
             np.isin(negative_labels, negative_ids)
             | np.isin(positive_labels, positive_ids),
             dtype=np.bool_,
         )
         pixel_rows, pixel_columns = np.nonzero(detection_mask)
+        row_span = int(pixel_rows.max() - pixel_rows.min() + 1)
+        column_span = int(pixel_columns.max() - pixel_columns.min() + 1)
         center_row = float(np.mean(pixel_rows))
         center_column = float(np.mean(pixel_columns))
+
+        # Reject very long, thin shear boundaries. Account for the grid's
+        # physical aspect ratio when projection metadata is available.
+        if frame.xscale is not None and frame.yscale is not None:
+            width = column_span * abs(frame.xscale)
+            height = row_span * abs(frame.yscale)
+        else:
+            west, east, south, north = frame.extent
+            rows, columns = velocity.shape
+            latitude = north - (center_row + 0.5) / rows * (north - south)
+            width = (
+                column_span
+                * (east - west)
+                / columns
+                * 111_320.0
+                * max(math.cos(math.radians(latitude)), 0.01)
+            )
+            height = row_span * (north - south) / rows * 111_320.0
+        aspect_ratio = max(width, height) / max(min(width, height), 1.0)
+        if aspect_ratio > ROTATION_MAX_ASPECT_RATIO:
+            continue
+
+        latitude, longitude = _pixel_to_geographic(
+            frame,
+            center_row,
+            center_column,
+        )
         detections.append(
             RotationDetection(
-                latitude=north - (center_row + 0.5) / rows * (north - south),
-                longitude=west + (center_column + 0.5) / columns * (east - west),
+                latitude=latitude,
+                longitude=longitude,
                 negative_pixels=sum(int(negative_sizes[index]) for index in negative_ids),
                 positive_pixels=sum(int(positive_sizes[index]) for index in positive_ids),
             )
