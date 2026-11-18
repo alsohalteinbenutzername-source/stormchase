@@ -39,17 +39,22 @@ from lightning import LightningStrike
 from lightning_stream import stream_blitzortung_lightning
 from radar import (
     GERMANY_EXTENT,
+    KONRAD3D_ROTATION_MATCH_RADIUS_KM,
+    MESOCYCLONE_MIN_DISPLAY_LEVEL,
     RAIN_CELL_MAX_DBZ,
     RAIN_CELL_MIN_DBZ,
+    ROTATION_STORM_SUPPORT_MIN_DBZ,
     RainCellTracker,
     RainCell,
     RadarFrame,
     RotationDetection,
     VelocityRadarSite,
     detect_rain_cells,
-    detect_rotations,
     fetch_latest_radar,
+    fetch_latest_mesocyclone_detections,
     fetch_latest_velocity_radar,
+    geographic_distance_km,
+    maximum_reflectivity_near,
     nearest_velocity_radar_site,
     project_rain_cell_direction,
 )
@@ -1788,15 +1793,6 @@ class StormRadarApp:
                 fetch_latest_velocity_radar,
                 site.site,
             )
-            rotations = (
-                await self.loop.run_in_executor(
-                    self.executor,
-                    detect_rotations,
-                    frame,
-                )
-                if frame is not None
-                else ()
-            )
         except Exception as error:
             if (
                 not self._closed
@@ -1807,6 +1803,19 @@ class StormRadarApp:
                     f"Velocity · {site.name} failed: {type(error).__name__}: {error}"
                 )
         else:
+            try:
+                rotations = (
+                    await self.loop.run_in_executor(
+                        self.executor,
+                        fetch_latest_mesocyclone_detections,
+                    )
+                    if frame is not None
+                    else ()
+                )
+            except Exception:
+                # Keep the velocity image available when the optional volume
+                # mesocyclone product is delayed or unavailable.
+                rotations = ()
             if not self._closed:
                 if frame is not None:
                     self.velocity_radar_frames[site_code] = frame
@@ -2594,16 +2603,77 @@ class StormRadarApp:
             and self.radar_product == VELOCITY_RADAR
             and self.velocity_radar_site is not None
         ):
+            level_colors = {
+                1: "#22c55e",
+                2: "#facc15",
+                3: "#f97316",
+                4: "#ef4444",
+                5: "#d946ef",
+            }
+            level_markers = {1: "o", 2: "s", 3: "^", 4: "D", 5: "*"}
+            labeled_levels: set[int] = set()
             for detection in self.velocity_rotation_detections.get(
                 self.velocity_radar_site.site.value,
                 (),
             ):
+                # Only show DWD severity 3+ as a rotation symbol. DWD defines
+                # level 3 as meeting its deep-mesocyclone criteria; lower
+                # levels are weaker signatures, not confirmation of rotation.
+                if detection.level < MESOCYCLONE_MIN_DISPLAY_LEVEL:
+                    continue
+                overlaps_konrad3d = any(
+                    geographic_distance_km(
+                        detection.latitude,
+                        detection.longitude,
+                        cell.latitude,
+                        cell.longitude,
+                    )
+                    <= KONRAD3D_ROTATION_MATCH_RADIUS_KM
+                    for cell in self.storm_update.cells
+                )
+                nearby_reflectivity = (
+                    maximum_reflectivity_near(
+                        self.radar_frame,
+                        detection.latitude,
+                        detection.longitude,
+                    )
+                    if self.radar_frame is not None
+                    else None
+                )
+                if not (
+                    overlaps_konrad3d
+                    or (
+                        nearby_reflectivity is not None
+                        and nearby_reflectivity >= ROTATION_STORM_SUPPORT_MIN_DBZ
+                    )
+                ):
+                    continue
+                height = ""
+                if detection.base_km is not None and detection.top_km is not None:
+                    height = f" · {detection.base_km:.1f}–{detection.top_km:.1f} km"
+                legend_label = (
+                    f"DWD mesocyclone level {detection.level}{height}"
+                    if detection.level not in labeled_levels
+                    else "_nolegend_"
+                )
+                labeled_levels.add(detection.level)
+                self.axes.scatter(
+                    [detection.longitude],
+                    [detection.latitude],
+                    marker=level_markers.get(detection.level, "o"),
+                    s=190 if detection.level == 5 else 125,
+                    color=level_colors.get(detection.level, "#22c55e"),
+                    edgecolors="#101820",
+                    linewidths=1.1,
+                    label=legend_label,
+                    zorder=12,
+                )
                 self.axes.text(
                     detection.longitude,
                     detection.latitude,
                     "↻",
-                    color="#fff04a",
-                    fontsize=38,
+                    color="white",
+                    fontsize=16,
                     fontweight="bold",
                     horizontalalignment="center",
                     verticalalignment="center",
@@ -2612,6 +2682,20 @@ class StormRadarApp:
                     ],
                     zorder=12,
                 )
+                if detection.base_km is not None and detection.top_km is not None:
+                    self.axes.annotate(
+                        f"{detection.base_km:.1f}–{detection.top_km:.1f} km",
+                        (detection.longitude, detection.latitude),
+                        xytext=(0, -13),
+                        textcoords="offset points",
+                        color="white",
+                        fontsize=7,
+                        horizontalalignment="center",
+                        path_effects=[
+                            path_effects.withStroke(linewidth=2, foreground="#101820")
+                        ],
+                        zorder=12,
+                    )
 
         if not outlook_mode and self.lightning_strikes:
             strikes = tuple(self.lightning_strikes.values())

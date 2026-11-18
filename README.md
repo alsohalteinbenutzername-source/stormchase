@@ -36,17 +36,29 @@ the background map. Zoom with the mouse wheel or the **Zoom +** / **Zoom −**
 buttons; **Reset** returns to the full map view.
 
 The live map's radar-product selector switches between reflectivity (dBZ) and
-radial velocity (m/s). Radar frames and rotation detections are fetched and
-calculated locally from DWD during the regular five-minute data updates.
-In velocity mode, click the map to select the nearest active DWD Doppler
-station; its radar coverage is shown in its correct map position. The
-local velocity-couplet detections are marked with a large rotation symbol.
-Lobes are measured against their local velocity background, so both sides do
-not need to cross zero. The detector evaluates the robust velocity difference
-and physical separation as shear and angular momentum, with a 10 m/s minimum
-couplet difference and compact-feature checks. This is a two-dimensional
-radar-velocity heuristic; it does not confirm a mesocyclone or tornado and is
-not an official warning.
+radial velocity (m/s). Radar frames and rotation detections are fetched during
+the regular five-minute data updates. In velocity mode, click the map to
+select the nearest active DWD Doppler station; its radar coverage is shown in
+its correct map position. DWD's volume-scan mesocyclone detections are overlaid
+as rotation symbols with five intensity levels: green (1), yellow (2), orange
+(3), red (4), and pink/purple (5). Each symbol also identifies the reported
+mesocyclone base and top in km above ground level. These levels and heights
+come from DWD's native volume product, rather than being inferred from a
+single 2-D velocity sweep. DWD's mesocyclone algorithm analyzes Doppler data
+from the multi-elevation radar volumes and reports 3-D detections with
+severity and base/top heights. The feed can arrive later than the velocity
+image; if it is unavailable, the velocity image still loads and rotation
+symbols are omitted until a later refresh. By default, only levels 3–5 are
+drawn: DWD's published severity criteria define level 3 as meeting its
+deep-mesocyclone thresholds, while levels 1–2 are weaker signatures. A symbol
+is shown only when it is within 8 km of a KONRAD3D cell center or when the
+reflectivity composite has at least 35 dBZ within 5 km. KONRAD3D supplies cell
+centers, not polygon boundaries, so the distance is an approximate overlap
+check. The reflectivity threshold is configurable and set to the midpoint of
+the requested 30–40 dBZ range. These detections are algorithm guidance, not
+confirmation of a tornado or an official warning. See the [DWD mesocyclone
+algorithm paper](https://journals.ametsoc.org/doi/10.1175/JTECH-D-16-0230.1)
+and [DWD radar product documentation](https://wetterdienst.readthedocs.io/en/latest/data/provider/dwd/radar/index.html).
 The integrated publisher runs from this repository on its configured schedule; the app reads shared
 KONRAD3D tracking snapshots and movement predictions from Supabase when configured.
 KONRAD3D convective cells are shown with their observed movement history and a

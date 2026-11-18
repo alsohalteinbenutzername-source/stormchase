@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from functools import cached_property, lru_cache
 from io import BytesIO
 import math
+import xml.etree.ElementTree as ET
 from typing import Any, cast
 
 import h5py
@@ -25,6 +26,13 @@ from wetterdienst.provider.dwd.radar.api import DwdRadarSites
 
 REFLECTIVITY_PRODUCT: DwdRadarParameter = DwdRadarParameter.HX_REFLECTIVITY
 VELOCITY_PRODUCT: DwdRadarParameter = DwdRadarParameter.PR_VELOCITY
+MESOCYCLONE_PRODUCT: DwdRadarParameter = DwdRadarParameter.MESOCYCLONE_DETECTION
+# DWD's level 3 is its threshold for a deep mesocyclone; levels 1–2 are weaker
+# signatures and are more likely to be mistaken for ordinary convective echoes.
+MESOCYCLONE_MIN_DISPLAY_LEVEL: int = 3
+ROTATION_STORM_SUPPORT_MIN_DBZ: float = 35.0
+ROTATION_REFLECTIVITY_SEARCH_RADIUS_KM: float = 5.0
+KONRAD3D_ROTATION_MATCH_RADIUS_KM: float = 8.0
 GERMANY_EXTENT: tuple[float, float, float, float] = (5.0, 16.0, 47.0, 56.0)
 RAIN_CELL_MIN_DBZ: float = 20.0
 RAIN_CELL_MAX_DBZ: float = 30.0
@@ -202,6 +210,10 @@ class RotationDetection:
     longitude: float
     negative_pixels: int
     positive_pixels: int
+    level: int = 1
+    base_km: float | None = None
+    top_km: float | None = None
+    rotational_velocity_ms: float | None = None
 
 
 @dataclass
@@ -443,6 +455,73 @@ def nearest_velocity_radar_site(latitude: float, longitude: float) -> VelocityRa
         return 2 * 6371.0 * math.asin(min(1.0, math.sqrt(haversine)))
 
     return min(velocity_radar_sites(), key=distance)
+
+
+def geographic_distance_km(
+    first_latitude: float,
+    first_longitude: float,
+    second_latitude: float,
+    second_longitude: float,
+) -> float:
+    """Return great-circle distance between two latitude/longitude points."""
+    latitude_delta = math.radians(second_latitude - first_latitude)
+    longitude_delta = math.radians(
+        (second_longitude - first_longitude + 180.0) % 360.0 - 180.0
+    )
+    haversine = (
+        math.sin(latitude_delta / 2.0) ** 2
+        + math.cos(math.radians(first_latitude))
+        * math.cos(math.radians(second_latitude))
+        * math.sin(longitude_delta / 2.0) ** 2
+    )
+    return 2.0 * 6371.0 * math.asin(min(1.0, math.sqrt(haversine)))
+
+
+def maximum_reflectivity_near(
+    frame: RadarFrame,
+    latitude: float,
+    longitude: float,
+    radius_km: float = ROTATION_REFLECTIVITY_SEARCH_RADIUS_KM,
+) -> float | None:
+    """Return the strongest gridded reflectivity within a geographic radius."""
+    if not math.isfinite(radius_km) or radius_km < 0:
+        raise ValueError("Reflectivity search radius must be finite and nonnegative.")
+    west, east, south, north = frame.extent
+    if not (west <= longitude <= east and south <= latitude <= north):
+        return None
+
+    values = frame.geographic_values
+    rows, columns = values.shape
+    if rows == 0 or columns == 0:
+        return None
+    center_column = int((longitude - west) / (east - west) * columns)
+    center_row = int((north - latitude) / (north - south) * rows)
+    row_radius = math.ceil(radius_km / 111.0 / (north - south) * rows)
+    longitude_km_per_degree = 111.0 * max(abs(math.cos(math.radians(latitude))), 0.01)
+    column_radius = math.ceil(
+        radius_km / longitude_km_per_degree / (east - west) * columns
+    )
+    row_start = max(0, center_row - row_radius)
+    row_end = min(rows, center_row + row_radius + 1)
+    column_start = max(0, center_column - column_radius)
+    column_end = min(columns, center_column + column_radius + 1)
+    neighborhood = values[row_start:row_end, column_start:column_end]
+    row_indices = np.arange(row_start, row_end, dtype=np.float64)
+    column_indices = np.arange(column_start, column_end, dtype=np.float64)
+    pixel_latitudes = north - (row_indices + 0.5) / rows * (north - south)
+    pixel_longitudes = west + (column_indices + 0.5) / columns * (east - west)
+    longitude_grid, latitude_grid = np.meshgrid(pixel_longitudes, pixel_latitudes)
+    north_south_distance = (latitude_grid - latitude) * 111.0
+    east_west_distance = (
+        (longitude_grid - longitude)
+        * 111.0
+        * math.cos(math.radians(latitude))
+    )
+    within_radius = np.hypot(north_south_distance, east_west_distance) <= radius_km
+    finite = neighborhood[np.isfinite(neighborhood) & within_radius]
+    if not finite.size:
+        return None
+    return float(np.max(finite))
 
 
 def detect_rain_cells(
@@ -905,6 +984,97 @@ def fetch_latest_velocity_radar(site: DwdRadarSite) -> RadarFrame | None:
         result.data.getvalue(),
         timestamp=result.timestamp or result.data_updated_at,
     )
+
+
+def fetch_latest_mesocyclone_detections() -> tuple[RotationDetection, ...]:
+    """Fetch DWD's volume-scan mesocyclone detections and severity metadata.
+
+    DWD supplies the five-level intensity together with the detected feature's
+    base and top heights (km AGL), so symbol levels are based on the official
+    volume product rather than inferred from one 2-D velocity sweep.
+    """
+    request = DwdRadarValues(
+        parameter=MESOCYCLONE_PRODUCT,
+        start=DwdRadarDate.LATEST,
+    )
+    result = next(iter(request.query()), None)
+    if result is None:
+        return ()
+
+    payload = result.data
+    if hasattr(payload, "getvalue"):
+        payload = payload.getvalue()
+    if isinstance(payload, str):
+        payload = payload.encode("utf-8")
+    if not payload:
+        return ()
+    try:
+        root = ET.fromstring(payload)
+    except (ET.ParseError, TypeError, ValueError) as error:
+        raise RadarDataError("DWD mesocyclone XML could not be decoded.") from error
+
+    def child_text(parent: ET.Element, name: str) -> str | None:
+        for child in parent.iter():
+            if child is not parent and child.tag.rsplit("}", 1)[-1] == name:
+                return child.text
+        return None
+
+    def number(parent: ET.Element, name: str) -> float | None:
+        value = child_text(parent, name)
+        if value is None:
+            return None
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if math.isfinite(parsed) else None
+
+    detections: list[RotationDetection] = []
+    for event in root.iter():
+        if event.tag.rsplit("}", 1)[-1] != "event":
+            continue
+        location = next(
+            (item for item in event.iter() if item.tag.rsplit("}", 1)[-1] == "moving-point"),
+            None,
+        )
+        parameters = next(
+            (item for item in event.iter() if item.tag.rsplit("}", 1)[-1] == "nowcast-parameters"),
+            None,
+        )
+        if location is None or parameters is None:
+            continue
+        latitude = number(location, "latitude")
+        longitude = number(location, "longitude")
+        level_value = number(parameters, "meso_intensity")
+        base_km = number(parameters, "mesocyclone_base")
+        top_km = number(parameters, "mesocyclone_top")
+        if (
+            latitude is None or longitude is None
+            or not -90 <= latitude <= 90 or not -180 <= longitude <= 180
+            or level_value is None or not level_value.is_integer()
+            or not 1 <= level_value <= 5
+            or base_km is None or top_km is None or base_km < 0 or top_km < base_km
+        ):
+            continue
+        rotational_velocity = number(
+            parameters,
+            "mesocyclone_velocity_rotational_max_closest_to_ground",
+        )
+        if rotational_velocity is None:
+            rotational_velocity = number(parameters, "mesocyclone_velocity_rotational_max")
+        detections.append(
+            RotationDetection(
+                latitude=latitude,
+                longitude=longitude,
+                negative_pixels=0,
+                positive_pixels=0,
+                level=int(level_value),
+                base_km=base_km,
+                top_km=top_km,
+                rotational_velocity_ms=rotational_velocity,
+            )
+        )
+    return tuple(detections)
 
 def velocity_radar_playback(
     start: datetime,
