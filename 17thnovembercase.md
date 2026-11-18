@@ -41,6 +41,6 @@ During a cold-season **High-Shear, Low-CAPE (HSLC)** Atlantic frontal passage, S
 
 ## 4 Technical Takeaways & Next Improvements
 
-1. **HSLC Calibration Confirmed:** Weighting tornado scores by final overall risk (`risk / 50`, capped at `1`) successfully suppressed false alarms in high-shear/zero-CAPE regions while preserving the 15–30% corridor where boundary-layer moisture and low-level SRH overlapped.
+1. **HSLC Calibration Confirmed:** Weighting tornado scores by final overall risk (`risk / 100`, capped at `1`) successfully suppressed false alarms in high-shear/zero-CAPE regions while preserving the 15–30% corridor where boundary-layer moisture and low-level SRH overlapped.
 2. **Western Radar Horizon Latency:** Because DWD's Neuheilenbach radar beam sits above shallow low-topped cores west of the Charleroi–Namur meridian, cells approaching from northern France/western Belgium enter StormChase's local DWD detection footprint later than western radar composites. Integrating optional cross-border radar feeds or documenting the ~150 km range ring helps set clear expectations for users tracking inbound western systems.
 3. **Post-Event Ground Verification:** Follow up with regional damage survey databases (European Severe Weather Database / ESWD, Belgorage, Keraunos) to archive official ground-track ratings alongside this radar dataset.

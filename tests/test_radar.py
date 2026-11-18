@@ -157,28 +157,42 @@ class NearestVelocityRadarSiteTests(unittest.TestCase):
 
 class RotationDetectionTests(unittest.TestCase):
     def test_detects_adjacent_velocity_couplet_and_returns_its_map_location(self) -> None:
-        velocity = np.zeros((10, 10), dtype=np.float32)
-        velocity[2:4, 2:5] = -15.0
-        velocity[2:4, 5:8] = 15.0
-        frame = RadarFrame(velocity, None, extent=(0.0, 10.0, 0.0, 10.0))
+        velocity = np.zeros((5, 10), dtype=np.float32)
+        velocity[2:4, 0:5] = -20.0
+        velocity[2:4, 5:10] = 20.0
+        frame = RadarFrame(velocity, None, extent=(0.0, 10.0, 0.0, 5.0))
 
         detections = detect_rotations(frame)
 
         self.assertEqual(len(detections), 1)
         detection = detections[0]
-        self.assertAlmostEqual(detection.latitude, 7.0)
+        self.assertAlmostEqual(detection.latitude, 2.0)
         self.assertAlmostEqual(detection.longitude, 5.0)
-        self.assertEqual(detection.negative_pixels, 6)
-        self.assertEqual(detection.positive_pixels, 6)
+        self.assertEqual(detection.negative_pixels, 10)
+        self.assertEqual(detection.positive_pixels, 10)
         self.assertTrue(rotation_detection(frame))
 
     def test_ignores_small_or_separated_velocity_regions(self) -> None:
         velocity = np.zeros((12, 12), dtype=np.float32)
-        velocity[1:3, 1:3] = -20.0
-        velocity[1:3, 8:10] = 20.0
+        velocity[1:3, 1:3] = -15.0
+        velocity[1:3, 8:10] = 15.0
 
         self.assertEqual(detect_rotations(RadarFrame(velocity, None)), ())
         self.assertFalse(rotation_detection(RadarFrame(velocity, None)))
+
+    def test_rejects_broad_but_weaker_adjacent_couplet(self) -> None:
+        velocity = np.zeros((12, 12), dtype=np.float32)
+        velocity[2:6, 2:6] = -19.9
+        velocity[2:6, 6:10] = 20.0
+
+        self.assertEqual(detect_rotations(RadarFrame(velocity, None)), ())
+
+    def test_rejects_small_but_strong_adjacent_couplet(self) -> None:
+        velocity = np.zeros((12, 12), dtype=np.float32)
+        velocity[2:4, 2:4] = -20.0
+        velocity[2:4, 4:6] = 20.0
+
+        self.assertEqual(detect_rotations(RadarFrame(velocity, None)), ())
 
 
 if __name__ == "__main__":

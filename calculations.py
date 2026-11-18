@@ -927,7 +927,7 @@ def calculate_best_window(
         )
 
         print(
-            f"BEST WINDOW RISK: {best['selection_score']}/50"
+            f"BEST WINDOW RISK: {best['selection_score']}/100"
         )
 
         print(

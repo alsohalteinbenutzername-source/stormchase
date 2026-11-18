@@ -90,20 +90,20 @@ ESRI_ATTRIBUTION = (
     "Imagery © Esri, Vantor, Earthstar Geographics, and the GIS User Community"
 )
 OUTLOOK_COLORS = ("#78c679", "#f4e842", "#f6a13a", "#e95d45", "#d43b9b", "#8c42bd")
-OVERALL_LEVELS = (10, 25, 35, 40, 45)
+OVERALL_LEVELS = (20, 45, 60, 70, 85)
 OVERALL_LABELS = ("Marginal", "Slight", "Moderate", "High", "Extreme")
 OVERALL_SCORE_LABELS = (
-    "Very low: <10",
-    "Marginal: 10–<25",
-    "Slight: 25–<35",
-    "Moderate: 35–<40",
-    "High: 40–<45",
-    "Extreme: ≥45 / 50",
+    "Very low: <20",
+    "Marginal: 20–<45",
+    "Slight: 45–<60",
+    "Moderate: 60–<70",
+    "High: 70–<85",
+    "Extreme: ≥85 / 100",
 )
 THREAT_PROBABILITIES = {
-    "Tornado": ((10, 2), (15, 5), (20, 10), (25, 15), (30, 30), (35, 45)),
-    "Hail": ((10, 2), (15, 5), (20, 10), (25, 15), (30, 30), (35, 45)),
-    "Wind": ((10, 2), (15, 5), (20, 10), (25, 15), (30, 30), (35, 45)),
+    "Tornado": ((20, 2), (30, 5), (40, 10), (50, 15), (60, 30), (70, 45)),
+    "Hail": ((20, 2), (30, 5), (40, 10), (50, 15), (60, 30), (70, 45)),
+    "Wind": ((20, 2), (30, 5), (40, 10), (50, 15), (60, 30), (70, 45)),
 }
 
 
@@ -1337,10 +1337,10 @@ class StormRadarApp:
         threats = ", ".join(analysis["threats"]) or "No specific severe-weather threats indicated"
         criticism = "\n".join(analysis["criticism"]) or "No additional assessment notes."
         self.manual_outlook_result.set(
-            f"MANUAL RESULT · Overall risk {analysis['risk']}/50 · {analysis['category']}\n"
+            f"MANUAL RESULT · Overall risk {analysis['risk']}/100 · {analysis['category']}\n"
             f"Storm type: {analysis['storm_type']}\n"
-            f"Tornado {analysis['tornado']}/40 · Hail {analysis['hail']}/40 · "
-            f"Wind {analysis['wind']}/40 · Supercell {analysis['supercell']}/20 · "
+            f"Tornado {analysis['tornado']}/80 · Hail {analysis['hail']}/80 · "
+            f"Wind {analysis['wind']}/80 · Supercell {analysis['supercell']}/20 · "
             f"MCS {analysis['mcs']}/20\n"
             f"Threats: {threats}\n"
             f"Issued: {analysis['issued']}\n"
@@ -1371,15 +1371,15 @@ class StormRadarApp:
             f"Day {self._outlook_day + 1} · nearest forecast grid point "
             f"{entry['latitude']:.2f}° N, {entry['longitude']:.2f}° E · {entry['time']}\n"
             f"Selected location: {latitude:.2f}° N, {longitude:.2f}° E\n"
-            f"Overall risk: {entry['risk']}/50 · {entry['category']} · {entry['storm_type']}\n"
+            f"Overall risk: {entry['risk']}/100 · {entry['category']} · {entry['storm_type']}\n"
             f"CAPE {environment['cape']} J/kg · CIN {environment['cin']} J/kg · "
             f"LCL {environment['lcl']} m · Lapse {environment['lapse']} °C/km\n"
             f"Temperature {environment['temperature']} °C · "
             f"Dewpoint {environment['dewpoint']} °C · Humidity {environment['humidity']}%\n"
             f"SRH {environment['srh']} m²/s² · Deep shear {environment['high_shear']} kt · "
             f"Low-level shear {environment['low_shear']} kt\n"
-            f"Tornado {entry['tornado']}/40 · Hail {entry['hail']}/40 · "
-            f"Wind {entry['wind']}/40 · Supercell {entry['supercell']}/20 · "
+            f"Tornado {entry['tornado']}/80 · Hail {entry['hail']}/80 · "
+            f"Wind {entry['wind']}/80 · Supercell {entry['supercell']}/20 · "
             f"MCS {entry['mcs']}/20\n"
             f"Threats: {threats}\nIssued: {entry['issued']}\nAssessment:\n{criticism}"
         )
@@ -2033,7 +2033,7 @@ class StormRadarApp:
         if self._outlook_metric == "Overall risk":
             labels = list(OVERALL_SCORE_LABELS)
             colors = ("#ffffff", *OUTLOOK_COLORS[1:])
-            title = f"{self.outlook_day_var.get()} · StormAnalyzer risk score / 50"
+            title = f"{self.outlook_day_var.get()} · StormAnalyzer risk score / 100"
         else:
             tiers = THREAT_PROBABILITIES[self._outlook_metric]
             probabilities = [probability for _, probability in tiers]
@@ -2141,20 +2141,20 @@ class StormRadarApp:
                 scores = np.asarray([entry[metric_key] for entry in entries], dtype=float)
                 if metric_key != "risk":
                     composite_risk = np.asarray([entry["risk"] for entry in entries], dtype=float)
-                    risk_factor = np.clip(composite_risk / 50.0, 0.0, 1.0)
+                    risk_factor = np.clip(composite_risk / 100.0, 0.0, 1.0)
                     if metric_key != "tornado":
                         scores = scores * risk_factor
                 triangulation = Triangulation(longitudes, latitudes) if len(entries) >= 3 else None
 
                 if metric_key == "risk":
-                    score_levels = (-1, *OVERALL_LEVELS, 51)
+                    score_levels = (-1, *OVERALL_LEVELS, 101)
                     level_colors = ("#ffffff", *OUTLOOK_COLORS[1:])
                     contour_options: dict[str, Any] = {
                         "hatches": ("///", "", "", "", "", ""),
                     }
                 else:
                     tiers = THREAT_PROBABILITIES[self._outlook_metric]
-                    score_levels = tuple(score for score, _ in tiers) + (41,)
+                    score_levels = tuple(score for score, _ in tiers) + (81,)
                     level_colors = OUTLOOK_COLORS
                     contour_options = {}
 

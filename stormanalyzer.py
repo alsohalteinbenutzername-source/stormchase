@@ -1,14 +1,14 @@
 def get_risk_category(risk):
 
-    if risk >= 45:
+    if risk >= 85:
         return "Extreme Severe Weather Potential"
-    elif risk >= 40:
+    elif risk >= 70:
         return "High Severe Weather Potential"
-    elif risk >= 35:
+    elif risk >= 60:
         return "Moderate Severe Weather Potential"
-    elif risk >= 25:
+    elif risk >= 45:
         return "Slight Severe Weather Potential"
-    elif risk >= 10:
+    elif risk >= 20:
         return "Marginal Storm Potential"
     else:
         return "Fair Weather / Very Low Storm Potential"
@@ -16,13 +16,13 @@ def get_risk_category(risk):
 
 
 def get_risk_threat(risk):
-    if risk >= 40:
+    if risk >= 70:
         return "High"
-    elif risk >= 35:
+    elif risk >= 60:
         return "Moderate"
-    elif risk >= 25:
+    elif risk >= 45:
         return "Slight"
-    elif risk >= 15:
+    elif risk >= 20:
         return "Marginal"
 
 
@@ -32,25 +32,25 @@ def get_risk_threat(risk):
 def get_threats(tornado_score, hail_score, wind_score):
 
     threats = []
-    if hail_score >= 30:
+    if hail_score >= 60:
         threats.append("a significant large hail risk")
-    elif hail_score >= 25:
+    elif hail_score >= 50:
         threats.append("a moderate large hail risk")
-    elif hail_score >= 15:
+    elif hail_score >= 30:
         threats.append("an isolated large hail risk")
 
-    if wind_score >= 30:
+    if wind_score >= 60:
         threats.append("a significant risk of damaging wind gusts")
-    elif wind_score >= 25:
+    elif wind_score >= 50:
         threats.append("a moderate risk of damaging wind gusts")
-    elif wind_score >= 15:
+    elif wind_score >= 30:
         threats.append("an isolated risk of damaging wind gusts")
 
-    if tornado_score >= 30:
+    if tornado_score >= 60:
         threats.append("a significant risk of tornadoes")
-    elif tornado_score >= 25:
+    elif tornado_score >= 50:
         threats.append("a considerable risk of tornadoes")
-    elif tornado_score >= 15:
+    elif tornado_score >= 30:
         threats.append("an isolated risk of tornadoes")
 
     return threats
@@ -94,20 +94,21 @@ def analyze_snowstorm(snowfall, precipitation, temperature, wind_speed):
             + wind_score
             + precipitation_score,
             50
-        ),
+        ) * 2,
         2
     )
+    wind_score *= 2
 
     if not snowfall:
         category = "Low Snowstorm Risk"
         storm_type = "No snowstorm signal"
-    elif risk >= 30:
+    elif risk >= 60:
         category = "High Snowstorm Risk"
         storm_type = "Heavy Snowstorm Potential"
-    elif risk >= 20:
+    elif risk >= 40:
         category = "Moderate Snowstorm Risk"
         storm_type = "Snow and Strong Wind Potential" if wind_speed >= 35 else "Steady Snow Potential"
-    elif risk >= 10:
+    elif risk >= 20:
         category = "Snowstorm Potential"
         storm_type = "Periods of Snow Possible"
     else:
@@ -632,12 +633,12 @@ def analyze_storm(
         risk += 5
     
 
-    risk = min(risk, 50)
+    risk = min(risk * 2, 100)
 
-    tornado_score = min(tornado_score, 40)
-    tornado_score *= min(max(round(risk, 2) / 50, 0.0), 1.0)
-    hail_score = min(hail_score, 40)
-    damaging_wind_score = min(damaging_wind_score, 40)
+    tornado_score = min(tornado_score, 40) * 2
+    tornado_score *= min(max(round(risk, 2) / 100, 0.0), 1.0)
+    hail_score = min(hail_score, 40) * 2
+    damaging_wind_score = min(damaging_wind_score, 40) * 2
 
     supercell_score = min(supercell_score, 20)
     mcs_score = min(mcs_score, 20)
@@ -646,9 +647,9 @@ def analyze_storm(
         supercell_score = 0
 
 
-    tornado = tornado_score >= 25
-    hail = hail_score >= 25
-    wind = damaging_wind_score >= 25
+    tornado = tornado_score >= 50
+    hail = hail_score >= 50
+    wind = damaging_wind_score >= 50
 
     supercell = supercell_score >= 15
     mcs = mcs_score >= 15
@@ -672,23 +673,23 @@ def analyze_storm(
 
 
     # label the highest-impact combinations.
-    if tornado_score >= 35 and supercell and risk >= 35:
+    if tornado_score >= 70 and supercell and risk >= 70:
         storm_type = (
             "Extreme Tornadic Supercell Potential"
         )
 
-    elif mcs_score >= 18 and damaging_wind_score >= 30 and risk >= 35:
+    elif mcs_score >= 18 and damaging_wind_score >= 60 and risk >= 70:
         storm_type = (
             "High-End MCS / Derecho Potential"
         )
 
-    elif mcs_score >= 12 and damaging_wind_score >= 20 and risk >= 25:
+    elif mcs_score >= 12 and damaging_wind_score >= 40 and risk >= 50:
         storm_type = (
             "Organized MCS likely, with damaging wind potential"
         )
 
     elif (
-        risk < 15
+        risk < 20
     ):
         storm_type = (
             "Fairweather Likely, with minimal severe "
@@ -696,83 +697,83 @@ def analyze_storm(
         )
 
     elif (
-        risk < 18
+        risk < 30
     ):
         storm_type = (
             "Non-Severe Thunderstorms likely, with "
             "possible severe weather potential"
         )
 
-    elif highest < 20 and risk >= 18:
+    elif highest < 40 and risk >= 30:
         storm_type = (
             "Severe Thunderstorms likely"
         )
 
     elif supercell:
 
-        if tornado and hail and wind and cape >= 1000:
+        if tornado and hail and wind and risk >= 45:
             storm_type = (
                 "All-Hazards Supercell likely"
             )
 
-        elif tornado and hail and cape >= 1000:
+        elif tornado and hail and risk >= 45:
             storm_type = (
                 "Tornadic Hail Supercell potential"
             )
 
-        elif tornado and wind and cape >= 1000:
+        elif tornado and wind and risk >= 45:
             storm_type = (
                 "Tornadic Wind Supercell potential"
             )
 
-        elif hail and wind and cape >= 1000:
+        elif hail and wind and risk >= 45:
             storm_type = (
                 "Severe Hail/Wind Supercell potential"
             )
 
-        elif tornado and cape >= 1000:
+        elif tornado and risk >= 45:
             storm_type = (
                 "Tornadic Supercell potential"
             )
 
-        elif hail and cape >= 1000:
+        elif hail and risk >= 45:
             storm_type = (
                 "Hail-Dominant Supercell potential"
             )
 
-        elif wind and cape >= 1000:
+        elif wind and risk >= 45:
             storm_type = (
                 "Wind-Dominant Supercell potential"
             )
 
-        elif cape >= 1000:
+        elif risk >= 45:
             storm_type = (
                 "Supercell likely"
             )
 
     elif mcs:
 
-        if wind and hail and cape >= 500:
+        if wind and hail and risk >= 45:
             storm_type = (
                 "Severe MCS likely with Hail/Wind Potential"
             )
 
-        elif wind and cape >= 500:
+        elif wind and risk >= 45:
             storm_type = (
                 "Wind-Dominant MCS likely"
             )
 
-        elif hail and cape >= 500:
+        elif hail and risk >= 45:
             storm_type = (
                 "Hail-Producing MCS likely"
             )
 
-        elif tornado and cape >= 500:
+        elif tornado and risk >= 45:
             storm_type = (
                 "MCS likely with embedded tornado potential"
             )
 
-        elif high_shear >= 30 and cape >= 500:
+        elif high_shear >= 30 and risk >= 45:
             storm_type = (
                 "Organized MCS likely"
             )
@@ -825,7 +826,7 @@ def analyze_storm(
 
         "issued": (
             "No risk for severe storms today."
-            if risk < 15
+            if risk < 30
             else generate_storm_forecast([
                 {
                     "risk": get_risk_threat(risk),

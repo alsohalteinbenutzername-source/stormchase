@@ -3,7 +3,7 @@ import unittest
 from zoneinfo import ZoneInfo
 
 from calculations import calculate_best_day_window, calculate_manual_storm
-from stormanalyzer import analyze_storm
+from stormanalyzer import analyze_snowstorm, analyze_storm
 
 
 class CalculateManualStormTests(unittest.TestCase):
@@ -53,10 +53,24 @@ class CalculateManualStormTests(unittest.TestCase):
         low_risk = analyze_storm(100, 35, 29, 20, 300, -150, 850, 85, 30, 7.5)
         high_risk = analyze_storm(1000, 35, 29, 20, 300, -50, 850, 85, 30, 7.5)
 
-        self.assertAlmostEqual(low_risk["risk"], 3.71)
-        self.assertAlmostEqual(low_risk["tornado"], 0.57)
-        self.assertAlmostEqual(high_risk["risk"], 46.0)
-        self.assertAlmostEqual(high_risk["tornado"], 36.8)
+        self.assertAlmostEqual(low_risk["risk"], 7.42)
+        self.assertAlmostEqual(low_risk["tornado"], 1.14)
+        self.assertAlmostEqual(high_risk["risk"], 92.0)
+        self.assertAlmostEqual(high_risk["tornado"], 73.6)
+
+    def test_caps_overall_and_hazard_scores_at_the_new_maxima(self) -> None:
+        analysis = analyze_storm(3700, 35, 29, 20, 300, 0, 850, 85, 30, 7.5)
+
+        self.assertEqual(analysis["risk"], 100)
+        self.assertEqual(analysis["tornado"], 80)
+        self.assertLessEqual(analysis["hail"], 80)
+        self.assertLessEqual(analysis["wind"], 80)
+
+    def test_doubles_snowstorm_risk_to_the_new_maximum(self) -> None:
+        analysis = analyze_snowstorm(10, 5, -5, 55)
+
+        self.assertEqual(analysis["risk"], 100)
+        self.assertEqual(analysis["wind"], 20)
 
 
 class CalculateBestDayWindowTests(unittest.TestCase):

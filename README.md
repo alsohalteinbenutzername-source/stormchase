@@ -69,8 +69,10 @@ threat map with no qualifying areas reports that no elevated tier was forecast.
 Best forecast hours are anchored to the daily grid's issue time, or local
 midnight for an Open-Meteo fallback. Fallback ICON-D2 responses are cached
 locally until the next Berlin midnight, so reopening does not change the day's
-inputs or selected window. Tornado scores are weighted by the final overall
-risk (`risk / 50`, capped at 1) before tornado threat levels are calculated.
+inputs or selected window. The overall risk score is out of 100; tornado,
+hail, and wind scores are out of 80. Tornado scores are weighted by the final
+overall risk (`risk / 100`, capped at 1) before tornado threat levels are
+calculated.
 
 Blitzortung / LightningMaps community-network lightning strokes appear as
 yellow plus markers for up to 15 minutes on the live and DWD warning maps.
