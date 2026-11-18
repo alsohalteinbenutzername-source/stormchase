@@ -70,9 +70,11 @@ Best forecast hours are anchored to the daily grid's issue time, or local
 midnight for an Open-Meteo fallback. Fallback ICON-D2 responses are cached
 locally until the next Berlin midnight, so reopening does not change the day's
 inputs or selected window. The overall risk score is out of 100; tornado,
-hail, and wind scores are out of 80. Tornado scores are weighted by the final
-overall risk (`risk / 100`, capped at 1) before tornado threat levels are
-calculated.
+hail, and wind scores are out of 80. The tornado sub-threat uses a
+low-level interaction gate based on 0–500 m shear, 0–1 km storm-relative
+helicity and efficiency, hodograph critical angle, LCL, and CIN. Low-level
+lapse rate and optional 0–3 km CAPE/LFC values are also considered. The
+additional 180 m wind fields are optional when reading older cached outlooks.
 
 Blitzortung / LightningMaps community-network lightning strokes appear as
 yellow plus markers for up to 15 minutes on the live and DWD warning maps.

@@ -127,6 +127,7 @@ def calculate_germany_outlook(
     supabase: SupabaseClient | None = None,
 ) -> tuple[list[dict[str, Any]], datetime]:
     from weather_api import (
+        OPTIONAL_STORMANALYZER_HOURLY_FIELDS,
         STORMANALYZER_HOURLY_FIELDS,
         _validate_hourly,
         get_germany_grid_weather,
@@ -161,13 +162,18 @@ def calculate_germany_outlook(
         )
 
     fields = STORMANALYZER_HOURLY_FIELDS.split(",")
+    required_fields = [
+        field
+        for field in fields
+        if field not in OPTIONAL_STORMANALYZER_HOURLY_FIELDS
+    ]
     outlook = []
     for (latitude, longitude), location in zip(points, weather):
         best_by_day: dict[int, dict[str, Any]] = {}
         hourly = location.get("icon_d2")
         if not isinstance(hourly, dict):
             raise RuntimeError("Daily outlook is missing ICON-D2 hourly data.")
-        _validate_hourly(hourly, fields)
+        _validate_hourly(hourly, required_fields)
         cin = hourly.get("cin")
         if not isinstance(cin, list) or len(cin) != len(hourly["time"]):
             raise RuntimeError("Daily outlook is missing matching CIN data.")
@@ -2447,17 +2453,7 @@ class StormRadarApp:
             self._cell_artist = None
 
         for cell in self.rain_cells if self.map_mode == LIVE_MAP else ():
-            path = [
-                (point.longitude, point.latitude)
-                for point in cell.track
-            ]
-            if len(path) > 1:
-                self._draw_movement_track(
-                    path,
-                    "#72f1cf",
-                    linewidth=1.5,
-                    arrow=False,
-                )
+            if len(cell.track) > 1:
                 projected_position = project_rain_cell_direction(
                     cell.track,
                     (cell.latitude, cell.longitude),
@@ -3141,7 +3137,6 @@ class StormRadarApp:
                     "Rain echo (20–30 dBZ; convection not independently classified)",
                     f"Maximum reflectivity: {cell.max_reflectivity_dbz:.1f} dBZ",
                     f"Echo area: {cell.area_pixels} radar pixels",
-                    f"Track points: {len(cell.track)}",
                 )
             )
         else:

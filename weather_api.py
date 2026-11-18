@@ -17,9 +17,14 @@ STORMANALYZER_HOURLY_FIELDS = (
     "cape,convective_inhibition,temperature_850hPa,temperature_700hPa,"
     "temperature_500hPa,temperature_2m,dew_point_2m,relative_humidity_2m,"
     "precipitation,snowfall,wind_speed_10m,wind_direction_10m,"
+    "wind_speed_180m,wind_direction_180m,"
     "wind_speed_925hPa,wind_direction_925hPa,wind_speed_850hPa,"
     "wind_direction_850hPa,wind_speed_700hPa,wind_direction_700hPa,"
     "wind_speed_500hPa,wind_direction_500hPa"
+)
+OPTIONAL_STORMANALYZER_HOURLY_FIELDS = (
+    "wind_speed_180m",
+    "wind_direction_180m",
 )
 
 
@@ -44,6 +49,9 @@ params = {
 
         "wind_speed_10m",
         "wind_direction_10m",
+
+        "wind_speed_180m",
+        "wind_direction_180m",
 
         "wind_speed_925hPa",
         "wind_direction_925hPa",

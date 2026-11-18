@@ -108,6 +108,23 @@ class RainCellTrackerTests(unittest.TestCase):
         self.assertEqual(len(second.track), 2)
         self.assertEqual(second.track[-1].timestamp, self.start + timedelta(minutes=5))
 
+    def test_keeps_only_the_two_most_recent_track_points(self) -> None:
+        self.tracker.update((self.cell(51.0, 7.0),), self.start)
+        self.tracker.update(
+            (self.cell(51.05, 7.1),),
+            self.start + timedelta(minutes=5),
+        )
+
+        latest = self.tracker.update(
+            (self.cell(51.1, 7.2),),
+            self.start + timedelta(minutes=10),
+        )[0]
+
+        self.assertEqual(
+            [(point.latitude, point.longitude) for point in latest.track],
+            [(51.05, 7.1), (51.1, 7.2)],
+        )
+
     def test_does_not_duplicate_a_track_point_for_the_same_scan(self) -> None:
         self.tracker.update((self.cell(51.0, 7.0),), self.start)
 

@@ -3,6 +3,8 @@ from collections.abc import Mapping
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
+import numpy as np
+
 from stormanalyzer import analyze_snowstorm, analyze_storm
 
 
@@ -109,6 +111,160 @@ def calculate_srh(
         round(srh, 1),
         400.0
     )
+
+
+def _finite_float(value):
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def calculate_storm_motion_features(sounding):
+    """Derive near-surface shear, storm-relative helicity, and hodograph metrics."""
+    layer_heights = {
+        "wind10": 10.0,
+        "wind180": 180.0,
+        "wind925": 750.0,
+        "wind850": 1500.0,
+        "wind700": 3000.0,
+        "wind500": 5500.0,
+    }
+    profile = []
+    for wind_name, height in layer_heights.items():
+        speed = _finite_float(sounding.get(wind_name))
+        direction = _finite_float(sounding.get(f"dir{wind_name[4:]}"))
+        if speed is None or direction is None or speed < 0:
+            continue
+        profile.append((height, speed / 3.6, direction))
+
+    profile.sort(key=lambda point: point[0])
+    if len(profile) < 2 or profile[0][0] != 10.0:
+        return {}
+
+    heights = np.asarray([point[0] for point in profile], dtype=float)
+    speeds = np.asarray([point[1] for point in profile], dtype=float)
+    directions = np.deg2rad(np.asarray([point[2] for point in profile], dtype=float))
+    components = np.column_stack(
+        (-speeds * np.sin(directions), -speeds * np.cos(directions))
+    )
+    u_wind, v_wind = components[:, 0], components[:, 1]
+
+    def wind_at(height):
+        return (
+            float(np.interp(height, heights, u_wind)),
+            float(np.interp(height, heights, v_wind)),
+        )
+
+    def shear_between(bottom, top):
+        u0, v0 = wind_at(bottom)
+        u1, v1 = wind_at(top)
+        return math.hypot(u1 - u0, v1 - v0)
+
+    def mean_wind(bottom, top):
+        interior = heights[(heights > bottom) & (heights < top)]
+        levels = np.concatenate(([bottom], interior, [top]))
+        u_values = np.interp(levels, heights, u_wind)
+        v_values = np.interp(levels, heights, v_wind)
+        layer_depths = np.diff(levels)
+        return (
+            float(np.sum((u_values[:-1] + u_values[1:]) * layer_depths / 2) / (top - bottom)),
+            float(np.sum((v_values[:-1] + v_values[1:]) * layer_depths / 2) / (top - bottom)),
+        )
+
+    def bunkers_right_mover():
+        top = min(6000.0, float(heights[-1]))
+        if top <= 10.0:
+            return None
+        mean_u, mean_v = mean_wind(0.0, top)
+        low_u, low_v = mean_wind(0.0, top / 2.0)
+        high_u, high_v = mean_wind(top / 2.0, top)
+        shear_u, shear_v = high_u - low_u, high_v - low_v
+        shear_magnitude = math.hypot(shear_u, shear_v)
+        if shear_magnitude < 1e-6:
+            return None
+        deviation = 7.5
+        return (
+            mean_u + deviation * shear_v / shear_magnitude,
+            mean_v - deviation * shear_u / shear_magnitude,
+        )
+
+    storm_motion = bunkers_right_mover()
+
+    def storm_relative_helicity(top):
+        if storm_motion is None or heights[-1] < top:
+            return None
+        interior = heights[(heights > 0) & (heights < top)]
+        levels = np.concatenate(([0.0], interior, [top]))
+        u_values = np.interp(levels, heights, u_wind) - storm_motion[0]
+        v_values = np.interp(levels, heights, v_wind) - storm_motion[1]
+        du = np.diff(u_values)
+        dv = np.diff(v_values)
+        return max(float(np.sum(u_values[:-1] * dv - v_values[:-1] * du)), 0.0)
+
+    surface_u, surface_v = wind_at(10.0)
+    wind180_u, wind180_v = wind_at(180.0)
+    shear_u, shear_v = wind180_u - surface_u, wind180_v - surface_v
+    inflow_angle = None
+    if storm_motion is not None:
+        inflow_u = storm_motion[0] - surface_u
+        inflow_v = storm_motion[1] - surface_v
+        denominator = math.hypot(inflow_u, inflow_v) * math.hypot(shear_u, shear_v)
+        if denominator > 1e-6:
+            cosine = np.clip(
+                (inflow_u * shear_u + inflow_v * shear_v) / denominator,
+                -1.0,
+                1.0,
+            )
+            inflow_angle = math.degrees(math.acos(float(cosine)))
+
+    srh_1km = storm_relative_helicity(1000.0)
+    srh_3km = storm_relative_helicity(3000.0)
+    efficiency = None
+    if srh_1km is not None:
+        mean_u, mean_v = mean_wind(0.0, 1000.0)
+        mean_storm_relative_wind = math.hypot(
+            mean_u - storm_motion[0],
+            mean_v - storm_motion[1],
+        )
+        theoretical_srh = mean_storm_relative_wind * shear_between(0.0, 1000.0)
+        if theoretical_srh > 1e-6:
+            efficiency = min(srh_1km / theoretical_srh, 1.0)
+
+    return {
+        "shear_10m_180m": shear_between(10.0, 180.0),
+        "shear_0_500m": shear_between(0.0, 500.0),
+        "shear_0_1km": shear_between(0.0, 1000.0),
+        "critical_angle": inflow_angle,
+        "srh_0_1km": srh_1km,
+        "srh_0_3km": srh_3km,
+        "srh_efficiency": efficiency,
+    }
+
+
+def calculate_low_level_lapse_rate(sounding):
+    """Estimate the 0–2 km lapse rate from surface, 850 hPa, and 700 hPa temperatures."""
+    surface = _finite_float(sounding.get("temperature_2m"))
+    temp850 = _finite_float(sounding.get("temperature_850"))
+    temp700 = _finite_float(sounding.get("temperature_700"))
+    if surface is None or temp850 is None or temp700 is None:
+        return None
+
+    profile_height = np.asarray([2.0, 1500.0, 3000.0], dtype=float)
+    profile_temperature = np.asarray([surface, temp850, temp700], dtype=float)
+    temperature_2km = float(np.interp(2000.0, profile_height, profile_temperature))
+    return (surface - temperature_2km) / 2.0
+
+
+def _hourly_optional_value(hourly, index, field_names):
+    for field in field_names:
+        values = hourly.get(field)
+        if values is not None and index < len(values):
+            value = _finite_float(values[index])
+            if value is not None:
+                return value
+    return None
 
 
 def calculate_lcl(
@@ -377,9 +533,33 @@ def calculate_environment(
             ][i]
     }
 
+    sounding["wind180"] = _hourly_optional_value(
+        hourly, i, ("wind_speed_180m",)
+    )
+    sounding["dir180"] = _hourly_optional_value(
+        hourly, i, ("wind_direction_180m",)
+    )
+    sounding["temperature_2m"] = temperature
+    sounding["temperature_850"] = _hourly_optional_value(
+        hourly, i, ("temperature_850hPa",)
+    )
+    sounding["temperature_700"] = temp700
+
 
     srh = calculate_srh(
         sounding
+    )
+    motion_features = calculate_storm_motion_features(sounding)
+    low_level_lapse = calculate_low_level_lapse_rate(sounding)
+    cape_0_3km = _hourly_optional_value(
+        hourly,
+        i,
+        ("cape_0_3km", "cape_0_3000m", "cape_3km", "3cape"),
+    )
+    lfc = _hourly_optional_value(
+        hourly,
+        i,
+        ("lfc", "lfc_height", "lfc_height_m", "level_of_free_convection"),
     )
 
     return {
@@ -455,6 +635,38 @@ def calculate_environment(
                 lapse,
                 2
             ),
+
+        "low_level_lapse":
+            round(low_level_lapse, 2)
+            if low_level_lapse is not None
+            else None,
+
+        "shear_10m_180m":
+            motion_features.get("shear_10m_180m"),
+
+        "shear_0_500m":
+            motion_features.get("shear_0_500m"),
+
+        "shear_0_1km":
+            motion_features.get("shear_0_1km"),
+
+        "critical_angle":
+            motion_features.get("critical_angle"),
+
+        "srh_0_1km":
+            motion_features.get("srh_0_1km"),
+
+        "srh_0_3km":
+            motion_features.get("srh_0_3km"),
+
+        "srh_efficiency":
+            motion_features.get("srh_efficiency"),
+
+        "cape_0_3km":
+            cape_0_3km,
+
+        "lfc":
+            lfc,
 
         "sounding":
             sounding
@@ -543,7 +755,26 @@ def _has_required_environment_data(hourly, index):
         "wind_speed_500hPa",
         "wind_direction_500hPa",
     )
-    return all(hourly[variable][index] is not None for variable in required_variables)
+    return all(
+        variable in hourly
+        and index < len(hourly[variable])
+        and _finite_float(hourly[variable][index]) is not None
+        for variable in required_variables
+    )
+
+
+def _storm_feature_arguments(environment):
+    feature_names = (
+        "srh_0_1km",
+        "srh_0_3km",
+        "srh_efficiency",
+        "shear_0_500m",
+        "critical_angle",
+        "low_level_lapse",
+        "cape_0_3km",
+        "lfc",
+    )
+    return {name: environment.get(name) for name in feature_names}
 
 
 def calculate_best_day_window(hourly, target_day: date, now: datetime | None = None):
@@ -574,6 +805,7 @@ def calculate_best_day_window(hourly, target_day: date, now: datetime | None = N
             environment["temperature"],
             environment["lapse"],
             environment.get("coverage", 50),
+            **_storm_feature_arguments(environment),
         )
         if analysis["risk"] > best_score:
             best_score = analysis["risk"]
@@ -876,7 +1108,8 @@ def calculate_best_window(
                 result.get(
                     "coverage",
                     50
-                )
+                ),
+                **_storm_feature_arguments(result),
             )
 
         score = analysis["risk"]
