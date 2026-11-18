@@ -33,6 +33,14 @@ from radar import (
     velocity_radar_sites,
 )
 from tracking import fetch_latest_storm_cells
+if __package__:
+    from .severe_parameters import (
+        PRESSURE_LEVEL_HOURLY_FIELDS,
+    )
+else:
+    from severe_parameters import (
+        PRESSURE_LEVEL_HOURLY_FIELDS,
+    )
 
 
 LOG = logging.getLogger("stormchase-publisher")
@@ -52,7 +60,7 @@ OUTLOOK_EXTENT = (4.0, 16.0, 47.0, 56.0)
 OUTLOOK_GRID_SPACING = 0.4
 OUTLOOK_GRID_POINT_COUNT = 744
 OUTLOOK_API_URL = "https://api.open-meteo.com/v1/dwd-icon"
-OUTLOOK_HOURLY_FIELDS = (
+_BASE_OUTLOOK_HOURLY_FIELDS = (
     "cape,convective_inhibition,surface_pressure,"
     "temperature_2m,dew_point_2m,relative_humidity_2m,"
     "temperature_925hPa,temperature_850hPa,temperature_700hPa,"
@@ -66,6 +74,15 @@ OUTLOOK_HOURLY_FIELDS = (
     "wind_direction_850hPa,wind_speed_700hPa,wind_direction_700hPa,"
     "wind_speed_500hPa,wind_direction_500hPa"
 ).split(",")
+OUTLOOK_HOURLY_FIELDS = list(dict.fromkeys((
+    *_BASE_OUTLOOK_HOURLY_FIELDS,
+    *PRESSURE_LEVEL_HOURLY_FIELDS,
+)))
+OUTLOOK_EXTRA_PRESSURE_LEVEL_FIELDS = tuple(
+    field
+    for field in PRESSURE_LEVEL_HOURLY_FIELDS
+    if field not in _BASE_OUTLOOK_HOURLY_FIELDS
+)
 OUTLOOK_PROFILE_FIELDS = (
     "srh_0_1km",
     "srh_0_3km",
@@ -75,12 +92,15 @@ OUTLOOK_PROFILE_FIELDS = (
     "low_level_lapse",
     "cape_0_3km",
     "lfc",
+    "stp",
+    "scp",
 )
 NO_LFC_SENTINEL_M = 6000.0
 OUTLOOK_BATCH_SIZE = 100
 OUTLOOK_RETRY_ATTEMPTS = 4
 OUTLOOK_FETCH_WINDOW_SECONDS = 120.0
 OUTLOOK_PUBLISH_BATCH_SIZE = 25
+OUTLOOK_PROFILE_VERSION = "effective-layer-v2"
 
 
 class PublisherError(RuntimeError):
@@ -745,7 +765,9 @@ def _fetch_openmeteo_batch(request_params: dict[str, Any]) -> list[dict[str, Any
     raise PublisherError("Open-Meteo outlook request failed after retries.")
 
 
-def _fetch_daily_outlook_grid() -> list[dict[str, Any]]:
+def _fetch_daily_outlook_grid(
+    reference_time: datetime | None = None,
+) -> list[dict[str, Any]]:
     points = _outlook_grid_points()
     batches = [
         points[index : index + OUTLOOK_BATCH_SIZE]
@@ -837,8 +859,37 @@ def _fetch_daily_outlook_grid() -> list[dict[str, Any]]:
             len(points),
         )
 
+    from calculations import calculate_best_day_window
+
+    reference_time = reference_time or datetime.now(OUTLOOK_TIMEZONE)
+    reference_time = reference_time.astimezone(OUTLOOK_TIMEZONE)
+    for point in grid:
+        hourly = point["icon_d2"]
+        for day_offset in range(2):
+            best_window = calculate_best_day_window(
+                hourly,
+                reference_time.date() + timedelta(days=day_offset),
+                reference_time,
+            )
+            if best_window is None:
+                continue
+            time_text = best_window["time"].strftime("%Y-%m-%dT%H:%M")
+            try:
+                selected_index = hourly["time"].index(time_text)
+            except ValueError as error:
+                raise PublisherError(
+                    "Selected daily outlook time is missing from its hourly profile."
+                ) from error
+            environment = best_window["environment"]
+            hourly["stp"][selected_index] = environment["stp"]
+            hourly["scp"][selected_index] = environment["scp"]
+
     if not _valid_outlook_grid(grid):
         raise PublisherError("Open-Meteo returned an incomplete daily outlook grid.")
+    for point in grid:
+        hourly = point["icon_d2"]
+        for field in OUTLOOK_EXTRA_PRESSURE_LEVEL_FIELDS:
+            hourly.pop(field, None)
     return grid
 
 
@@ -859,9 +910,24 @@ def publish_daily_outlook() -> None:
         isinstance(row, dict) for row in existing_points
     ):
         raise PublisherError("Supabase returned an invalid daily outlook point response.")
-    if [row.get("point_index") for row in existing_points] == list(
-        range(OUTLOOK_GRID_POINT_COUNT)
+    points_are_complete = [
+        row.get("point_index") for row in existing_points
+    ] == list(range(OUTLOOK_GRID_POINT_COUNT))
+    version_rows = _request(
+        "GET",
+        "/rest/v1/daily_outlook_forecasts",
+        query={
+            "select": "forecast_date",
+            "forecast_date": f"eq.{date_text}",
+            "grid_payload->>profile_version": f"eq.{OUTLOOK_PROFILE_VERSION}",
+            "limit": "1",
+        },
+    )
+    if not isinstance(version_rows, list) or not all(
+        isinstance(row, dict) for row in version_rows
     ):
+        raise PublisherError("Supabase returned an invalid daily outlook version response.")
+    if points_are_complete and version_rows:
         LOG.info("Daily outlook for %s is already published; skipping Open-Meteo.", date_text)
         return
     if existing_points:
@@ -872,9 +938,12 @@ def publish_daily_outlook() -> None:
             OUTLOOK_GRID_POINT_COUNT,
         )
 
+    issued_at_datetime = datetime.now(timezone.utc)
+    issued_at = _iso(issued_at_datetime)
     LOG.info("Fetching the once-daily ICON-D2 outlook grid for %s.", date_text)
-    grid = _fetch_daily_outlook_grid()
-    issued_at = _iso(datetime.now(timezone.utc))
+    grid = _fetch_daily_outlook_grid(
+        issued_at_datetime.astimezone(OUTLOOK_TIMEZONE)
+    )
     _upsert(
         "daily_outlook_forecasts",
         "forecast_date",
@@ -916,6 +985,17 @@ def publish_daily_outlook() -> None:
             batch_end,
             len(grid),
         )
+    _upsert(
+        "daily_outlook_forecasts",
+        "forecast_date",
+        [
+            {
+                "forecast_date": date_text,
+                "issued_at": issued_at,
+                "grid_payload": {"profile_version": OUTLOOK_PROFILE_VERSION},
+            }
+        ],
+    )
     LOG.info("Published the daily outlook grid for %s (%d points).", date_text, len(grid))
 
 

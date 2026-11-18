@@ -221,7 +221,6 @@ def analyze_snowstorm(snowfall, precipitation, temperature, wind_speed):
         "hail": 0,
         "wind": round(wind_score, 2),
         "supercell": 0,
-        "mcs": 0,
         "threats": threats,
         "issued": (
             f"{category}: {snowfall:.2f} cm snowfall, "
@@ -378,17 +377,6 @@ def generate_criticism(
     return reasons
 
 
-def get_storm_types(
-    tornado,
-    hail,
-    wind,
-    supercell,
-    mcs,
-    coverage
-):
-    pass
-
-
 def analyze_storm(
     cape,
     high_shear,
@@ -400,7 +388,6 @@ def analyze_storm(
     rh,
     temp,
     lapse,
-    coverage=50,
     *,
     srh_0_1km,
     srh_0_3km,
@@ -412,7 +399,6 @@ def analyze_storm(
     lfc,
 ):
 
-    mcs_score = 0
     supercell_score = 0
 
     tornado_score = 0
@@ -498,11 +484,6 @@ def analyze_storm(
         (3000, 10),
         (3700, 12)
     ], cape), 10)
-
-    mcs_score += min(interpolate_cape_value([
-        (0, 0),
-        (3700, 7)
-    ], cape), 6)
 
     supercell_score += min(interpolate_cape_value([
         (0, 0),
@@ -641,12 +622,6 @@ def analyze_storm(
         (85, 7)
     ], rh), 5)
 
-    mcs_score += min(interpolate_cape_value([
-        (0, 0),
-        (85, 4)
-    ], rh), 3)
-
-
     risk += min(interpolate_cape_value([
         (0, 0),
         (30, 2)
@@ -677,36 +652,6 @@ def analyze_storm(
         risk -= 5
 
 
-    if coverage >= 80:
-        mcs_score = mcs_score * 0.45
-        supercell_score += 5
-        mcs_score -= 5
-
-    elif coverage >= 60:
-        supercell_score += 3
-        mcs_score -= 3
-
-    elif coverage >= 50:
-        supercell_score += 0
-        mcs_score += 0
-
-    elif coverage >= 40:
-        mcs_score += 3
-        supercell_score -= 3
-
-    elif coverage >= 20:
-        mcs_score += 5
-        supercell_score -= 5
-
-    else:
-        mcs_score += 15
-        supercell_score = supercell_score * 0.45
-
-
-    if mcs_score >= 15 and damaging_wind_score >= 30:
-        mcs_score += 5
-
-
     if tornado_helicity >= 300 and lcl <= 850:
         tornado_score += 8
 
@@ -723,28 +668,24 @@ def analyze_storm(
     if cape <= 100:
         risk *= 0.15
         supercell_score *= 0.40
-        mcs_score *= 0.40
         tornado_score *= 0.65
         damaging_wind_score *= 0.60
         hail_score *= 0.40
     elif cape <= 200:
         risk *= 0.35
         supercell_score *= 0.60
-        mcs_score *= 0.60
         tornado_score *= 0.75
         damaging_wind_score *= 0.70
         hail_score *= 0.60
     elif cape <= 300:
         risk *= 0.70
         supercell_score *= 0.75
-        mcs_score *= 0.75
         tornado_score *= 0.85
         damaging_wind_score *= 0.80
         hail_score *= 0.75
     elif cape <= 500:
         risk *= 0.90
         supercell_score *= 0.90
-        mcs_score *= 0.90
         tornado_score *= 0.95
         damaging_wind_score *= 0.90
         hail_score *= 0.90
@@ -782,7 +723,6 @@ def analyze_storm(
     damaging_wind_score = min(damaging_wind_score, 40) * 2
 
     supercell_score = min(supercell_score, 20)
-    mcs_score = min(mcs_score, 20)
 
     if high_shear < 20:
         supercell_score = 0
@@ -793,7 +733,6 @@ def analyze_storm(
     wind = damaging_wind_score >= 50
 
     supercell = supercell_score >= 15
-    mcs = mcs_score >= 15
 
 
 
@@ -817,16 +756,6 @@ def analyze_storm(
     if tornado_score >= 70 and supercell and risk >= 70:
         storm_type = (
             "Extreme Tornadic Supercell Potential"
-        )
-
-    elif mcs_score >= 18 and damaging_wind_score >= 60 and risk >= 70:
-        storm_type = (
-            "High-End MCS / Derecho Potential"
-        )
-
-    elif mcs_score >= 12 and damaging_wind_score >= 40 and risk >= 50:
-        storm_type = (
-            "Organized MCS likely, with damaging wind potential"
         )
 
     elif (
@@ -892,33 +821,6 @@ def analyze_storm(
                 "Supercell likely"
             )
 
-    elif mcs:
-
-        if wind and hail and risk >= 45:
-            storm_type = (
-                "Severe MCS likely with Hail/Wind Potential"
-            )
-
-        elif wind and risk >= 45:
-            storm_type = (
-                "Wind-Dominant MCS likely"
-            )
-
-        elif hail and risk >= 45:
-            storm_type = (
-                "Hail-Producing MCS likely"
-            )
-
-        elif tornado and risk >= 45:
-            storm_type = (
-                "MCS likely with embedded tornado potential"
-            )
-
-        elif high_shear >= 30 and risk >= 45:
-            storm_type = (
-                "Organized MCS likely"
-            )
-
     elif wind and hail:
         storm_type = (
             "Severe Hail/Wind Storm potential"
@@ -960,8 +862,6 @@ def analyze_storm(
         "wind": round(damaging_wind_score, 2),
 
         "supercell": round(supercell_score, 2),
-
-        "mcs": round(mcs_score, 2),
 
         "threats": threats,
 

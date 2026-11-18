@@ -1,6 +1,7 @@
 from datetime import datetime
 import math
 import unittest
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from calculations import (
@@ -26,7 +27,6 @@ class CalculateManualStormTests(unittest.TestCase):
             "humidity": 70,
             "temperature": 30,
             "lapse": 6.5,
-            "coverage": 100,
             "srh_0_1km": 150,
             "srh_0_3km": 250,
             "srh_efficiency": 0.6,
@@ -35,6 +35,13 @@ class CalculateManualStormTests(unittest.TestCase):
             "low_level_lapse": 6.5,
             "cape_0_3km": 300,
             "lfc": 800,
+            "mlcape": 1500,
+            "mllcl": 800,
+            "mlcin": -50,
+            "mucape": 1500,
+            "effective_srh": 150,
+            "effective_bwd": 20,
+            "effective_base_height": 0,
         }
 
     def test_calculates_manual_values_with_stormanalyzer(self) -> None:
@@ -49,7 +56,6 @@ class CalculateManualStormTests(unittest.TestCase):
             self.values["humidity"],
             self.values["temperature"],
             self.values["lapse"],
-            self.values["coverage"],
             **{
                 key: self.values[key]
                 for key in (
@@ -64,6 +70,8 @@ class CalculateManualStormTests(unittest.TestCase):
                 )
             },
         )
+        expected["stp"] = 1.0
+        expected["scp"] = 4.5
 
         self.assertEqual(calculate_manual_storm(self.values), expected)
 
@@ -89,11 +97,22 @@ class CalculateManualStormTests(unittest.TestCase):
             self.values["humidity"],
             self.values["temperature"],
             self.values["lapse"],
-            self.values["coverage"],
             **profile,
         )
+        expected["stp"] = 1.0
+        expected["scp"] = 4.5
 
         self.assertEqual(calculate_manual_storm({**self.values, **profile}), expected)
+
+    def test_removes_coverage_and_mcs_from_manual_results(self) -> None:
+        analysis = calculate_manual_storm(self.values)
+        with_legacy_coverage = calculate_manual_storm({
+            **self.values,
+            "coverage": 0,
+        })
+
+        self.assertEqual(analysis, with_legacy_coverage)
+        self.assertNotIn("mcs", analysis)
 
     def test_rejects_missing_or_non_finite_manual_values(self) -> None:
         missing = dict(self.values)
@@ -104,6 +123,10 @@ class CalculateManualStormTests(unittest.TestCase):
         del missing_profile["srh_0_1km"]
         with self.assertRaisesRegex(ValueError, "Missing manual input: srh_0_1km"):
             calculate_manual_storm(missing_profile)
+        missing_composite = dict(self.values)
+        del missing_composite["effective_srh"]
+        with self.assertRaisesRegex(ValueError, "Missing manual input: effective_srh"):
+            calculate_manual_storm(missing_composite)
 
         non_finite = dict(self.values, cape=float("nan"))
         with self.assertRaisesRegex(ValueError, "cape must be finite"):
@@ -112,6 +135,9 @@ class CalculateManualStormTests(unittest.TestCase):
         invalid_profile = dict(self.values, critical_angle=float("inf"))
         with self.assertRaisesRegex(ValueError, "critical_angle must be finite"):
             calculate_manual_storm(invalid_profile)
+        invalid_composite = dict(self.values, effective_bwd=float("nan"))
+        with self.assertRaisesRegex(ValueError, "effective_bwd must be finite"):
+            calculate_manual_storm(invalid_composite)
 
     def test_calibrates_tornado_score_by_the_final_overall_risk(self) -> None:
         profile = {
@@ -268,6 +294,7 @@ class CalculateManualStormTests(unittest.TestCase):
 
         self.assertEqual(analysis["risk"], 100)
         self.assertEqual(analysis["wind"], 20)
+        self.assertNotIn("mcs", analysis)
 
 
 class CalculateBestDayWindowTests(unittest.TestCase):
@@ -356,6 +383,48 @@ class CalculateBestDayWindowTests(unittest.TestCase):
             "lfc",
         ):
             self.assertTrue(math.isfinite(environment[field]), field)
+
+    def test_reuses_publisher_profile_metrics(self) -> None:
+        hourly = dict(self.hourly)
+        hourly["low_level_lapse"] = [5.67] * 4
+        hourly["cape_0_3km"] = [222.2] * 4
+        hourly["lfc"] = [900.4] * 4
+        hourly["stp"] = [1.2] * 4
+        hourly["scp"] = [3.4] * 4
+
+        with patch(
+            "calculations.calculate_low_level_buoyancy_metrics",
+            side_effect=AssertionError("cached buoyancy metrics should be used"),
+        ), patch(
+            "calculations.calculate_low_level_lapse_rate",
+            side_effect=AssertionError("cached lapse rate should be used"),
+        ), patch(
+            "calculations.calculate_spc_effective_parameters",
+            side_effect=AssertionError("cached SPC composites should be used"),
+        ):
+            environment = calculate_environment(hourly, 1)
+
+        self.assertEqual(environment["low_level_lapse"], 5.67)
+        self.assertEqual(environment["cape_0_3km"], 222.2)
+        self.assertEqual(environment["lfc"], 900.4)
+        self.assertEqual(environment["stp"], 1.2)
+        self.assertEqual(environment["scp"], 3.4)
+
+    def test_computes_spc_parameters_for_the_selected_daily_window(self) -> None:
+        with patch(
+            "calculations.calculate_spc_effective_parameters",
+            return_value={"stp": 1.2, "scp": 3.4},
+        ) as calculate_parameters:
+            best = calculate_best_day_window(
+                self.hourly,
+                self.now.date(),
+                self.now,
+            )
+
+        assert best is not None
+        self.assertEqual(best["environment"]["stp"], 1.2)
+        self.assertEqual(best["environment"]["scp"], 3.4)
+        self.assertEqual(calculate_parameters.call_count, 1)
 
     def test_uses_finite_lfc_sentinel_when_profile_never_reaches_free_convection(self) -> None:
         hourly = dict(self.hourly)

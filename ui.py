@@ -111,6 +111,17 @@ THREAT_PROBABILITIES = {
     "Hail": ((20, 2), (30, 5), (40, 10), (50, 15), (60, 30), (70, 45)),
     "Wind": ((20, 2), (30, 5), (40, 10), (50, 15), (60, 30), (70, 45)),
 }
+OUTLOOK_PARAMETER_SCALES = {"STP": 10.0, "SCP": 25.0}
+
+
+def _format_optional_parameter(value: Any) -> str:
+    try:
+        numeric_value = float(value)
+    except (TypeError, ValueError):
+        return "unavailable"
+    if not math.isfinite(numeric_value):
+        return "unavailable"
+    return f"{numeric_value:.2f}"
 
 
 def germany_grid_points(outlines: tuple[tuple[tuple[float, float], ...], ...], spacing: float = 0.4) -> list[tuple[float, float]]:
@@ -1067,7 +1078,7 @@ class StormRadarApp:
         self.outlook_day_var.trace_add("write", self._on_outlook_selection_change)
         self.outlook_metric_combo = ttk.Combobox(
             map_toolbar, textvariable=self.outlook_metric_var,
-            values=("Overall risk", "Tornado", "Hail", "Wind"),
+            values=("Overall risk", "Tornado", "Hail", "Wind", "STP", "SCP"),
             state="readonly", width=12,
         )
         self.outlook_metric_combo.pack(side="left", padx=(5, 0))
@@ -1286,12 +1297,11 @@ class StormRadarApp:
             ("snowfall", "Snowfall (cm/hour)", "0"),
             ("precipitation", "Precipitation (mm/hour)", "0"),
             ("wind_speed", "Surface wind (km/h)", "15"),
-            ("srh", "SRH (m²/s²)", "150"),
+            ("srh", "Full-profile SRH (m²/s²)", "150"),
             ("high_shear", "Deep layer shear (kt)", "35"),
             ("low_shear", "Low level shear (kt)", "20"),
             ("lapse", "Lapse rate (°C/km)", "6.5"),
             ("lcl", "LCL (m)", "1000"),
-            ("coverage", "Coverage (0–100)", "100"),
         )
         self.manual_outlook_inputs: dict[str, tk.StringVar] = {}
         for index, (key, label, default) in enumerate(fields):
@@ -1331,19 +1341,19 @@ class StormRadarApp:
             style="Panel.TLabel",
         ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 3))
         profile_fields = (
-            ("srh_0_1km", "0–1 km SRH (m²/s²)"),
-            ("srh_0_3km", "0–3 km SRH (m²/s²)"),
-            ("srh_efficiency", "SRH efficiency (0–1)"),
-            ("shear_0_500m", "0–500 m shear (m/s)"),
-            ("critical_angle", "Critical angle (°)"),
-            ("low_level_lapse", "0–2 km lapse rate (°C/km)"),
-            ("cape_0_3km", "0–3 km CAPE (J/kg)"),
-            ("lfc", "LFC height (m)"),
+            ("srh_0_1km", "0–1 km SRH (m²/s²)", "300"),
+            ("srh_0_3km", "0–3 km SRH (m²/s²)", "400"),
+            ("srh_efficiency", "SRH efficiency (0–1)", "1.0"),
+            ("shear_0_500m", "0–500 m shear (m/s)", "15"),
+            ("critical_angle", "Critical angle (°)", "90"),
+            ("low_level_lapse", "0–2 km lapse rate (°C/km)", "7.5"),
+            ("cape_0_3km", "0–3 km CAPE (J/kg)", "150"),
+            ("lfc", "LFC height (m)", "500"),
         )
-        for index, (key, label) in enumerate(profile_fields):
+        for index, (key, label, default) in enumerate(profile_fields):
             row = index // 2 + 1
             column = (index % 2) * 2
-            value = tk.StringVar()
+            value = tk.StringVar(value=default)
             self.manual_outlook_inputs[key] = value
             ttk.Label(advanced_box, text=label, style="Panel.TLabel").grid(
                 row=row,
@@ -1361,11 +1371,56 @@ class StormRadarApp:
             )
         advanced_box.columnconfigure(1, weight=1)
         advanced_box.columnconfigure(3, weight=1)
+        composite_box = ttk.LabelFrame(
+            manual_box,
+            text="SPC effective-layer composite inputs",
+            style="Panel.TLabelframe",
+            padding=6,
+        )
+        composite_box.grid(row=8, column=0, columnspan=4, sticky="ew", pady=(6, 0))
+        ttk.Label(
+            composite_box,
+            text=(
+                "Enter effective-layer values here; these are distinct from the "
+                "full-profile SRH and deep-layer shear above."
+            ),
+            style="Panel.TLabel",
+        ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 3))
+        composite_fields = (
+            ("mlcape", "Mixed-layer CAPE (J/kg)", "1500"),
+            ("mllcl", "Mixed-layer LCL (m AGL)", "800"),
+            ("mlcin", "Mixed-layer CIN (J/kg)", "-50"),
+            ("mucape", "Most-unstable CAPE (J/kg)", "1500"),
+            ("effective_srh", "Effective-layer SRH (m²/s²)", "150"),
+            ("effective_bwd", "Effective-layer bulk wind difference (m/s)", "20"),
+            ("effective_base_height", "Effective inflow base (m AGL)", "0"),
+        )
+        for index, (key, label, default) in enumerate(composite_fields):
+            row = index // 2 + 1
+            column = (index % 2) * 2
+            value = tk.StringVar(value=default)
+            self.manual_outlook_inputs[key] = value
+            ttk.Label(composite_box, text=label, style="Panel.TLabel").grid(
+                row=row,
+                column=column,
+                sticky="w",
+                padx=(0, 6),
+                pady=3,
+            )
+            ttk.Entry(composite_box, textvariable=value, width=12).grid(
+                row=row,
+                column=column + 1,
+                sticky="ew",
+                padx=(0, 14),
+                pady=3,
+            )
+        composite_box.columnconfigure(1, weight=1)
+        composite_box.columnconfigure(3, weight=1)
         ttk.Button(
             manual_box,
             text="Calculate manual risk",
             command=self._calculate_manual_outlook,
-        ).grid(row=8, column=0, columnspan=4, sticky="w", pady=(8, 4))
+        ).grid(row=9, column=0, columnspan=4, sticky="w", pady=(8, 4))
         self.manual_outlook_result = tk.StringVar(
             value="Enter environmental values and calculate a manual storm-risk assessment."
         )
@@ -1375,7 +1430,7 @@ class StormRadarApp:
             style="Panel.TLabel",
             justify="left",
             wraplength=900,
-        ).grid(row=9, column=0, columnspan=4, sticky="ew", pady=(4, 0))
+        ).grid(row=10, column=0, columnspan=4, sticky="ew", pady=(4, 0))
 
     def _set_manual_outlook_location(self) -> None:
         try:
@@ -1432,8 +1487,10 @@ class StormRadarApp:
             f"MANUAL RESULT · Overall risk {analysis['risk']}/100 · {analysis['category']}\n"
             f"Storm type: {analysis['storm_type']}\n"
             f"Tornado {analysis['tornado']}/80 · Hail {analysis['hail']}/80 · "
-            f"Wind {analysis['wind']}/80 · Supercell {analysis['supercell']}/20 · "
-            f"MCS {analysis['mcs']}/20\n"
+            f"Wind {analysis['wind']}/80 · Supercell {analysis['supercell']}/20\n"
+            f"SPC effective-layer STP {analysis['stp']:.2f} · "
+            f"SCP {analysis['scp']:.2f}\n"
+            f"Full-profile SRH {values['srh']:.0f} m²/s² · "
             f"Low-level profile: 0–1 km SRH {values['srh_0_1km']:.0f} · "
             f"0–3 km SRH {values['srh_0_3km']:.0f} · "
             f"SRH efficiency {values['srh_efficiency']:.2f} · "
@@ -1476,7 +1533,8 @@ class StormRadarApp:
             f"LCL {environment['lcl']} m · Lapse {environment['lapse']} °C/km\n"
             f"Temperature {environment['temperature']} °C · "
             f"Dewpoint {environment['dewpoint']} °C · Humidity {environment['humidity']}%\n"
-            f"SRH {environment['srh']} m²/s² · Deep shear {environment['high_shear']} kt · "
+            f"Full-profile SRH {environment['srh']} m²/s² · "
+            f"Deep shear {environment['high_shear']} kt · "
             f"Low-level shear {environment['low_shear']} kt\n"
             f"Near-surface: 0–1 km SRH {environment['srh_0_1km']:.0f} · "
             f"0–3 km SRH {environment['srh_0_3km']:.0f} · "
@@ -1485,10 +1543,11 @@ class StormRadarApp:
             f"critical angle {environment['critical_angle']:.0f}°\n"
             f"0–2 km lapse {environment['low_level_lapse']:.1f} °C/km · "
             f"0–3 km CAPE {environment['cape_0_3km']:.0f} J/kg · "
-            f"LFC {environment['lfc']:.0f} m\n"
+            f"LFC {environment['lfc']:.0f} m · "
+            f"effective-layer STP {_format_optional_parameter(environment['stp'])} · "
+            f"SCP {_format_optional_parameter(environment['scp'])}\n"
             f"Tornado {entry['tornado']}/80 · Hail {entry['hail']}/80 · "
-            f"Wind {entry['wind']}/80 · Supercell {entry['supercell']}/20 · "
-            f"MCS {entry['mcs']}/20\n"
+            f"Wind {entry['wind']}/80 · Supercell {entry['supercell']}/20\n"
             f"Threats: {threats}\nIssued: {entry['issued']}\nAssessment:\n{criticism}"
         )
 
@@ -2142,7 +2201,20 @@ class StormRadarApp:
             )
 
     def _draw_outlook_legend(self) -> None:
-        if self._outlook_metric == "Overall risk":
+        if self._outlook_metric in OUTLOOK_PARAMETER_SCALES:
+            maximum = OUTLOOK_PARAMETER_SCALES[self._outlook_metric]
+            levels = np.linspace(0.0, maximum, len(OUTLOOK_COLORS) + 1)
+            labels = [
+                f"{levels[index]:.1f}–<{levels[index + 1]:.1f}"
+                for index in range(len(levels) - 2)
+            ]
+            labels.append(f"{levels[-2]:.1f}–{maximum:g} (scale maximum)")
+            colors = OUTLOOK_COLORS
+            title = (
+                f"{self.outlook_day_var.get()} · SPC effective-layer "
+                f"{self._outlook_metric} (0–{maximum:g})"
+            )
+        elif self._outlook_metric == "Overall risk":
             labels = list(OVERALL_SCORE_LABELS)
             colors = ("#ffffff", *OUTLOOK_COLORS[1:])
             title = f"{self.outlook_day_var.get()} · StormAnalyzer risk score / 100"
@@ -2246,33 +2318,72 @@ class StormRadarApp:
         if outlook_mode and self._storm_outlook:
             day = self._outlook_day
             entries = [entry for entry in self._storm_outlook if entry["day"] == day]
-            metric_key = {"Overall risk": "risk", "Tornado": "tornado", "Hail": "hail", "Wind": "wind"}[self._outlook_metric]
+            metric_key = {
+                "Overall risk": "risk",
+                "Tornado": "tornado",
+                "Hail": "hail",
+                "Wind": "wind",
+                "STP": "stp",
+                "SCP": "scp",
+            }[self._outlook_metric]
+            parameter_scale = OUTLOOK_PARAMETER_SCALES.get(self._outlook_metric)
+            parameter_values: list[float] = []
+            if parameter_scale is not None:
+                available_entries = []
+                for entry in entries:
+                    environment = entry.get("environment")
+                    if not isinstance(environment, dict):
+                        continue
+                    value = environment.get(metric_key)
+                    try:
+                        numeric_value = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if math.isfinite(numeric_value):
+                        available_entries.append(entry)
+                        parameter_values.append(
+                            float(np.clip(numeric_value, 0.0, parameter_scale))
+                        )
+                entries = available_entries
             if entries:
                 longitudes = np.asarray([entry["longitude"] for entry in entries])
                 latitudes = np.asarray([entry["latitude"] for entry in entries])
-                scores = np.asarray([entry[metric_key] for entry in entries], dtype=float)
+                scores = (
+                    np.asarray(parameter_values, dtype=float)
+                    if parameter_scale is not None
+                    else np.asarray([entry[metric_key] for entry in entries], dtype=float)
+                )
                 if metric_key != "risk":
-                    composite_risk = np.asarray([entry["risk"] for entry in entries], dtype=float)
-                    risk_factor = np.clip(composite_risk / 100.0, 0.0, 1.0)
-                    if metric_key != "tornado":
-                        scores = scores * risk_factor
+                    if parameter_scale is None:
+                        composite_risk = np.asarray([entry["risk"] for entry in entries], dtype=float)
+                        risk_factor = np.clip(composite_risk / 100.0, 0.0, 1.0)
+                        if metric_key != "tornado":
+                            scores = scores * risk_factor
                 triangulation = Triangulation(longitudes, latitudes) if len(entries) >= 3 else None
 
-                if metric_key == "risk":
+                if parameter_scale is not None:
+                    score_levels = tuple(np.linspace(0.0, parameter_scale, len(OUTLOOK_COLORS) + 1))
+                    scores = np.minimum(scores, np.nextafter(parameter_scale, 0.0))
+                    level_colors = OUTLOOK_COLORS
+                    contour_options: dict[str, Any] = {}
+                    minimum_to_render = score_levels[1]
+                elif metric_key == "risk":
                     score_levels = (-1, *OVERALL_LEVELS, 101)
                     level_colors = ("#ffffff", *OUTLOOK_COLORS[1:])
                     contour_options: dict[str, Any] = {
                         "hatches": ("///", "", "", "", "", ""),
                     }
+                    minimum_to_render = score_levels[0]
                 else:
                     tiers = THREAT_PROBABILITIES[self._outlook_metric]
                     score_levels = tuple(score for score, _ in tiers) + (81,)
                     level_colors = OUTLOOK_COLORS
                     contour_options = {}
+                    minimum_to_render = score_levels[0]
 
                 if (
                     scores.size
-                    and np.nanmax(scores) >= score_levels[0]
+                    and np.nanmax(scores) >= minimum_to_render
                     and triangulation is not None
                 ):
                     refined_triangulation, refined_scores = UniformTriRefiner(triangulation).refine_field(scores, subdiv=4)

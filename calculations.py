@@ -5,6 +5,10 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 
+from publisher.severe_parameters import (
+    calculate_spc_composites,
+    calculate_spc_effective_parameters,
+)
 from stormanalyzer import analyze_snowstorm, analyze_storm
 
 
@@ -294,6 +298,13 @@ def _hourly_required_value(hourly, index, field):
     if value is None:
         raise ValueError(f"Invalid required ICON-D2 profile value: {field}.")
     return value
+
+
+def _hourly_optional_value(hourly, index, field):
+    values = hourly.get(field)
+    if not isinstance(values, list) or index < 0 or index >= len(values):
+        return None
+    return _finite_float(values[index])
 
 
 def _saturation_vapor_pressure(temp_kelvin):
@@ -813,10 +824,22 @@ def calculate_environment(
         sounding
     )
     motion_features = calculate_storm_motion_features(sounding)
-    low_level_lapse = calculate_low_level_lapse_rate(sounding)
+    low_level_lapse = _hourly_optional_value(hourly, i, "low_level_lapse")
+    if low_level_lapse is None:
+        low_level_lapse = calculate_low_level_lapse_rate(sounding)
     if low_level_lapse is None:
         raise ValueError("ICON-D2 profile does not support a 0–2 km lapse rate.")
-    buoyancy_features = calculate_low_level_buoyancy_metrics(hourly, i)
+    cached_cape_0_3km = _hourly_optional_value(hourly, i, "cape_0_3km")
+    cached_lfc = _hourly_optional_value(hourly, i, "lfc")
+    if cached_cape_0_3km is not None and cached_lfc is not None:
+        buoyancy_features = {
+            "cape_0_3km": cached_cape_0_3km,
+            "lfc": cached_lfc,
+        }
+    else:
+        buoyancy_features = calculate_low_level_buoyancy_metrics(hourly, i)
+    stp = _hourly_optional_value(hourly, i, "stp")
+    scp = _hourly_optional_value(hourly, i, "scp")
 
     return {
 
@@ -922,6 +945,12 @@ def calculate_environment(
         "lfc":
             buoyancy_features["lfc"],
 
+        "stp":
+            stp,
+
+        "scp":
+            scp,
+
         "sounding":
             sounding
     }
@@ -939,7 +968,6 @@ def calculate_manual_storm(values: Mapping[str, float]) -> dict:
         "humidity",
         "temperature",
         "lapse",
-        "coverage",
         "srh_0_1km",
         "srh_0_3km",
         "srh_efficiency",
@@ -948,6 +976,13 @@ def calculate_manual_storm(values: Mapping[str, float]) -> dict:
         "low_level_lapse",
         "cape_0_3km",
         "lfc",
+        "mlcape",
+        "mllcl",
+        "mlcin",
+        "mucape",
+        "effective_srh",
+        "effective_bwd",
+        "effective_base_height",
     )
     parameters = {}
     for field in fields:
@@ -961,7 +996,7 @@ def calculate_manual_storm(values: Mapping[str, float]) -> dict:
             raise ValueError(f"Manual input {field} must be finite.")
         parameters[field] = value
 
-    return analyze_storm(
+    analysis = analyze_storm(
         parameters["cape"],
         parameters["high_shear"],
         parameters["low_shear"],
@@ -972,7 +1007,6 @@ def calculate_manual_storm(values: Mapping[str, float]) -> dict:
         parameters["humidity"],
         parameters["temperature"],
         parameters["lapse"],
-        parameters["coverage"],
         srh_0_1km=parameters["srh_0_1km"],
         srh_0_3km=parameters["srh_0_3km"],
         srh_efficiency=parameters["srh_efficiency"],
@@ -982,6 +1016,16 @@ def calculate_manual_storm(values: Mapping[str, float]) -> dict:
         cape_0_3km=parameters["cape_0_3km"],
         lfc=parameters["lfc"],
     )
+    analysis.update(calculate_spc_composites(
+        mlcape=parameters["mlcape"],
+        mllcl=parameters["mllcl"],
+        mlcin=parameters["mlcin"],
+        mucape=parameters["mucape"],
+        effective_srh=parameters["effective_srh"],
+        effective_bwd=parameters["effective_bwd"],
+        effective_base_height=parameters["effective_base_height"],
+    ))
+    return analysis
 
 
 def nearest_outlook_entry(
@@ -1072,6 +1116,7 @@ def _storm_feature_arguments(environment):
 def calculate_best_day_window(hourly, target_day: date, now: datetime | None = None):
     current_time = now or datetime.now(GERMANY_TZ)
     best = None
+    best_index = None
     best_score = float("-inf")
 
     for index, time_string in enumerate(hourly["time"]):
@@ -1096,7 +1141,6 @@ def calculate_best_day_window(hourly, target_day: date, now: datetime | None = N
             environment["humidity"],
             environment["temperature"],
             environment["lapse"],
-            environment.get("coverage", 50),
             **_storm_feature_arguments(environment),
         )
         if analysis["risk"] > best_score:
@@ -1107,6 +1151,21 @@ def calculate_best_day_window(hourly, target_day: date, now: datetime | None = N
                 "time": dt,
                 "selection_score": best_score,
             }
+            best_index = index
+
+    if best is not None and best_index is not None:
+        environment = best["environment"]
+        stp = environment["stp"]
+        scp = environment["scp"]
+        if stp is None or scp is None:
+            calculated_parameters = calculate_spc_effective_parameters(
+                hourly,
+                best_index,
+            )
+            if stp is None:
+                environment["stp"] = calculated_parameters["stp"]
+            if scp is None:
+                environment["scp"] = calculated_parameters["scp"]
 
     return best
 
@@ -1397,10 +1456,6 @@ def calculate_best_window(
                 result["humidity"],
                 result["temperature"],
                 result["lapse"],
-                result.get(
-                    "coverage",
-                    50
-                ),
                 **_storm_feature_arguments(result),
             )
 
