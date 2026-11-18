@@ -40,9 +40,13 @@ radial velocity (m/s). Radar frames and rotation detections are fetched and
 calculated locally from DWD during the regular five-minute data updates.
 In velocity mode, click the map to select the nearest active DWD Doppler
 station; its radar coverage is shown in its correct map position. The
-local adjacent inbound/outbound velocity couplet detections (±15 m/s,
-five pixels per side) are marked with a large rotation symbol. This is a
-simple radar-velocity heuristic, not a tornado detector or official warning.
+local velocity-couplet detections are marked with a large rotation symbol.
+Lobes are measured against their local velocity background, so both sides do
+not need to cross zero. The detector evaluates the robust velocity difference
+and physical separation as shear and angular momentum, with a 10 m/s minimum
+couplet difference and compact-feature checks. This is a two-dimensional
+radar-velocity heuristic; it does not confirm a mesocyclone or tornado and is
+not an official warning.
 The integrated publisher runs from this repository on its configured schedule; the app reads shared
 KONRAD3D tracking snapshots and movement predictions from Supabase when configured.
 KONRAD3D convective cells are shown with their observed movement history and a

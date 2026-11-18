@@ -13,7 +13,7 @@ import numpy as np
 from numpy.typing import NDArray
 from pyproj import CRS, Transformer
 from pyproj.exceptions import CRSError, ProjError
-from scipy.ndimage import binary_dilation, label, map_coordinates
+from scipy.ndimage import binary_dilation, label, map_coordinates, uniform_filter
 from wetterdienst.provider.dwd.radar import (
     DwdRadarDate,
     DwdRadarParameter,
@@ -34,8 +34,17 @@ RAIN_TRACK_MAX_DISTANCE_KM: float = 45.0
 RAIN_TRACK_MAX_GAP: timedelta = timedelta(minutes=20)
 RAIN_TRACK_MAX_POINTS: int = 2
 RAIN_CELL_POINTER_DISTANCE_KM: float = 25.0
-ROTATION_VELOCITY_THRESHOLD_MS: float = 20.0
-ROTATION_MIN_PIXELS: int = 10
+# A 10 m/s minimum couplet delta follows the lower-limit value used in NSSL's
+# published MDA analysis; the remaining gates use shear and momentum so the
+# same raw delta is judged differently at different feature sizes.
+ROTATION_MIN_COUPLET_DELTA_MS: float = 10.0
+# Pattern-vector limits are expressed as physical shear (s^-1) and specific
+# angular momentum (m^2/s), not absolute inbound/outbound speeds.
+ROTATION_LOW_SHEAR_S1: float = 2.0e-3
+ROTATION_HIGH_SHEAR_S1: float = 5.0e-3
+ROTATION_LOW_ANGULAR_MOMENTUM_M2S: float = 15_000.0
+ROTATION_HIGH_ANGULAR_MOMENTUM_M2S: float = 50_000.0
+ROTATION_MIN_PIXELS: int = 3
 ROTATION_MAX_ASPECT_RATIO: float = 8.0
 MAX_GEOGRAPHIC_IMAGE_SIZE: int = 1200
 
@@ -637,24 +646,43 @@ class RainCellTracker:
 
 def detect_rotations(
     frame: RadarFrame,
-    threshold: float = ROTATION_VELOCITY_THRESHOLD_MS,
+    threshold: float = ROTATION_MIN_COUPLET_DELTA_MS,
     min_pixels: int = ROTATION_MIN_PIXELS,
 ) -> tuple[RotationDetection, ...]:
     """Find compact inbound/outbound velocity couplets in a gridded scan.
 
-    Candidate lobes must meet the per-pixel velocity and area thresholds,
-    touch one another, and retain a strong robust velocity difference. Very
-    elongated regions are discarded as likely shear boundaries.
+    Candidate lobes are found relative to their local background, so both
+    sides need not cross zero. Their robust velocity difference is evaluated
+    against physical separation using shear and angular-momentum thresholds.
+    Very elongated regions are discarded as likely shear boundaries.
     """
     if not math.isfinite(threshold) or threshold <= 0 or min_pixels < 1:
         raise ValueError("Rotation detection parameters must be positive.")
     velocity = frame.values
+    finite = np.isfinite(velocity)
+    if not np.any(finite):
+        return ()
+
+    # Remove the locally shared radial flow before finding opposite lobes.
+    # This keeps a velocity offset from hiding a couplet (for example when
+    # both sides are outbound), while leaving the pair's delta-V unchanged.
+    valid_fraction = uniform_filter(
+        finite.astype(np.float32),
+        size=(7, 7),
+        mode="nearest",
+    )
+    local_mean = uniform_filter(
+        np.where(finite, velocity, 0.0),
+        size=(7, 7),
+        mode="nearest",
+    ) / np.maximum(valid_fraction, 1.0e-6)
+    residual = velocity - local_mean
     negative_mask: NDArray[np.bool_] = np.asarray(
-        np.isfinite(velocity) & (velocity <= -threshold),
+        finite & (residual < 0.0),
         dtype=np.bool_,
     )
     positive_mask: NDArray[np.bool_] = np.asarray(
-        np.isfinite(velocity) & (velocity >= threshold),
+        finite & (residual > 0.0),
         dtype=np.bool_,
     )
     structure = np.ones((3, 3), dtype=np.uint8)
@@ -669,6 +697,9 @@ def detect_rotations(
     for neg_label in range(1, negative_count + 1):
         if negative_sizes[neg_label] < min_pixels:
             continue
+        neg_rows, neg_columns = np.nonzero(negative_labels == neg_label)
+        neg_center = (float(np.mean(neg_rows)), float(np.mean(neg_columns)))
+        negative_values = velocity[negative_labels == neg_label]
         neg_mask: NDArray[np.bool_] = np.asarray(
             negative_labels == neg_label,
             dtype=np.bool_,
@@ -681,6 +712,43 @@ def detect_rotations(
         for pos_label in adjacent_positive:
             if pos_label == 0 or positive_sizes[pos_label] < min_pixels:
                 continue
+
+            pos_rows, pos_columns = np.nonzero(positive_labels == pos_label)
+            pos_center = (float(np.mean(pos_rows)), float(np.mean(pos_columns)))
+            positive_values = velocity[positive_labels == pos_label]
+            delta_velocity = float(
+                np.percentile(positive_values, 25)
+                - np.percentile(negative_values, 75)
+            )
+            if delta_velocity < threshold:
+                continue
+
+            neg_latitude, neg_longitude = _pixel_to_geographic(frame, *neg_center)
+            pos_latitude, pos_longitude = _pixel_to_geographic(frame, *pos_center)
+            latitude_delta = math.radians(pos_latitude - neg_latitude)
+            longitude_delta = math.radians(
+                (pos_longitude - neg_longitude + 180.0) % 360.0 - 180.0
+            )
+            distance_m = 6_371_000.0 * 2.0 * math.asin(
+                math.sqrt(
+                    math.sin(latitude_delta / 2.0) ** 2
+                    + math.cos(math.radians(neg_latitude))
+                    * math.cos(math.radians(pos_latitude))
+                    * math.sin(longitude_delta / 2.0) ** 2
+                )
+            )
+            shear = delta_velocity / max(distance_m, 1.0)
+            angular_momentum = delta_velocity * distance_m
+            if not (
+                shear >= ROTATION_LOW_SHEAR_S1
+                and angular_momentum >= ROTATION_LOW_ANGULAR_MOMENTUM_M2S
+                and (
+                    shear >= ROTATION_HIGH_SHEAR_S1
+                    or angular_momentum >= ROTATION_HIGH_ANGULAR_MOMENTUM_M2S
+                )
+            ):
+                continue
+
             negative_node = (False, neg_label)
             positive_node = (True, int(pos_label))
             graph.setdefault(negative_node, set()).add(positive_node)
@@ -688,8 +756,6 @@ def detect_rotations(
 
     detections: list[RotationDetection] = []
     visited: set[tuple[bool, int]] = set()
-    west, east, south, north = frame.extent
-    rows, columns = velocity.shape
     for start in graph:
         if start in visited:
             continue
@@ -769,7 +835,7 @@ def detect_rotations(
 
 def rotation_detection(
     frame: RadarFrame,
-    threshold: float = ROTATION_VELOCITY_THRESHOLD_MS,
+    threshold: float = ROTATION_MIN_COUPLET_DELTA_MS,
     min_pixels: int = ROTATION_MIN_PIXELS,
 ) -> bool:
     """Return whether a velocity frame contains at least one qualifying couplet."""
