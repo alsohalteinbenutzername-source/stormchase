@@ -273,11 +273,28 @@ def _fetch_openmeteo_batch(request_params: dict[str, Any]) -> list[dict[str, Any
                     )
                 except (TypeError, ValueError, OverflowError):
                     delay = 5.0 * (2**attempt)
+            LOG.warning(
+                "Open-Meteo returned HTTP %d for an outlook batch on attempt %d/%d; "
+                "retrying in %.1f seconds.",
+                error.code,
+                attempt + 1,
+                OUTLOOK_RETRY_ATTEMPTS,
+                delay,
+            )
             time.sleep(delay)
         except (URLError, TimeoutError, OSError) as error:
             if attempt + 1 >= OUTLOOK_RETRY_ATTEMPTS:
                 raise PublisherError(f"Could not reach Open-Meteo: {error}") from error
-            time.sleep(min(5.0 * (2**attempt), 60.0))
+            delay = min(5.0 * (2**attempt), 60.0)
+            LOG.warning(
+                "Open-Meteo outlook request failed on attempt %d/%d; "
+                "retrying in %.1f seconds: %s",
+                attempt + 1,
+                OUTLOOK_RETRY_ATTEMPTS,
+                delay,
+                error,
+            )
+            time.sleep(delay)
         except json.JSONDecodeError as error:
             raise PublisherError("Open-Meteo returned malformed JSON.") from error
         else:
@@ -316,14 +333,16 @@ def _fetch_daily_outlook_grid() -> list[dict[str, Any]]:
         raise PublisherError(
             "The daily outlook grid exceeds StormChase's conservative hourly Open-Meteo budget."
         )
-    started_at = time.monotonic()
+    last_batch_started_at: float | None = None
     grid: list[dict[str, Any]] = []
 
     for batch_index, batch in enumerate(batches):
-        scheduled_at = started_at + batch_index * batch_interval
-        wait_seconds = scheduled_at - time.monotonic()
-        if wait_seconds > 0:
-            time.sleep(wait_seconds)
+        if last_batch_started_at is not None:
+            wait_seconds = batch_interval - (
+                time.monotonic() - last_batch_started_at
+            )
+            if wait_seconds > 0:
+                time.sleep(wait_seconds)
 
         LOG.info(
             "Fetching daily outlook batch %d/%d (%d locations).",
@@ -331,6 +350,8 @@ def _fetch_daily_outlook_grid() -> list[dict[str, Any]]:
             len(batches),
             len(batch),
         )
+        batch_started_at = time.monotonic()
+        last_batch_started_at = batch_started_at
         request_params = {
             "latitude": ",".join(f"{latitude:.3f}" for latitude, _ in batch),
             "longitude": ",".join(f"{longitude:.3f}" for _, longitude in batch),
@@ -377,11 +398,12 @@ def _fetch_daily_outlook_grid() -> list[dict[str, Any]]:
             ]
             grid.append({"icon_d2": hourly})
         LOG.info(
-            "Fetched daily outlook batch %d/%d (%d/%d points).",
+            "Fetched daily outlook batch %d/%d (%d/%d points) in %.1f seconds.",
             batch_index + 1,
             len(batches),
             len(grid),
             len(points),
+            time.monotonic() - batch_started_at,
         )
 
     if not _valid_outlook_grid(grid):

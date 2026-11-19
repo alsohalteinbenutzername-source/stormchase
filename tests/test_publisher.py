@@ -87,6 +87,54 @@ class DailyOutlookPublisherTests(unittest.TestCase):
         self.assertNotIn("stp", grid[0]["icon_d2"])
         self.assertNotIn("scp", grid[0]["icon_d2"])
 
+    def test_slow_batch_does_not_bunch_later_requests(self) -> None:
+        elapsed = [0.0]
+        request_starts = []
+
+        def fake_fetch(_request_params):
+            request_starts.append(elapsed[0])
+            if len(request_starts) == 1:
+                elapsed[0] += 240.0
+            return [
+                {
+                    "elevation": 100,
+                    "hourly": {
+                        "time": ["2026-11-18T12:00"],
+                        **{
+                            field: [10]
+                            for field in OUTLOOK_HOURLY_FIELDS
+                        },
+                    },
+                }
+            ] * (100 if len(request_starts) < 8 else 44)
+
+        def sleep(seconds):
+            elapsed[0] += seconds
+
+        with (
+            patch(
+                "publisher.publisher._fetch_openmeteo_batch",
+                side_effect=fake_fetch,
+            ),
+            patch("publisher.publisher.time.monotonic", side_effect=lambda: elapsed[0]),
+            patch("publisher.publisher.time.sleep", side_effect=sleep),
+        ):
+            _fetch_daily_outlook_grid()
+
+        self.assertEqual(len(request_starts), 8)
+        self.assertEqual(request_starts[0], 0.0)
+        self.assertEqual(request_starts[1], 240.0)
+        self.assertEqual(
+            [
+                current - previous
+                for previous, current in zip(
+                    request_starts[1:],
+                    request_starts[2:],
+                )
+            ],
+            [15.0] * 6,
+        )
+
     def test_request_retries_a_timeout(self) -> None:
         with (
             patch("publisher.publisher.SUPABASE_URL", "https://example.supabase.co"),
