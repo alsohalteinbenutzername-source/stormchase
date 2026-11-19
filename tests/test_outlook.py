@@ -4,6 +4,7 @@ from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
 
 from calculations import nearest_outlook_entry
+from supabase_client import SupabaseError
 from ui import calculate_germany_outlook, germany_grid_points
 
 
@@ -142,6 +143,20 @@ class GermanyOutlookGridTests(unittest.TestCase):
                 "returned 0 location forecasts for 2 outlook grid points",
             ):
                 calculate_germany_outlook(())
+
+    def test_surfaces_supabase_lookup_errors_without_falling_back(self) -> None:
+        supabase = Mock()
+        supabase.daily_outlook_grid.side_effect = SupabaseError(
+            "Unable to reach Supabase"
+        )
+        with (
+            patch("ui.germany_grid_points", return_value=[(50.1, 7.1)]),
+            patch("weather_api.get_germany_grid_weather") as fetch,
+        ):
+            with self.assertRaisesRegex(SupabaseError, "Unable to reach Supabase"):
+                calculate_germany_outlook((), supabase)
+
+        fetch.assert_not_called()
 
     def test_uses_supabase_daily_grid_without_calling_open_meteo(self) -> None:
         points = [(50.1, 7.1)]

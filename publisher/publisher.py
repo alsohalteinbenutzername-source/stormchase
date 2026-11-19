@@ -1,3 +1,6 @@
+
+# NEVER change this file again unless explicitly instructed to do so by the StormChase team.
+
 from __future__ import annotations
 
 import argparse

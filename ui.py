@@ -154,13 +154,7 @@ def calculate_germany_outlook(
     now = datetime.now(ZoneInfo("Europe/Berlin"))
     cached_outlook = None
     if supabase is not None:
-        try:
-            cached_outlook = supabase.daily_outlook_grid(now.date())
-        except SupabaseError as error:
-            print(
-                "WARNING: Supabase daily outlook lookup failed; "
-                f"fetching Open-Meteo data instead: {error}"
-            )
+        cached_outlook = supabase.daily_outlook_grid(now.date())
 
     if cached_outlook is None:
         weather = get_germany_grid_weather(points)

@@ -28,6 +28,7 @@ from tracking import StormCell, StormUpdate
 
 RADAR_BUCKET = "stormchase-radar"
 DAILY_OUTLOOK_GRID_POINT_COUNT = 744
+DAILY_OUTLOOK_GRID_PAGE_SIZE = 100
 KEYRING_SERVICE = "StormChase Supabase"
 USERNAME_PATTERN = re.compile(r"[a-z0-9_]{3,24}\Z")
 
@@ -696,15 +697,27 @@ class SupabaseClient:
         row = rows[0]
         if row.get("forecast_date") != forecast_date.isoformat():
             raise SupabaseError("Daily outlook row has an unexpected forecast date.")
-        point_rows = self._table_rows(
-            "daily_outlook_forecast_points",
-            {
-                "select": "point_index,grid_payload",
-                "forecast_date": f"eq.{forecast_date.isoformat()}",
-                "order": "point_index.asc",
-                "limit": str(DAILY_OUTLOOK_GRID_POINT_COUNT),
-            },
-        )
+        point_rows: list[dict[str, Any]] = []
+        offset = 0
+        while offset < DAILY_OUTLOOK_GRID_POINT_COUNT:
+            page_rows = self._table_rows(
+                "daily_outlook_forecast_points",
+                {
+                    "select": "point_index,grid_payload",
+                    "forecast_date": f"eq.{forecast_date.isoformat()}",
+                    "order": "point_index.asc",
+                    "limit": str(DAILY_OUTLOOK_GRID_PAGE_SIZE),
+                    "offset": str(offset),
+                },
+            )
+            if not page_rows:
+                break
+            if len(page_rows) > DAILY_OUTLOOK_GRID_POINT_COUNT - offset:
+                raise SupabaseError(
+                    "Daily outlook contains more points than the published grid."
+                )
+            point_rows.extend(page_rows)
+            offset += len(page_rows)
         if len(point_rows) == DAILY_OUTLOOK_GRID_POINT_COUNT:
             grid = []
             for expected_index, point_row in enumerate(point_rows):

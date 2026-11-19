@@ -194,17 +194,25 @@ class SupabaseDataContractTests(unittest.TestCase):
 
     def test_reads_daily_outlook_grid_for_the_requested_date(self) -> None:
         issued_at = "2026-11-11T10:00:00Z"
-        point = {"icon_d2": {"time": ["2026-11-11T10:00"], "cin": [0]}}
+        point = {
+            "icon_d2": {"time": ["2026-11-11T10:00"], "cin": [0]},
+            "grid_version": "raw-icon-d2-v1",
+        }
         grid = [point] * 744
+        point_rows = [
+            {"point_index": index, "grid_payload": point}
+            for index in range(744)
+        ]
+        pages = [
+            point_rows[start : start + 50]
+            for start in range(0, len(point_rows), 50)
+        ]
         with patch.object(
             self.client,
             "_table_rows",
             side_effect=[
                 [{"forecast_date": "2026-11-11", "issued_at": issued_at}],
-                [
-                    {"point_index": index, "grid_payload": point}
-                    for index in range(744)
-                ],
+                *pages,
             ],
         ) as table_rows:
             result = self.client.daily_outlook_grid(date(2026, 11, 11))
@@ -230,9 +238,17 @@ class SupabaseDataContractTests(unittest.TestCase):
                     "select": "point_index,grid_payload",
                     "forecast_date": "eq.2026-11-11",
                     "order": "point_index.asc",
-                    "limit": "744",
+                    "limit": "100",
+                    "offset": "0",
                 },
             ),
+        )
+        self.assertEqual(
+            [
+                call.args[1]["offset"]
+                for call in table_rows.call_args_list[1:]
+            ],
+            [str(start) for start in range(0, 744, 50)],
         )
 
     def test_reads_legacy_daily_outlook_when_no_point_rows_exist(self) -> None:
@@ -267,6 +283,7 @@ class SupabaseDataContractTests(unittest.TestCase):
                     }
                 ],
                 [{"point_index": 0, "grid_payload": {"icon_d2": {}}}],
+                [],
             ],
         ):
             with self.assertRaisesRegex(SupabaseError, "1 of 744"):
