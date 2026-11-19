@@ -16,6 +16,7 @@ GERMANY_TZ = ZoneInfo(
     "Europe/Berlin"
 )
 NO_LFC_SENTINEL_M = 6000.0
+MOIST_PARCEL_INTEGRATION_STEP_M = 100.0
 
 
 
@@ -414,65 +415,73 @@ def calculate_low_level_buoyancy_metrics(hourly, index):
     ))
     lcl_height = min(max(lcl_height, 0.0), float(heights[-1]))
 
-    def pressure_at(height):
-        return math.exp(float(np.interp(height, heights, log_pressures)))
-
-    def moist_derivative(height, temperature):
-        return -_moist_adiabatic_lapse_rate(
-            temperature,
-            pressure_at(height),
-        )
-
-    def integrate_moist_parcel(start_height, start_temperature, end_height):
-        temperature = start_temperature
-        height = start_height
-        while height < end_height:
-            step = min(25.0, end_height - height)
-            k1 = moist_derivative(height, temperature)
-            k2 = moist_derivative(
-                height + step / 2.0,
-                temperature + step * k1 / 2.0,
-            )
-            k3 = moist_derivative(
-                height + step / 2.0,
-                temperature + step * k2 / 2.0,
-            )
-            k4 = moist_derivative(
-                height + step,
-                temperature + step * k3,
-            )
-            temperature += step * (k1 + 2.0 * k2 + 2.0 * k3 + k4) / 6.0
-            height += step
-        return temperature
-
     top = float(heights[-1])
     parcel_heights = np.unique(np.concatenate((
         np.arange(0.0, top, 25.0),
         np.asarray([0.0, 3000.0, lcl_height, top]),
     )))
-    parcel_temperatures = []
-    previous_height = 0.0
-    previous_temperature = surface_temperature
-    for height in parcel_heights:
-        pressure = pressure_at(float(height))
-        if height <= lcl_height:
-            parcel_temperature = surface_temperature * (
-                pressure / surface_pressure
-            ) ** (287.05 / 1004.0)
-        else:
-            if previous_height <= lcl_height:
-                previous_height = lcl_height
-                previous_temperature = surface_temperature * (
-                    lcl_pressure / surface_pressure
-                ) ** (287.05 / 1004.0)
-            parcel_temperature = integrate_moist_parcel(
-                previous_height,
-                previous_temperature,
-                float(height),
-            )
-        parcel_temperatures.append(parcel_temperature)
-        previous_height = float(height)
-        previous_temperature = parcel_temperature
+    parcel_log_pressures = np.interp(parcel_heights, heights, log_pressures)
+    parcel_pressures = np.exp(parcel_log_pressures)
+    parcel_temperatures = surface_temperature * (
+        parcel_pressures / surface_pressure
+    ) ** (287.05 / 1004.0)
+    lcl_index = int(np.searchsorted(parcel_heights, lcl_height))
+    moist_start_temperature = surface_temperature * (
+        lcl_pressure / surface_pressure
+    ) ** (287.05 / 1004.0)
+    moist_target_heights = np.arange(
+        lcl_height + MOIST_PARCEL_INTEGRATION_STEP_M,
+        top,
+        MOIST_PARCEL_INTEGRATION_STEP_M,
+    )
+    if lcl_height < top:
+        moist_target_heights = np.append(moist_target_heights, top)
+    moist_heights = np.concatenate((
+        np.asarray([lcl_height]),
+        moist_target_heights,
+    ))
+    moist_steps = np.diff(moist_heights)
+    moist_start_pressures = np.exp(
+        np.interp(moist_heights[:-1], heights, log_pressures)
+    )
+    moist_midpoint_pressures = np.exp(
+        np.interp(
+            moist_heights[:-1] + moist_steps / 2.0,
+            heights,
+            log_pressures,
+        )
+    )
+    moist_end_pressures = np.exp(
+        np.interp(moist_heights[1:], heights, log_pressures)
+    )
+    parcel_temperature = moist_start_temperature
+    moist_parcel_temperatures = np.empty_like(moist_heights)
+    moist_parcel_temperatures[0] = parcel_temperature
+    for offset, step in enumerate(moist_steps):
+        k1 = -_moist_adiabatic_lapse_rate(
+            parcel_temperature,
+            moist_start_pressures[offset],
+        )
+        k2 = -_moist_adiabatic_lapse_rate(
+            parcel_temperature + step * k1 / 2.0,
+            moist_midpoint_pressures[offset],
+        )
+        k3 = -_moist_adiabatic_lapse_rate(
+            parcel_temperature + step * k2 / 2.0,
+            moist_midpoint_pressures[offset],
+        )
+        k4 = -_moist_adiabatic_lapse_rate(
+            parcel_temperature + step * k3,
+            moist_end_pressures[offset],
+        )
+        parcel_temperature += step * (k1 + 2.0 * k2 + 2.0 * k3 + k4) / 6.0
+        moist_parcel_temperatures[offset + 1] = parcel_temperature
+    moist_mask = parcel_heights > lcl_height
+    parcel_temperatures[moist_mask] = np.interp(
+        parcel_heights[moist_mask],
+        moist_heights,
+        moist_parcel_temperatures,
+    )
 
     environment_temperatures = np.interp(parcel_heights, heights, temperatures)
     environment_mixing_ratios = np.interp(
@@ -481,13 +490,13 @@ def calculate_low_level_buoyancy_metrics(hourly, index):
         mixing_ratios,
     )
     buoyancy = []
-    for height, parcel_temperature, environment_temperature, environment_ratio in zip(
+    for height, parcel_temperature, environment_temperature, environment_ratio, pressure in zip(
         parcel_heights,
         parcel_temperatures,
         environment_temperatures,
         environment_mixing_ratios,
+        parcel_pressures,
     ):
-        pressure = pressure_at(float(height))
         if height <= lcl_height:
             parcel_ratio = surface_mixing_ratio
         else:
@@ -518,7 +527,6 @@ def calculate_low_level_buoyancy_metrics(hourly, index):
     ))
 
     lfc = NO_LFC_SENTINEL_M
-    lcl_index = int(np.searchsorted(parcel_heights, lcl_height))
     if buoyancy[lcl_index] >= 0.0:
         lfc = lcl_height
     else:

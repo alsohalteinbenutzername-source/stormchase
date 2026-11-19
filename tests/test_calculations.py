@@ -384,6 +384,16 @@ class CalculateBestDayWindowTests(unittest.TestCase):
         ):
             self.assertTrue(math.isfinite(environment[field]), field)
 
+    def test_optimized_low_level_buoyancy_preserves_reference_values(self) -> None:
+        metrics = calculate_low_level_buoyancy_metrics(self.hourly, 1)
+
+        self.assertAlmostEqual(
+            metrics["cape_0_3km"],
+            54.439101833562724,
+            delta=0.001,
+        )
+        self.assertAlmostEqual(metrics["lfc"], 763.7682978509388, places=5)
+
     def test_reuses_publisher_profile_metrics(self) -> None:
         hourly = dict(self.hourly)
         hourly["low_level_lapse"] = [5.67] * 4

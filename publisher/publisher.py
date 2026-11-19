@@ -36,6 +36,7 @@ from radar import (
     velocity_radar_sites,
 )
 from tracking import fetch_latest_storm_cells
+from publisher.severe_parameters import PRESSURE_LEVEL_HOURLY_FIELDS
 
 
 LOG = logging.getLogger("stormchase-publisher")
@@ -69,13 +70,20 @@ _BASE_OUTLOOK_HOURLY_FIELDS = (
     "wind_direction_850hPa,wind_speed_700hPa,wind_direction_700hPa,"
     "wind_speed_500hPa,wind_direction_500hPa"
 ).split(",")
-OUTLOOK_HOURLY_FIELDS = list(dict.fromkeys(_BASE_OUTLOOK_HOURLY_FIELDS))
-OUTLOOK_BATCH_SIZE = 100
+_OUTLOOK_PROFILE_FIELDS = tuple(
+    field
+    for field in PRESSURE_LEVEL_HOURLY_FIELDS
+    if field.startswith(("temperature_", "relative_humidity_", "geopotential_height_"))
+)
+OUTLOOK_HOURLY_FIELDS = list(dict.fromkeys(
+    (*_BASE_OUTLOOK_HOURLY_FIELDS, *_OUTLOOK_PROFILE_FIELDS)
+))
+OUTLOOK_BATCH_SIZE = 45
 OUTLOOK_RETRY_ATTEMPTS = 4
 OUTLOOK_CALLS_PER_MINUTE = 450.0
 OUTLOOK_FETCH_WINDOW_SECONDS = 120.0
 OUTLOOK_PUBLISH_BATCH_SIZE = 25
-OUTLOOK_GRID_VERSION = "raw-icon-d2-v1"
+OUTLOOK_GRID_VERSION = "raw-icon-d2-v2"
 
 
 class PublisherError(RuntimeError):
