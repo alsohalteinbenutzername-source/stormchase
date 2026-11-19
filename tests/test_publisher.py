@@ -1,12 +1,10 @@
-from datetime import datetime
 import unittest
 from unittest.mock import patch
 
 from publisher.publisher import (
     OUTLOOK_FETCH_WINDOW_SECONDS,
+    OUTLOOK_GRID_VERSION,
     OUTLOOK_HOURLY_FIELDS,
-    OUTLOOK_PROFILE_FIELDS,
-    OUTLOOK_PROFILE_VERSION,
     PublisherError,
     _request,
     _fetch_daily_outlook_grid,
@@ -28,7 +26,7 @@ class EmptyResponse:
 
 
 class DailyOutlookPublisherTests(unittest.TestCase):
-    def test_outlook_request_uses_only_fields_needed_by_the_profile(self) -> None:
+    def test_outlook_request_uses_required_raw_hourly_fields(self) -> None:
         self.assertLess(len(OUTLOOK_HOURLY_FIELDS), 50)
         self.assertIn("temperature_925hPa", OUTLOOK_HOURLY_FIELDS)
         self.assertIn("geopotential_height_500hPa", OUTLOOK_HOURLY_FIELDS)
@@ -43,7 +41,7 @@ class DailyOutlookPublisherTests(unittest.TestCase):
             longitudes = request_params["longitude"].split(",")
             hourly_values = {
                 field: [
-                    100
+                    -25
                     if field == "cape"
                     else -50
                     if field == "convective_inhibition"
@@ -65,33 +63,15 @@ class DailyOutlookPublisherTests(unittest.TestCase):
         def sleep(seconds):
             elapsed[0] += seconds
 
-        def selected_daily_window(_hourly, target_day, _reference_time):
-            if target_day.isoformat() != "2026-11-18":
-                return None
-            return {
-                "time": datetime(2026, 11, 18, 12, 0),
-                "environment": {"stp": 1.2, "scp": 3.4},
-            }
-
         with (
             patch(
                 "publisher.publisher._fetch_openmeteo_batch",
                 side_effect=fake_fetch,
             ) as fetch,
-            patch(
-                "calculations.calculate_best_day_window",
-                side_effect=selected_daily_window,
-            ),
-            patch(
-                "publisher.publisher._derive_outlook_profile_metrics",
-                return_value={field: None for field in OUTLOOK_PROFILE_FIELDS},
-            ),
             patch("publisher.publisher.time.monotonic", side_effect=lambda: elapsed[0]),
             patch("publisher.publisher.time.sleep", side_effect=sleep) as sleep_mock,
         ):
-            grid = _fetch_daily_outlook_grid(
-                datetime.fromisoformat("2026-11-18T11:00:00+01:00")
-            )
+            grid = _fetch_daily_outlook_grid()
 
         self.assertEqual(fetch.call_count, 8)
         self.assertEqual(len(grid), len(points))
@@ -100,8 +80,12 @@ class DailyOutlookPublisherTests(unittest.TestCase):
         self.assertLessEqual(elapsed[0], OUTLOOK_FETCH_WINDOW_SECONDS)
         self.assertNotIn("temperature_975hPa", grid[0]["icon_d2"])
         self.assertIn("temperature_850hPa", grid[0]["icon_d2"])
-        self.assertEqual(grid[0]["icon_d2"]["stp"], [1.2])
-        self.assertEqual(grid[0]["icon_d2"]["scp"], [3.4])
+        self.assertEqual(grid[0]["icon_d2"]["cape"], [-25])
+        self.assertEqual(grid[0]["icon_d2"]["cin"], [-50])
+        self.assertNotIn("srh_0_1km", grid[0]["icon_d2"])
+        self.assertNotIn("cape_0_3km", grid[0]["icon_d2"])
+        self.assertNotIn("stp", grid[0]["icon_d2"])
+        self.assertNotIn("scp", grid[0]["icon_d2"])
 
     def test_request_retries_a_timeout(self) -> None:
         with (
@@ -146,8 +130,16 @@ class DailyOutlookPublisherTests(unittest.TestCase):
             "744",
         )
         self.assertEqual(
-            version_query["grid_payload->>profile_version"],
-            f"eq.{OUTLOOK_PROFILE_VERSION}",
+            version_query["grid_payload->>grid_version"],
+            f"eq.{OUTLOOK_GRID_VERSION}",
+        )
+        self.assertEqual(
+            version_query["limit"],
+            "744",
+        )
+        self.assertEqual(
+            request.call_args_list[1].args[1],
+            "/rest/v1/daily_outlook_forecast_points",
         )
         self.assertEqual(
             upsert.call_args_list[0].args[0],
@@ -155,7 +147,7 @@ class DailyOutlookPublisherTests(unittest.TestCase):
         )
         self.assertEqual(upsert.call_args_list[0].args[2][0]["grid_payload"], [])
 
-        point_batches = upsert.call_args_list[1:-1]
+        point_batches = upsert.call_args_list[1:]
         self.assertEqual(
             [len(call.args[2]) for call in point_batches],
             [25, 25, 1],
@@ -171,11 +163,10 @@ class DailyOutlookPublisherTests(unittest.TestCase):
         )
         self.assertEqual(
             [row["grid_payload"] for row in written_rows],
-            grid,
-        )
-        self.assertEqual(
-            upsert.call_args_list[-1].args[2][0]["grid_payload"],
-            {"profile_version": OUTLOOK_PROFILE_VERSION},
+            [
+                {**point, "grid_version": OUTLOOK_GRID_VERSION}
+                for point in grid
+            ],
         )
 
     def test_skips_fetch_when_all_outlook_points_are_published(self) -> None:
@@ -184,7 +175,7 @@ class DailyOutlookPublisherTests(unittest.TestCase):
                 "publisher.publisher._request",
                 side_effect=[
                     [{"point_index": index} for index in range(744)],
-                    [{"forecast_date": "2026-01-01"}],
+                    [{"point_index": index} for index in range(744)],
                 ],
             ) as request,
             patch("publisher.publisher._fetch_daily_outlook_grid") as fetch,
@@ -196,14 +187,14 @@ class DailyOutlookPublisherTests(unittest.TestCase):
         fetch.assert_not_called()
         upsert.assert_not_called()
 
-    def test_refetches_complete_legacy_grid_without_profile_marker(self) -> None:
+    def test_refetches_complete_grid_with_partial_version_markers(self) -> None:
         grid = [{"icon_d2": {"point": 0}}]
         with (
             patch(
                 "publisher.publisher._request",
                 side_effect=[
                     [{"point_index": index} for index in range(744)],
-                    [],
+                    [{"point_index": index} for index in range(25)],
                 ],
             ),
             patch(

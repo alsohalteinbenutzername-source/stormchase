@@ -94,11 +94,12 @@ inputs or selected window. The overall risk score is out of 100; tornado,
 hail, and wind scores are out of 80. The tornado sub-threat uses a
 low-level interaction gate based on 0–500 m shear, 0–1 km storm-relative
 helicity and efficiency, hodograph critical angle, LCL, and CIN. The manual
-calculator requires all low-level profile inputs. Automated ICON-D2 outlooks
-derive them from required wind, temperature, humidity, and geopotential-height
-fields; surface-parcel 0–3 km CAPE and LFC are estimated locally. A 6000 m LFC
-value denotes that no LFC was found in the profile. Cached outlooks missing the
-required profile are refreshed before scoring.
+calculator requires all low-level profile inputs. The daily publisher stores
+the raw hourly ICON-D2 grid; StormAnalyzer derives profile metrics from the
+wind, temperature, humidity, and geopotential-height fields, and estimates
+surface-parcel 0–3 km CAPE and LFC locally. A 6000 m LFC value denotes that no
+LFC was found in the profile. Cached outlooks missing required raw profile
+fields are refreshed before scoring.
 
 Blitzortung / LightningMaps community-network lightning strokes appear as
 yellow plus markers for up to 15 minutes on the live and DWD warning maps.
