@@ -11,6 +11,7 @@ from publisher.publisher import (
     _request,
     _fetch_daily_outlook_grid,
     _outlook_grid_points,
+    main,
     publish_daily_outlook,
 )
 
@@ -27,6 +28,12 @@ class EmptyResponse:
 
 
 class DailyOutlookPublisherTests(unittest.TestCase):
+    def test_outlook_request_uses_only_fields_needed_by_the_profile(self) -> None:
+        self.assertLess(len(OUTLOOK_HOURLY_FIELDS), 50)
+        self.assertIn("temperature_925hPa", OUTLOOK_HOURLY_FIELDS)
+        self.assertIn("geopotential_height_500hPa", OUTLOOK_HOURLY_FIELDS)
+        self.assertNotIn("temperature_975hPa", OUTLOOK_HOURLY_FIELDS)
+
     def test_fetches_all_outlook_batches_within_two_minutes(self) -> None:
         points = _outlook_grid_points()
         elapsed = [0.0]
@@ -228,6 +235,40 @@ class DailyOutlookPublisherTests(unittest.TestCase):
                 )
 
         self.assertEqual(urlopen.call_count, 4)
+
+
+class PublisherTaskSelectionTests(unittest.TestCase):
+    def test_live_publisher_does_not_fetch_daily_outlook(self) -> None:
+        with (
+            patch("publisher.publisher._configuration", return_value=("url", "key")),
+            patch("publisher.publisher.purge_expired_radar_objects") as purge,
+            patch("publisher.publisher.publish_reflectivity_and_rain") as reflectivity,
+            patch("publisher.publisher.publish_konrad3d") as konrad,
+            patch("publisher.publisher.publish_velocity_and_rotations") as velocity,
+            patch("publisher.publisher.publish_lightning") as lightning,
+            patch("publisher.publisher.publish_daily_outlook") as outlook,
+        ):
+            main([])
+
+        for task in (purge, reflectivity, konrad, velocity, lightning):
+            task.assert_called_once()
+        outlook.assert_not_called()
+
+    def test_daily_outlook_mode_runs_without_live_publisher_tasks(self) -> None:
+        with (
+            patch("publisher.publisher._configuration", return_value=("url", "key")),
+            patch("publisher.publisher.purge_expired_radar_objects") as purge,
+            patch("publisher.publisher.publish_reflectivity_and_rain") as reflectivity,
+            patch("publisher.publisher.publish_konrad3d") as konrad,
+            patch("publisher.publisher.publish_velocity_and_rotations") as velocity,
+            patch("publisher.publisher.publish_lightning") as lightning,
+            patch("publisher.publisher.publish_daily_outlook") as outlook,
+        ):
+            main(["--daily-outlook-only"])
+
+        outlook.assert_called_once()
+        for task in (purge, reflectivity, konrad, velocity, lightning):
+            task.assert_not_called()
 
 
 if __name__ == "__main__":

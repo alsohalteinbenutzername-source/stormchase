@@ -157,11 +157,12 @@ snapshots and authenticated community-report features.
      only in GitHub Actions; never add it to `config.py`, the desktop app, or a
      distributed build.
 
-   The live-data workflow runs every five minutes and can be started manually.
-   The daily-outlook workflow refreshes the shared ICON-D2 grid shortly after
-   midnight in Germany and can also be started manually. GitHub Actions and
-   scheduled workflows must be enabled in this repository's **Settings →
-   Actions**.
+   The live-data workflow runs every five minutes and publishes radar and
+   lightning data without fetching the daily outlook. The separate
+   daily-outlook workflow refreshes the shared ICON-D2 grid shortly after
+   midnight in Germany (using `--daily-outlook-only`) and can also be started
+   manually. GitHub Actions and scheduled workflows must be enabled in this
+   repository's **Settings → Actions**.
 
    Supabase Cron can dispatch the live-data workflow every five minutes too.
    To enable that, create a fine-grained GitHub token restricted to this

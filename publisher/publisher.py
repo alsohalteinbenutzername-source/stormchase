@@ -13,6 +13,7 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
+from email.utils import parsedate_to_datetime
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -33,14 +34,6 @@ from radar import (
     velocity_radar_sites,
 )
 from tracking import fetch_latest_storm_cells
-if __package__:
-    from .severe_parameters import (
-        PRESSURE_LEVEL_HOURLY_FIELDS,
-    )
-else:
-    from severe_parameters import (
-        PRESSURE_LEVEL_HOURLY_FIELDS,
-    )
 
 
 LOG = logging.getLogger("stormchase-publisher")
@@ -74,15 +67,8 @@ _BASE_OUTLOOK_HOURLY_FIELDS = (
     "wind_direction_850hPa,wind_speed_700hPa,wind_direction_700hPa,"
     "wind_speed_500hPa,wind_direction_500hPa"
 ).split(",")
-OUTLOOK_HOURLY_FIELDS = list(dict.fromkeys((
-    *_BASE_OUTLOOK_HOURLY_FIELDS,
-    *PRESSURE_LEVEL_HOURLY_FIELDS,
-)))
-OUTLOOK_EXTRA_PRESSURE_LEVEL_FIELDS = tuple(
-    field
-    for field in PRESSURE_LEVEL_HOURLY_FIELDS
-    if field not in _BASE_OUTLOOK_HOURLY_FIELDS
-)
+OUTLOOK_HOURLY_FIELDS = list(dict.fromkeys(_BASE_OUTLOOK_HOURLY_FIELDS))
+OUTLOOK_EXTRA_PRESSURE_LEVEL_FIELDS = ()
 OUTLOOK_PROFILE_FIELDS = (
     "srh_0_1km",
     "srh_0_3km",
@@ -98,6 +84,7 @@ OUTLOOK_PROFILE_FIELDS = (
 NO_LFC_SENTINEL_M = 6000.0
 OUTLOOK_BATCH_SIZE = 100
 OUTLOOK_RETRY_ATTEMPTS = 4
+OUTLOOK_CALLS_PER_MINUTE = 450.0
 OUTLOOK_FETCH_WINDOW_SECONDS = 120.0
 OUTLOOK_PUBLISH_BATCH_SIZE = 25
 OUTLOOK_PROFILE_VERSION = "effective-layer-v2"
@@ -740,10 +727,19 @@ def _fetch_openmeteo_batch(request_params: dict[str, Any]) -> list[dict[str, Any
                 ) from error
             retry_after = error.headers.get("Retry-After")
             try:
-                delay = min(max(float(retry_after), 1.0), 60.0) if retry_after else 5.0 * (2**attempt)
-            except ValueError:
-                delay = 5.0 * (2**attempt)
-            time.sleep(min(delay, 60.0))
+                delay = min(max(float(retry_after), 1.0), 3600.0) if retry_after else 5.0 * (2**attempt)
+            except (TypeError, ValueError):
+                try:
+                    retry_at = parsedate_to_datetime(retry_after)
+                    if retry_at.tzinfo is None:
+                        retry_at = retry_at.replace(tzinfo=timezone.utc)
+                    delay = min(
+                        max((retry_at - datetime.now(timezone.utc)).total_seconds(), 1.0),
+                        3600.0,
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    delay = 5.0 * (2**attempt)
+            time.sleep(delay)
         except (URLError, TimeoutError, OSError) as error:
             if attempt + 1 >= OUTLOOK_RETRY_ATTEMPTS:
                 raise PublisherError(f"Could not reach Open-Meteo: {error}") from error
@@ -773,7 +769,21 @@ def _fetch_daily_outlook_grid(
         points[index : index + OUTLOOK_BATCH_SIZE]
         for index in range(0, len(points), OUTLOOK_BATCH_SIZE)
     ]
+    field_weight = len(OUTLOOK_HOURLY_FIELDS) / 10.0
+    batch_weight = field_weight * OUTLOOK_BATCH_SIZE
+    total_weight = sum(
+        field_weight * len(batch)
+        for batch in batches
+    )
     batch_interval = OUTLOOK_FETCH_WINDOW_SECONDS / len(batches)
+    if batch_weight > OUTLOOK_CALLS_PER_MINUTE:
+        raise PublisherError(
+            "A single daily outlook batch exceeds StormChase's per-minute Open-Meteo budget."
+        )
+    if total_weight > 8500.0:
+        raise PublisherError(
+            "The daily outlook grid exceeds StormChase's conservative hourly Open-Meteo budget."
+        )
     started_at = time.monotonic()
     grid: list[dict[str, Any]] = []
 
@@ -1432,7 +1442,7 @@ def main(argv: list[str] | None = None) -> None:
     modes.add_argument(
         "--skip-daily-outlook",
         action="store_true",
-        help="Publish live data without refreshing the daily outlook.",
+        help="Deprecated; live publishing skips the daily outlook by default.",
     )
     modes.add_argument(
         "--daily-outlook-only",
@@ -1457,8 +1467,6 @@ def main(argv: list[str] | None = None) -> None:
             ("velocity/rotation", publish_velocity_and_rotations),
             ("lightning", publish_lightning),
         )
-        if not args.skip_daily_outlook:
-            tasks += (("daily outlook", publish_daily_outlook),)
 
     for name, task in tasks:
         try:
