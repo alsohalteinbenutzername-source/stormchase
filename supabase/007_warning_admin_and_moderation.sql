@@ -212,3 +212,23 @@ as $$
 $$;
 
 revoke all on function public.expire_stormchase_warnings() from public, anon, authenticated;
+
+do $
+declare
+    existing_job_id bigint;
+begin
+    for existing_job_id in
+        select jobid
+        from cron.job
+        where jobname = 'stormchase-community-warning-expiry'
+    loop
+        perform cron.unschedule(existing_job_id);
+    end loop;
+end;
+$;
+
+select cron.schedule(
+    'stormchase-community-warning-expiry',
+    '*/5 * * * *',
+    'select public.expire_stormchase_warnings();'
+);
