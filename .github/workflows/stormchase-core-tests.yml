@@ -1,0 +1,41 @@
+name: StormChase focused regression tests
+
+on:
+  push:
+    branches:
+      - main
+      - feat/storm-analysis-and-warning-admin-2026-11-25
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  core-regressions:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "wetterdienst[radarplus]" pytest numpy scipy h5py pyproj matplotlib pillow customtkinter keyring requests-cache websockets
+
+      - name: Check changed application modules compile
+        run: |
+          python -m compileall -q ui.py radar.py tracking.py case_analysis.py warning_system.py supabase_client.py
+
+      - name: Run focused regressions
+        run: |
+          python -m pytest -q tests/test_warning_system.py tests/test_case_analysis.py tests/test_radar.py
