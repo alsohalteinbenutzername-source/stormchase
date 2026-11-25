@@ -69,6 +69,12 @@ class RadarFrame:
     projection: str | None = None
     xscale: float | None = None
     yscale: float | None = None
+    site_latitude: float | None = None
+    site_longitude: float | None = None
+    site_altitude_m: float | None = None
+    elevation_angle_degrees: float | None = None
+    range_scale_m: float | None = None
+    range_start_km: float | None = None
 
     @property
     def values(self) -> NDArray[np.float32]:
@@ -340,6 +346,12 @@ def decode_radar_file(contents: bytes, timestamp: datetime | None = None) -> Rad
             projection = None
             xscale = None
             yscale = None
+            site_latitude = None
+            site_longitude = None
+            site_altitude_m = None
+            elevation_angle_degrees = None
+            range_scale_m = None
+            range_start_km = None
             dataset_parent = dataset.parent
             dataset_group = (
                 dataset_parent.parent
@@ -353,6 +365,9 @@ def decode_radar_file(contents: bytes, timestamp: datetime | None = None) -> Rad
                 metadata = radar_file.get("where")
             if isinstance(metadata, h5py.Group):
                 attributes = metadata.attrs
+                elevation_angle_degrees = _attribute_value(attributes, "elangle")
+                range_scale_m = _attribute_value(attributes, "rscale")
+                range_start_km = _attribute_value(attributes, "rstart")
                 corner_names = ("LL_lon", "LR_lon", "UL_lon", "UR_lon")
                 latitude_names = ("LL_lat", "LR_lat", "UL_lat", "UR_lat")
                 if all(name in attributes for name in (*corner_names, *latitude_names)):
@@ -376,6 +391,12 @@ def decode_radar_file(contents: bytes, timestamp: datetime | None = None) -> Rad
                 projection = _attribute_text(attributes, "projdef")
                 xscale = _attribute_value(attributes, "xscale")
                 yscale = _attribute_value(attributes, "yscale")
+                root_where = radar_file.get("where")
+                if isinstance(root_where, h5py.Group):
+                    root_attributes = root_where.attrs
+                    site_latitude = _attribute_value(root_attributes, "lat")
+                    site_longitude = _attribute_value(root_attributes, "lon")
+                    site_altitude_m = _attribute_value(root_attributes, "height")
                 if projection is not None and xscale is not None and yscale is not None:
                     xsize = _attribute_value(attributes, "xsize")
                     ysize = _attribute_value(attributes, "ysize")
@@ -408,6 +429,12 @@ def decode_radar_file(contents: bytes, timestamp: datetime | None = None) -> Rad
         projection=projection,
         xscale=xscale,
         yscale=yscale,
+        site_latitude=site_latitude,
+        site_longitude=site_longitude,
+        site_altitude_m=site_altitude_m,
+        elevation_angle_degrees=elevation_angle_degrees,
+        range_scale_m=range_scale_m,
+        range_start_km=range_start_km,
     )
 
 
