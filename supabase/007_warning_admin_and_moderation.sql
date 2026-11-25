@@ -1,5 +1,5 @@
 -- StormChase community warning polygons and report moderation.
--- Apply after 006_general_weather_forecasts.sql.
+-- Apply after 001_stormchase_schema.sql and 004_anonymous_reporters.sql.
 -- Admin membership is managed out-of-band by a trusted project owner using service_role.
 -- Never grant users a client-side way to add themselves to stormchase_admins.
 
@@ -84,7 +84,7 @@ create or replace function public.validate_storm_warning_polygon()
 returns trigger
 language plpgsql
 set search_path = ''
-as $
+as $$
 declare
     vertex jsonb;
     first_vertex jsonb;
@@ -139,7 +139,7 @@ begin
 
     return new;
 end;
-$;
+$$;
 
 revoke all on function public.validate_storm_warning_polygon() from public, anon, authenticated;
 drop trigger if exists storm_warning_polygon_validation_trigger on public.storm_warnings;
