@@ -108,6 +108,34 @@ underlying feed is community-run and non-commercial, can be delayed or
 incomplete, and is not an official safety service. Do not use it for life-safety
 decisions or as a substitute for a certified lightning-detection feed.
 
+
+## Local analysis tools
+
+The live-map sidebar includes a **Measure distance** tool. Activate it and click
+two points on the map to draw a straight-line great-circle measurement in
+kilometres; start another measurement to replace the previous one. This is a
+geographic distance, not a road route or storm-motion estimate.
+
+Select a KONRAD3D cell or rain echo and choose **Copy cell summary** to copy
+its coordinates and the currently available reflectivity, severity, area, and
+retained track details to the clipboard. The export uses already-loaded
+session data and does not make another network request.
+
+The **Data status** tab reports the last observed timestamps and freshness of
+the main feeds, including DWD reflectivity and velocity, KONRAD3D tracking,
+mesocyclone detections, lightning, the ICON-D2 outlook, and community reports.
+Core radar/tracking observations older than 12 minutes and lightning strokes
+older than 15 minutes are marked stale; an outlook older than 30 hours is also
+marked stale. A failed latest request is shown alongside the last successful
+observation where one exists. A stale feed means the displayed observation is
+old, not necessarily that the network connection is down.
+
+The same tab includes session-only counters for unique cell/echo IDs observed,
+lightning strokes received, completed refresh cycles, and peak simultaneous
+cell counts. These counters reset when the application restarts. The
+diagnostics, clipboard export, and distance measurement operate on data already
+loaded by StormChase and do not add API calls.
+
 ## Supabase shared data and reports
 
 The desktop fetches DWD reflectivity, velocity, KONRAD3D fallback data, and
