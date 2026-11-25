@@ -40,8 +40,11 @@ create table if not exists public.storm_warnings (
     headline text not null check (length(btrim(headline)) between 1 and 120),
     description text not null check (length(btrim(description)) between 1 and 2000),
     polygon jsonb not null check (
-        jsonb_typeof(polygon) = 'array'
-        and jsonb_array_length(polygon) between 4 and 251
+        case
+            when jsonb_typeof(polygon) = 'array'
+            then jsonb_array_length(polygon) between 4 and 251
+            else false
+        end
     ),
     status text not null default 'active' check (
         status in ('active', 'cancelled', 'expired')
@@ -51,14 +54,98 @@ create table if not exists public.storm_warnings (
     updated_at timestamptz not null default now(),
     expires_at timestamptz not null check (expires_at > created_at),
     check (
-        category <> 'tornado'
-        or level <> 3
-        or level_tag = 'CATASTROPHIC / TORNADO EMERGENCY'
+        (category = 'damaging_wind' and (
+            (level = 1 and level_tag = 'BASE')
+            or (level = 2 and level_tag = 'CONSIDERABLE')
+            or (level = 3 and level_tag = 'DESTRUCTIVE')
+        ))
+        or (category = 'hail' and (
+            (level = 1 and level_tag = 'BASE')
+            or (level = 2 and level_tag = 'CONSIDERABLE')
+            or (level = 3 and level_tag = 'DESTRUCTIVE')
+        ))
+        or (category = 'tornado' and (
+            (level = 1 and level_tag = 'BASE')
+            or (level = 2 and level_tag = 'CONSIDERABLE / PDS')
+            or (level = 3 and level_tag = 'CATASTROPHIC / TORNADO EMERGENCY')
+        ))
+        or (category = 'heavy_rain' and (
+            (level = 1 and level_tag = 'DWD LEVEL 2')
+            or (level = 2 and level_tag = 'DWD LEVEL 3')
+            or (level = 3 and level_tag = 'DWD LEVEL 4')
+        ))
     )
 );
 
 create index if not exists storm_warnings_active_idx
     on public.storm_warnings(status, expires_at desc);
+
+create or replace function public.validate_storm_warning_polygon()
+returns trigger
+language plpgsql
+set search_path = ''
+as $
+declare
+    vertex jsonb;
+    first_vertex jsonb;
+    last_vertex jsonb;
+    previous_longitude double precision;
+    previous_latitude double precision;
+    current_longitude double precision;
+    current_latitude double precision;
+    vertex_count integer := 0;
+    area_twice double precision := 0;
+begin
+    if jsonb_typeof(new.polygon) <> 'array'
+       or jsonb_array_length(new.polygon) not between 4 and 251 then
+        raise exception 'A warning polygon must contain 3 to 250 vertices plus closure.';
+    end if;
+
+    for vertex in select value from jsonb_array_elements(new.polygon)
+    loop
+        if jsonb_typeof(vertex) <> 'array'
+           or jsonb_array_length(vertex) <> 2
+           or jsonb_typeof(vertex -> 0) <> 'number'
+           or jsonb_typeof(vertex -> 1) <> 'number' then
+            raise exception 'Every warning polygon vertex must be [longitude, latitude].';
+        end if;
+
+        current_longitude := (vertex ->> 0)::double precision;
+        current_latitude := (vertex ->> 1)::double precision;
+        if current_longitude not between -180 and 180
+           or current_latitude not between -90 and 90 then
+            raise exception 'Warning polygon coordinates are outside geographic bounds.';
+        end if;
+
+        vertex_count := vertex_count + 1;
+        if vertex_count = 1 then
+            first_vertex := vertex;
+        else
+            area_twice := area_twice
+                + previous_longitude * current_latitude
+                - current_longitude * previous_latitude;
+        end if;
+        previous_longitude := current_longitude;
+        previous_latitude := current_latitude;
+        last_vertex := vertex;
+    end loop;
+
+    if vertex_count < 4 or first_vertex <> last_vertex then
+        raise exception 'Warning polygon ring must contain at least 3 vertices and be closed.';
+    end if;
+    if abs(area_twice) < 1e-8 then
+        raise exception 'Warning polygon area is zero or too small.';
+    end if;
+
+    return new;
+end;
+$;
+
+revoke all on function public.validate_storm_warning_polygon() from public, anon, authenticated;
+drop trigger if exists storm_warning_polygon_validation_trigger on public.storm_warnings;
+create trigger storm_warning_polygon_validation_trigger
+    before insert or update of polygon on public.storm_warnings
+    for each row execute function public.validate_storm_warning_polygon();
 
 alter table public.storm_warnings enable row level security;
 drop policy if exists "Active community warnings are publicly readable"
