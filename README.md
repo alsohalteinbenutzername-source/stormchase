@@ -313,8 +313,10 @@ official DWD/NWS warnings or a German legal warning scale:
 - **Hail:** NWS Base (1.00 in / 25 mm), Considerable (1.75 in / 44 mm),
   and Destructive (2.75 in / 70 mm).
 - **Tornado:** NWS Base, Considerable/PDS, and Catastrophic/Tornado Emergency.
-  The highest tier requires an explicit reliable-confirmation acknowledgement
-  and should remain exceptionally rare.
+  The highest tier requires explicit confirmation of reliable evidence and
+  catastrophic impacts. NWS operational guidance also requires supervisor/team
+  concurrence; StormChase cannot reproduce that official authorization process
+  and does not issue an NWS Tornado Emergency.
 - **Heavy rain:** StormChase levels 1–3 map to DWD Warnstufen 2–4:
   15–25 mm/1 h or 20–35 mm/6 h; >25–40 mm/1 h or >35–60 mm/6 h;
   >40 mm/1 h or >60 mm/6 h.
