@@ -1755,7 +1755,7 @@ class StormRadarApp:
 
         self.admin_catastrophic_check = ttk.Checkbutton(
             warning_frame,
-            text="I have reliable evidence and the catastrophic-impact criteria are met, including independent supervisor/team review where applicable",
+            text="I have reliable confirmation of a strong tornado impacting a populated area (Catastrophic damage-threat tag)",
             variable=self.admin_catastrophic_var,
         )
         self.admin_catastrophic_check.grid(row=6, column=0, columnspan=2, sticky="w", padx=4, pady=3)
