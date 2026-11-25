@@ -12,3 +12,4 @@ winrt-Windows.Devices.Geolocation
 websockets
 keyring
 requests-cache
+customtkinter>=5.2.2,<6

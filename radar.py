@@ -945,6 +945,8 @@ def radar_playback(
     start: datetime,
     end: datetime,
     step: timedelta = timedelta(minutes=5),
+    parameter: DwdRadarParameter = REFLECTIVITY_PRODUCT,
+    site: DwdRadarSite | None = None,
 ) -> tuple[RadarFrame, ...]:
     if start.tzinfo is None or end.tzinfo is None:
         raise ValueError("Start and end times must be timezone-aware.")
@@ -952,22 +954,26 @@ def radar_playback(
         raise ValueError("Start time must be before end time.")
     if step.total_seconds() <= 0:
         raise ValueError("Step duration must be positive.")
+    if parameter == VELOCITY_PRODUCT and site is None:
+        raise ValueError("A radar site is required to replay velocity data.")
 
-    frames: list[RadarFrame] = []
-    current = start
-    while current <= end:
-        request = DwdRadarValues(
-            parameter=REFLECTIVITY_PRODUCT,
-            start=DwdRadarDate(current),
+    # Query the complete time window in one request; DWD returns each available
+    # five-minute scan, avoiding a separate network request for every frame.
+    request_options: dict[str, Any] = {
+        "parameter": parameter,
+        "start": start,
+        "end": end,
+    }
+    if site is not None:
+        request_options["site"] = site
+    request = DwdRadarValues(**request_options)
+    frames = [
+        decode_radar_file(
+            result.data.getvalue(),
+            timestamp=result.timestamp or result.data_updated_at,
         )
-        result = next(iter(request.query()), None)
-        if result is not None:
-            frame = decode_radar_file(
-                result.data.getvalue(),
-                timestamp=result.timestamp or result.data_updated_at,
-            )
-            frames.append(frame)
-        current += step
+        for result in request.query()
+    ]
     return tuple(frames)
 
 def fetch_latest_velocity_radar(site: DwdRadarSite) -> RadarFrame | None:
@@ -1081,27 +1087,10 @@ def velocity_radar_playback(
     end: datetime,
     step: timedelta = timedelta(minutes=5),
 ) -> tuple[RadarFrame, ...]:
-    if start.tzinfo is None or end.tzinfo is None:
-        raise ValueError("Start and end times must be timezone-aware.")
-    if start >= end:
-        raise ValueError("Start time must be before end time.")
-    if step.total_seconds() <= 0:
-        raise ValueError("Step duration must be positive.")
-
-    frames: list[RadarFrame] = []
-    current = start
-    while current <= end:
-        request = DwdRadarValues(
-            parameter=VELOCITY_PRODUCT,
-            site=DwdRadarSite.HNR,
-            start=DwdRadarDate(current),
-        )
-        result = next(iter(request.query()), None)
-        if result is not None:
-            frame = decode_radar_file(
-                result.data.getvalue(),
-                timestamp=result.timestamp or result.data_updated_at,
-            )
-            frames.append(frame)
-        current += step
-    return tuple(frames)
+    return radar_playback(
+        start,
+        end,
+        step,
+        parameter=VELOCITY_PRODUCT,
+        site=DwdRadarSite.HNR,
+    )

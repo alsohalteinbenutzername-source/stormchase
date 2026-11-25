@@ -27,6 +27,7 @@ import matplotlib.patheffects as path_effects
 from matplotlib.tri import Triangulation, UniformTriRefiner
 import numpy as np
 from PIL import Image, ImageDraw
+import customtkinter as ctk
 
 from loctrack import (
     LocationFix,
@@ -43,12 +44,14 @@ from radar import (
     MESOCYCLONE_MIN_DISPLAY_LEVEL,
     RAIN_CELL_MAX_DBZ,
     RAIN_CELL_MIN_DBZ,
+    REFLECTIVITY_PRODUCT,
     ROTATION_STORM_SUPPORT_MIN_DBZ,
     RainCellTracker,
     RainCell,
     RadarFrame,
     RotationDetection,
     VelocityRadarSite,
+    VELOCITY_PRODUCT,
     detect_rain_cells,
     fetch_latest_radar,
     fetch_latest_mesocyclone_detections,
@@ -57,6 +60,7 @@ from radar import (
     maximum_reflectivity_near,
     nearest_velocity_radar_site,
     project_rain_cell_direction,
+    radar_playback,
 )
 from supabase_client import AuthUser, SupabaseClient, SupabaseConfig, SupabaseError
 from tracking import StormCell, StormUpdate, fetch_latest_storm_cells, project_cell_motion
@@ -69,11 +73,11 @@ from calculations import (
 from stormanalyzer import analyze_general_weather, summarize_daily_outlook_environment
 
 
-BACKGROUND = "#101820"
-PANEL = "#19252e"
-FOREGROUND = "#e7eef2"
-MUTED = "#9aabb5"
-ACCENT = "#43c6ac"
+BACKGROUND = "#11191e"
+PANEL = "#1a252b"
+FOREGROUND = "#e8edef"
+MUTED = "#a4b0b5"
+ACCENT = "#73b6a5"
 SEVERE_THRESHOLD_DBZ = 50.0
 DATA_REFRESH_SECONDS = 300
 SHARED_DATA_STALE_AFTER = timedelta(minutes=12)
@@ -125,9 +129,75 @@ GENERAL_WEATHER_MAP_SCALES = {
 }
 
 
+class AppButton(ctk.CTkButton):
+    """Shared muted button styling for the app's CustomTkinter controls."""
+
+    def __init__(self, master: Any, **kwargs: Any) -> None:
+        kwargs.setdefault("fg_color", "#293941")
+        kwargs.setdefault("hover_color", "#3a5057")
+        kwargs.setdefault("text_color", FOREGROUND)
+        kwargs.setdefault("corner_radius", 8)
+        kwargs.setdefault("height", 34)
+        kwargs.setdefault("font", ("Segoe UI", 10))
+        super().__init__(master, **kwargs)
+
+
+class AppComboBox(ctk.CTkComboBox):
+    """Muted, rounded dropdown styling shared by the map controls."""
+
+    def __init__(self, master: Any, **kwargs: Any) -> None:
+        kwargs.setdefault("fg_color", "#202d33")
+        kwargs.setdefault("border_color", "#35454b")
+        kwargs.setdefault("button_color", "#293941")
+        kwargs.setdefault("button_hover_color", "#3a5057")
+        kwargs.setdefault("dropdown_fg_color", "#1a252b")
+        kwargs.setdefault("dropdown_hover_color", "#2b3b41")
+        kwargs.setdefault("text_color", FOREGROUND)
+        kwargs.setdefault("text_color_disabled", MUTED)
+        kwargs.setdefault("corner_radius", 8)
+        kwargs.setdefault("height", 32)
+        kwargs.setdefault("font", ("Segoe UI", 10))
+        kwargs.setdefault("dropdown_font", ("Segoe UI", 10))
+        super().__init__(master, **kwargs)
+
+
 def _terminal_progress(area: str, message: str) -> None:
     timestamp = datetime.now().astimezone().strftime("%H:%M:%S")
     print(f"[{timestamp}] [{area}] {message}", flush=True)
+
+
+def _fill_grid_gaps_from_neighbors(
+    target_points: list[tuple[float, float]],
+    source_points: list[tuple[float, float]],
+    source_values: list[float],
+    neighbor_count: int = 4,
+) -> np.ndarray:
+    if not source_points or len(source_points) != len(source_values):
+        raise ValueError("At least one matching source point and value is required.")
+
+    targets = np.asarray(target_points, dtype=float)
+    sources = np.asarray(source_points, dtype=float)
+    values = np.asarray(source_values, dtype=float)
+    latitude_delta_km = (targets[:, None, 0] - sources[None, :, 0]) * 111.0
+    longitude_scale = np.cos(np.radians(targets[:, 0]))[:, None]
+    longitude_delta_km = (
+        (targets[:, None, 1] - sources[None, :, 1])
+        * 111.0
+        * longitude_scale
+    )
+    distances = np.hypot(latitude_delta_km, longitude_delta_km)
+    count = min(max(int(neighbor_count), 1), len(sources))
+    nearest = np.argpartition(distances, count - 1, axis=1)[:, :count]
+    nearest_distances = np.take_along_axis(distances, nearest, axis=1)
+    nearest_order = np.argsort(nearest_distances, axis=1)
+    nearest = np.take_along_axis(nearest, nearest_order, axis=1)
+    nearest_distances = np.take_along_axis(nearest_distances, nearest_order, axis=1)
+    nearest_values = values[nearest]
+    exact_matches = nearest_distances[:, 0] <= 1e-6
+    weights = 1.0 / np.maximum(nearest_distances, 1e-6) ** 2
+    interpolated = np.sum(nearest_values * weights, axis=1) / np.sum(weights, axis=1)
+    interpolated[exact_matches] = nearest_values[exact_matches, 0]
+    return interpolated
 
 
 def _format_optional_parameter(value: Any) -> str:
@@ -159,6 +229,7 @@ def calculate_germany_outlook(
     outlines: tuple[tuple[tuple[float, float], ...], ...],
     supabase: SupabaseClient | None = None,
     use_shared_outlook: bool = True,
+    general_weather_results: list[dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], datetime]:
     from weather_api import (
         OPTIONAL_STORMANALYZER_HOURLY_FIELDS,
@@ -282,47 +353,66 @@ def calculate_germany_outlook(
                 now.date() + timedelta(days=day),
                 calculation_time,
             )
+            local_weather = None
+            if general_weather_grid is not None and point_index < len(general_weather_grid):
+                daily_payload = general_weather_grid[point_index]
+                target_date = (now.date() + timedelta(days=day)).isoformat()
+                general_day = next(
+                    (
+                        forecast
+                        for forecast in daily_payload.get("days", [])
+                        if isinstance(forecast, dict)
+                        and forecast.get("date") == target_date
+                    ),
+                    None,
+                )
+                if general_day is not None:
+                    try:
+                        local_environment = summarize_daily_outlook_environment(
+                            hourly,
+                            target_date,
+                        )
+                    except ValueError as error:
+                        print(
+                            "WARNING: Could not summarize ICON-D2 environment "
+                            f"for local weather analysis: {error}",
+                            flush=True,
+                        )
+                        local_environment = {}
+                    local_weather = dict(general_day)
+                    local_weather["environment"] = local_environment
+                    local_weather["analysis"] = analyze_general_weather(
+                        local_environment,
+                        local_weather,
+                    )
+                    local_weather["weather_description"] = (
+                        local_weather["analysis"]["condition"]
+                    )
+                    if general_weather_results is not None:
+                        general_weather_results.append(
+                            {
+                                "day": day,
+                                "latitude": latitude,
+                                "longitude": longitude,
+                                "general_weather": local_weather,
+                            }
+                        )
             if result is not None:
-                best_by_day[day] = {
+                outlook_entry = {
                     **result,
                     "latitude": latitude,
                     "longitude": longitude,
                 }
-                if general_weather_grid is not None and point_index < len(general_weather_grid):
-                    daily_payload = general_weather_grid[point_index]
-                    target_date = (now.date() + timedelta(days=day)).isoformat()
-                    general_day = next(
-                        (
-                            forecast
-                            for forecast in daily_payload.get("days", [])
-                            if isinstance(forecast, dict)
-                            and forecast.get("date") == target_date
-                        ),
-                        None,
-                    )
-                    if general_day is not None:
-                        try:
-                            local_environment = summarize_daily_outlook_environment(
-                                hourly,
-                                target_date,
-                            )
-                        except ValueError as error:
-                            print(
-                                "WARNING: Could not summarize ICON-D2 environment "
-                                f"for local weather analysis: {error}"
-                            )
-                        else:
-                            local_weather = dict(general_day)
-                            local_weather["environment"] = local_environment
-                            local_weather["analysis"] = analyze_general_weather(
-                                local_environment,
-                                local_weather,
-                            )
-                            local_weather["weather_description"] = (
-                                local_weather["analysis"]["condition"]
-                            )
-                            best_by_day[day]["general_weather"] = local_weather
+                if local_weather is not None:
+                    outlook_entry["general_weather"] = local_weather
+                best_by_day[day] = outlook_entry
         outlook.extend({**entry, "day": day} for day, entry in best_by_day.items())
+    if general_weather_results is not None:
+        _terminal_progress(
+            "Outlook",
+            f"Collected {len(general_weather_results)} general-weather map points independently "
+            "of storm-analysis results.",
+        )
     _terminal_progress(
         "Outlook",
         f"Analysis complete: {len(outlook)} day/location results in "
@@ -861,13 +951,13 @@ def derive_ecmwf_srh(payload: dict[str, Any]) -> dict[str, float]:
 class StormRadarApp:
 
 
-    def __init__(self, root: tk.Tk) -> None:
+    def __init__(self, root: ctk.CTk) -> None:
         self.root = root
         _terminal_progress("App", "Starting StormChase and initializing local feeds.")
         self.root.title("StormChase | Live Storm Radar")
         self.root.geometry("1280x820")
         self.root.minsize(1000, 680)
-        self.root.configure(bg=BACKGROUND)
+        self.root.configure(fg_color=BACKGROUND)
 
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
@@ -890,6 +980,16 @@ class StormRadarApp:
         self._location_changed_handler: Any | None = None
         self._has_device_fix = False
         self.radar_frame: RadarFrame | None = None
+        self._radar_playback_frames: tuple[RadarFrame, ...] = ()
+        self._radar_playback_index: int | None = None
+        self._radar_playback_after_id: str | None = None
+        self._radar_playback_loading = False
+        self._radar_playback_paused = False
+        self._radar_playback_request_id = 0
+        self._radar_playback_product: str | None = None
+        self.radar_replay_button: AppButton | None = None
+        self.radar_replay_pause_button: AppButton | None = None
+        self.radar_replay_slider: ctk.CTkSlider | None = None
         self.rain_cell_tracker = RainCellTracker()
         self.velocity_radar_frame: RadarFrame | None = None
         self.velocity_radar_site: VelocityRadarSite | None = None
@@ -926,6 +1026,7 @@ class StormRadarApp:
         self._warning_click_request_id = 0
         self._weather_location: tuple[float, float] | None = None
         self._storm_outlook: list[dict[str, Any]] = []
+        self._general_weather_outlook: list[dict[str, Any]] = []
         self._storm_outlook_loading = False
         self._storm_outlook_error: str | None = None
         self._storm_outlook_loaded_at: datetime | None = None
@@ -962,6 +1063,7 @@ class StormRadarApp:
         _terminal_progress("App", "Startup complete; background refreshes are running.")
 
     def _build_ui(self) -> None:
+        ctk.set_appearance_mode("dark")
         style = ttk.Style(self.root)
         style.theme_use("clam")
         style.configure(
@@ -975,12 +1077,14 @@ class StormRadarApp:
         style.configure(
             "Panel.TLabelframe",
             background=PANEL,
-            bordercolor="#52636c",
+            bordercolor="#2b3940",
+            relief="solid",
+            borderwidth=1,
         )
         style.configure(
             "Panel.TLabelframe.Label",
             background=PANEL,
-            foreground=MUTED,
+            foreground=ACCENT,
             font=("Segoe UI Semibold", 9),
         )
         style.configure(
@@ -1015,12 +1119,78 @@ class StormRadarApp:
         )
         style.configure(
             "TButton",
-            background="#263b46",
+            background="#293941",
             foreground=FOREGROUND,
-            padding=(10, 7),
+            padding=(10, 6),
+            borderwidth=0,
+            focusthickness=0,
+        )
+        style.map(
+            "TButton",
+            background=[("disabled", "#202b30"), ("pressed", "#31454b"), ("active", "#35484e")],
+            foreground=[("disabled", "#77858a")],
+        )
+        style.configure(
+            "TEntry",
+            fieldbackground="#111a1f",
+            foreground=FOREGROUND,
+            insertcolor=FOREGROUND,
+            bordercolor="#35454b",
+            lightcolor="#35454b",
+            darkcolor="#35454b",
+            padding=(7, 5),
+        )
+        style.map(
+            "TEntry",
+            bordercolor=[("focus", ACCENT)],
+            lightcolor=[("focus", ACCENT)],
+            darkcolor=[("focus", ACCENT)],
+        )
+        style.configure(
+            "TCombobox",
+            fieldbackground="#202d33",
+            background="#293941",
+            foreground=FOREGROUND,
+            arrowcolor=FOREGROUND,
+            bordercolor="#35454b",
+            lightcolor="#35454b",
+            darkcolor="#35454b",
+            padding=(7, 4),
+        )
+        style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", "#202d33"), ("disabled", "#1c272c")],
+            foreground=[("readonly", FOREGROUND), ("disabled", MUTED)],
+            selectbackground=[("readonly", "#202d33")],
+            selectforeground=[("readonly", FOREGROUND)],
+            bordercolor=[("focus", ACCENT)],
+        )
+        style.configure(
+            "TNotebook",
+            background=PANEL,
+            borderwidth=0,
+            tabmargins=(3, 3, 3, 0),
+        )
+        style.configure(
+            "TNotebook.Tab",
+            background="#202d33",
+            foreground=MUTED,
+            padding=(12, 7),
             borderwidth=0,
         )
-        style.map("TButton", background=[("active", "#355563")])
+        style.map(
+            "TNotebook.Tab",
+            background=[("selected", "#2b3b41"), ("active", "#26363c")],
+            foreground=[("selected", FOREGROUND), ("active", FOREGROUND)],
+        )
+        style.configure(
+            "TScrollbar",
+            background="#35454b",
+            troughcolor="#141e23",
+            bordercolor="#141e23",
+            arrowcolor=MUTED,
+            gripcount=0,
+        )
 
         self.status = tk.StringVar()
         self.location_status = tk.StringVar()
@@ -1033,10 +1203,14 @@ class StormRadarApp:
         self.latitude_input = tk.StringVar()
         self.longitude_input = tk.StringVar()
 
-        header = ttk.Frame(self.root, padding=(22, 16, 22, 10))
-        header.pack(fill="x")
+        header = ctk.CTkFrame(
+            self.root,
+            fg_color="transparent",
+            corner_radius=0,
+        )
+        header.pack(fill="x", padx=22, pady=(16, 10))
         ttk.Label(header, text="STORMCHASE", style="Title.TLabel").pack(side="left")
-        self.auth_button = ttk.Button(
+        self.auth_button = AppButton(
             header,
             text="Set username",
             command=self._on_auth_button,
@@ -1047,7 +1221,7 @@ class StormRadarApp:
             textvariable=self.auth_status,
             style="Status.TLabel",
         ).pack(side="right", padx=(8, 4), pady=(5, 0))
-        ttk.Button(header, text="Refresh data", command=self.refresh_data).pack(
+        AppButton(header, text="Refresh data", command=self.refresh_data).pack(
             side="right", pady=(5, 0)
         )
         ttk.Label(
@@ -1056,36 +1230,47 @@ class StormRadarApp:
             style="Status.TLabel",
         ).pack(side="right", padx=(0, 12), pady=(5, 0))
 
-        body = ttk.Frame(self.root, padding=(18, 4, 18, 10))
-        body.pack(fill="both", expand=True)
+        body = ctk.CTkFrame(
+            self.root,
+            fg_color="transparent",
+            corner_radius=0,
+        )
+        body.pack(fill="both", expand=True, padx=18, pady=(4, 10))
         body.columnconfigure(1, weight=1)
         body.rowconfigure(0, weight=1)
 
-        sidebar = ttk.Frame(body, style="Panel.TFrame", padding=14, width=270)
+        sidebar = ctk.CTkFrame(
+            body,
+            fg_color=PANEL,
+            corner_radius=12,
+            width=270,
+        )
         sidebar.grid(row=0, column=0, sticky="nsw", padx=(0, 12))
         sidebar.grid_propagate(False)
-        ttk.Label(sidebar, text="LOCATION", style="Section.TLabel").pack(anchor="w")
+        sidebar_content = ttk.Frame(sidebar, style="Panel.TFrame", padding=14)
+        sidebar_content.pack(fill="both", expand=True)
+        ttk.Label(sidebar_content, text="LOCATION", style="Section.TLabel").pack(anchor="w")
         ttk.Label(
-            sidebar,
+            sidebar_content,
             text="Device location is used only after you opt in. It stays on this device.",
             style="Panel.TLabel",
             wraplength=230,
             justify="left",
         ).pack(anchor="w", pady=(8, 10))
-        ttk.Button(
-            sidebar,
+        AppButton(
+            sidebar_content,
             text="Enable device location",
             command=self.enable_location,
         ).pack(fill="x")
-        ttk.Button(
-            sidebar,
+        AppButton(
+            sidebar_content,
             text="Stop location tracking",
             command=self.stop_location_tracking,
         ).pack(fill="x", pady=(6, 8))
-        ttk.Label(sidebar, text="USE COORDINATES INSTEAD", style="Section.TLabel").pack(
+        ttk.Label(sidebar_content, text="USE COORDINATES INSTEAD", style="Section.TLabel").pack(
             anchor="w"
         )
-        coordinate_row = ttk.Frame(sidebar, style="Panel.TFrame")
+        coordinate_row = ttk.Frame(sidebar_content, style="Panel.TFrame")
         coordinate_row.pack(fill="x", pady=(8, 6))
         ttk.Entry(coordinate_row, textvariable=self.latitude_input, width=10).pack(
             side="left"
@@ -1093,69 +1278,84 @@ class StormRadarApp:
         ttk.Entry(coordinate_row, textvariable=self.longitude_input, width=10).pack(
             side="left", padx=(6, 0)
         )
-        ttk.Button(
-            sidebar,
+        AppButton(
+            sidebar_content,
             text="Set map location",
             command=self.set_manual_location,
         ).pack(fill="x")
 
-        ttk.Label(sidebar, text="STORM CELLS", style="Section.TLabel").pack(
+        ttk.Label(sidebar_content, text="STORM CELLS", style="Section.TLabel").pack(
             anchor="w", pady=(20, 7)
         )
         self.cell_list = tk.Listbox(
-            sidebar,
+            sidebar_content,
             height=12,
-            bg="#111b22",
+            bg="#131d22",
             fg=FOREGROUND,
-            selectbackground="#276b64",
+            selectbackground="#35584f",
             selectforeground="white",
             relief="flat",
             highlightthickness=0,
             activestyle="none",
             font=("Segoe UI", 9),
+            borderwidth=0,
+            highlightbackground="#2b3940",
         )
         self.cell_list.pack(fill="both", expand=True)
         self.cell_list.bind("<<ListboxSelect>>", self._on_cell_list_select)
         ttk.Label(
-            sidebar,
+            sidebar_content,
             textvariable=self.cell_detail,
             style="Panel.TLabel",
             wraplength=230,
             justify="left",
         ).pack(fill="x", pady=(8, 4))
-        self.file_report_button_widget = ttk.Button(
-            sidebar,
+        self.file_report_button_widget = AppButton(
+            sidebar_content,
             text="File report for selected cell",
             command=self.file_report_button,
             state="disabled",
         )
         self.file_report_button_widget.pack(fill="x", pady=(4, 0))
 
-        map_panel = ttk.Frame(body, style="Panel.TFrame", padding=10)
+        map_panel = ctk.CTkFrame(
+            body,
+            fg_color=PANEL,
+            corner_radius=12,
+        )
         map_panel.grid(row=0, column=1, sticky="nsew")
-        map_panel.rowconfigure(1, weight=1)
-        map_panel.columnconfigure(0, weight=1)
-        map_toolbar = ttk.Frame(map_panel, style="Panel.TFrame")
+        map_content = ttk.Frame(map_panel, style="Panel.TFrame", padding=10)
+        map_content.pack(fill="both", expand=True)
+        map_content.rowconfigure(2, weight=1)
+        map_content.columnconfigure(0, weight=1)
+        map_toolbar = ttk.Frame(map_content, style="Panel.TFrame")
         map_toolbar.grid(row=0, column=0, sticky="ew", padx=8, pady=(2, 6))
         self.map_mode_var = tk.StringVar(value=LIVE_MAP)
-        ttk.Combobox(
+        AppComboBox(
             map_toolbar,
-            textvariable=self.map_mode_var,
+            variable=self.map_mode_var,
             values=(LIVE_MAP, DWD_WARNING_MAP, STORMANALYZER_MAP),
             state="readonly",
-            width=25,
+            width=210,
         ).pack(side="left", padx=(12, 0))
         self.map_mode_var.trace_add("write", self._on_map_mode_change)
         self.radar_product_var = tk.StringVar(value=REFLECTIVITY_RADAR)
-        self.radar_product_combo = ttk.Combobox(
+        self.radar_product_combo = AppComboBox(
             map_toolbar,
-            textvariable=self.radar_product_var,
+            variable=self.radar_product_var,
             values=(REFLECTIVITY_RADAR, VELOCITY_RADAR),
             state="readonly",
-            width=13,
+            width=138,
         )
         self.radar_product_combo.pack(side="left", padx=(8, 0))
         self.radar_product_var.trace_add("write", self._on_radar_product_change)
+        self.radar_replay_button = AppButton(
+            map_toolbar,
+            text="Replay",
+            width=82,
+            command=self._toggle_radar_playback,
+        )
+        self.radar_replay_button.pack(side="left", padx=(6, 0))
         self.radar_product_status = tk.StringVar(value="Reflectivity: waiting for data")
         ttk.Label(
             map_toolbar,
@@ -1164,76 +1364,106 @@ class StormRadarApp:
         ).pack(side="left", padx=(8, 0))
         self.outlook_day_var = tk.StringVar(value="Day 1")
         self.outlook_metric_var = tk.StringVar(value="Overall risk")
-        self.outlook_day_combo = ttk.Combobox(
-            map_toolbar, textvariable=self.outlook_day_var,
-            values=OUTLOOK_DAY_LABELS, state="readonly", width=7,
+        self.outlook_day_combo = AppComboBox(
+            map_toolbar, variable=self.outlook_day_var,
+            values=OUTLOOK_DAY_LABELS, state="readonly", width=92,
         )
         self.outlook_day_combo.pack(side="left", padx=(8, 0))
         self.outlook_day_var.trace_add("write", self._on_outlook_selection_change)
-        self.outlook_metric_combo = ttk.Combobox(
-            map_toolbar, textvariable=self.outlook_metric_var,
+        self.outlook_metric_combo = AppComboBox(
+            map_toolbar, variable=self.outlook_metric_var,
             values=(
                 "Overall risk", "Tornado", "Hail", "Wind", "STP", "SCP",
                 *GENERAL_WEATHER_MAP_SCALES,
             ),
-            state="readonly", width=14,
+            state="readonly", width=148,
         )
         self.outlook_metric_combo.pack(side="left", padx=(5, 0))
         self.outlook_metric_var.trace_add("write", self._on_outlook_selection_change)
         self.outlook_day_combo.configure(state="disabled")
         self.outlook_metric_combo.configure(state="disabled")
-        self.outlook_load_button = ttk.Button(
+        self.outlook_load_button = AppButton(
             map_toolbar,
             text="Load map",
-            width=11,
+            width=92,
             command=self._ensure_storm_outlook,
             state="disabled",
         )
         self.outlook_load_button.pack(side="left", padx=(8, 0))
-        self.outlook_source_button = ttk.Button(
+        self.outlook_source_button = AppButton(
             map_toolbar,
             text="Use local feed",
-            width=14,
+            width=132,
             command=self._toggle_outlook_source,
             state="disabled",
         )
         self.outlook_source_button.pack(side="left", padx=(5, 0))
-        ttk.Button(
+        AppButton(
             map_toolbar,
             text="Zoom +",
-            width=8,
+            width=72,
             command=lambda: self._change_zoom(1 / 1.2),
         ).pack(side="right", padx=(5, 0))
-        ttk.Button(
+        AppButton(
             map_toolbar,
             text="Zoom −",
-            width=8,
+            width=72,
             command=lambda: self._change_zoom(1.2),
         ).pack(side="right", padx=(5, 0))
-        ttk.Button(
+        AppButton(
             map_toolbar,
             text="Reset",
-            width=7,
+            width=64,
             command=self._reset_map_zoom,
         ).pack(side="right")
+        replay_controls = ttk.Frame(map_content, style="Panel.TFrame")
+        replay_controls.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 6))
+        ttk.Label(
+            replay_controls,
+            text="RADAR REPLAY",
+            style="Status.TLabel",
+        ).pack(side="left", padx=(4, 10))
+        self.radar_replay_slider = ctk.CTkSlider(
+            replay_controls,
+            from_=0,
+            to=1,
+            number_of_steps=1,
+            width=320,
+            height=16,
+            fg_color="#28373d",
+            progress_color=ACCENT,
+            button_color=ACCENT,
+            button_hover_color="#93c9bb",
+            state="disabled",
+            command=self._on_radar_replay_seek,
+        )
+        self.radar_replay_slider.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        self.radar_replay_pause_button = AppButton(
+            replay_controls,
+            text="Pause",
+            width=88,
+            command=self._toggle_radar_replay_pause,
+            state="disabled",
+        )
+        self.radar_replay_pause_button.pack(side="right", padx=(0, 4))
         self.figure = Figure(figsize=(8, 6), dpi=100, facecolor=PANEL)
         self.axes = self.figure.add_subplot(111)
-        self.map_canvas = FigureCanvasTkAgg(self.figure, master=map_panel)
-        self.map_canvas.get_tk_widget().grid(row=1, column=0, sticky="nsew")
+        self.map_canvas = FigureCanvasTkAgg(self.figure, master=map_content)
+        self.map_canvas.get_tk_widget().grid(row=2, column=0, sticky="nsew")
         self.map_canvas.mpl_connect("pick_event", self._on_map_pick)
         self.map_canvas.mpl_connect("button_press_event", self._on_map_click)
         self.map_canvas.mpl_connect("scroll_event", self._on_map_scroll)
         self.map_canvas.mpl_connect("resize_event", self._on_map_resize)
         self.map_canvas.mpl_connect("draw_event", self._on_map_draw_complete)
         report_panel = ttk.LabelFrame(
-            map_panel,
+            map_content,
             text="Details and community reports",
             style="Panel.TLabelframe",
             padding=(6, 4),
             height=150,
         )
         self.report_panel = report_panel
-        report_panel.grid(row=2, column=0, sticky="ew", padx=8, pady=(8, 2))
+        report_panel.grid(row=3, column=0, sticky="ew", padx=8, pady=(8, 2))
         report_panel.grid_propagate(False)
         report_panel.columnconfigure(0, weight=1)
         report_panel.rowconfigure(0, weight=1)
@@ -1355,7 +1585,7 @@ class StormRadarApp:
             textvariable=self.outlook_longitude_input,
             width=14,
         ).grid(row=0, column=3, sticky="w", padx=(0, 14))
-        ttk.Button(
+        AppButton(
             coordinates_box,
             text="Use coordinates",
             command=self._set_manual_outlook_location,
@@ -1539,7 +1769,7 @@ class StormRadarApp:
             )
         composite_box.columnconfigure(1, weight=1)
         composite_box.columnconfigure(3, weight=1)
-        ttk.Button(
+        AppButton(
             manual_box,
             text="Calculate manual risk",
             command=self._calculate_manual_outlook,
@@ -1636,6 +1866,42 @@ class StormRadarApp:
             "the severe-thunderstorm score uses the other environmental inputs."
         )
 
+    def _set_general_weather_summary(self, general_weather: Any) -> None:
+        analysis = (
+            general_weather.get("analysis")
+            if isinstance(general_weather, dict)
+            else None
+        )
+        if not isinstance(analysis, dict):
+            self.general_weather_text.set(
+                "The published general-weather forecast is unavailable for this point and day."
+            )
+            return
+
+        probability = analysis.get("precipitation_probability_percent")
+        probability_text = (
+            f"{probability:.0f}%"
+            if isinstance(probability, (int, float))
+            else "unavailable"
+        )
+        rain_text = "Rain likely" if analysis.get("rain_likely") else "Rain not indicated"
+        if analysis.get("snow_likely"):
+            frozen_text = "Snow likely"
+        elif analysis.get("frozen_precipitation_likely"):
+            frozen_text = "Frozen precipitation likely"
+        else:
+            frozen_text = "No frozen precipitation indicated"
+        self.general_weather_text.set(
+            f"{analysis.get('headline', analysis.get('condition', 'Unavailable'))} · "
+            f"{analysis.get('condition', 'Unavailable')}\n"
+            f"Precipitation chance: {probability_text} · {rain_text} · {frozen_text}\n"
+            f"High / low: {_format_optional_parameter(general_weather.get('temperature_max_c'))} / "
+            f"{_format_optional_parameter(general_weather.get('temperature_min_c'))} °C · "
+            f"Total precipitation: {_format_optional_parameter(general_weather.get('precipitation_sum_mm'))} mm · "
+            f"Rain: {_format_optional_parameter(general_weather.get('rain_sum_mm'))} mm · "
+            f"Wind max: {_format_optional_parameter(general_weather.get('wind_speed_max_kmh'))} km/h"
+        )
+
     def _show_outlook_calculation(self, latitude: float, longitude: float) -> None:
         self._outlook_location = (longitude, latitude)
         entry = nearest_outlook_entry(
@@ -1644,13 +1910,36 @@ class StormRadarApp:
             latitude,
             longitude,
         )
+        weather_candidates = [
+            candidate
+            for candidate in self._general_weather_outlook
+            if candidate.get("day") == self._outlook_day
+            and isinstance(candidate.get("general_weather"), dict)
+        ]
+        nearest_weather = min(
+            weather_candidates,
+            key=lambda candidate: (
+                (candidate["latitude"] - latitude) ** 2
+                + (
+                    (candidate["longitude"] - longitude)
+                    * math.cos(math.radians(latitude))
+                )
+                ** 2
+            ),
+            default=None,
+        )
+        general_weather = (
+            entry.get("general_weather")
+            if entry is not None
+            else None
+        )
+        if not isinstance(general_weather, dict) and nearest_weather is not None:
+            general_weather = nearest_weather["general_weather"]
+        self._set_general_weather_summary(general_weather)
         if entry is None:
             self.outlook_calculation_text.set(
                 f"No calculation is available for Day {self._outlook_day + 1} at "
                 f"{latitude:.2f}° N, {longitude:.2f}° E yet."
-            )
-            self.general_weather_text.set(
-                f"No general-weather forecast is available for Day {self._outlook_day + 1} yet."
             )
             if self._storm_outlook_loaded_at is None and not self._storm_outlook_loading:
                 self._ensure_storm_outlook()
@@ -1659,36 +1948,6 @@ class StormRadarApp:
         environment = entry["environment"]
         threats = ", ".join(entry["threats"]) or "No specific severe-weather threats indicated"
         criticism = "\n".join(entry["criticism"]) or "No additional assessment notes."
-        general_weather = entry.get("general_weather")
-        analysis = general_weather.get("analysis") if isinstance(general_weather, dict) else None
-        if isinstance(analysis, dict):
-            probability = analysis.get("precipitation_probability_percent")
-            probability_text = (
-                f"{probability:.0f}%"
-                if isinstance(probability, (int, float))
-                else "unavailable"
-            )
-            rain_text = "Rain likely" if analysis.get("rain_likely") else "Rain not indicated"
-            if analysis.get("snow_likely"):
-                frozen_text = "Snow likely"
-            elif analysis.get("frozen_precipitation_likely"):
-                frozen_text = "Frozen precipitation likely"
-            else:
-                frozen_text = "No frozen precipitation indicated"
-            self.general_weather_text.set(
-                f"{analysis.get('headline', analysis.get('condition', 'Unavailable'))} · "
-                f"{analysis.get('condition', 'Unavailable')}\n"
-                f"Precipitation chance: {probability_text} · {rain_text} · {frozen_text}\n"
-                f"High / low: {_format_optional_parameter(general_weather.get('temperature_max_c'))} / "
-                f"{_format_optional_parameter(general_weather.get('temperature_min_c'))} °C · "
-                f"Total precipitation: {_format_optional_parameter(general_weather.get('precipitation_sum_mm'))} mm · "
-                f"Rain: {_format_optional_parameter(general_weather.get('rain_sum_mm'))} mm · "
-                f"Wind max: {_format_optional_parameter(general_weather.get('wind_speed_max_kmh'))} km/h"
-            )
-        else:
-            self.general_weather_text.set(
-                "The published general-weather forecast is unavailable for this point and day."
-            )
         self.outlook_calculation_text.set(
             f"Day {self._outlook_day + 1} · nearest forecast grid point "
             f"{entry['latitude']:.2f}° N, {entry['longitude']:.2f}° E · {entry['time']}\n"
@@ -1718,6 +1977,7 @@ class StormRadarApp:
 
     def _on_radar_product_change(self, *_args: Any) -> None:
         self.radar_product = self.radar_product_var.get()
+        self._stop_radar_playback(redraw=False)
         if self.radar_product == VELOCITY_RADAR:
             if self.velocity_radar_site is None:
                 center_longitude = sum(self.axes.get_xlim()) / 2
@@ -1758,6 +2018,11 @@ class StormRadarApp:
         return f"Velocity · {site.name}: {StormRadarApp._format_time(frame.timestamp)}"
 
     def _select_velocity_radar_site(self, site: VelocityRadarSite) -> None:
+        if (
+            self.velocity_radar_site is not None
+            and self.velocity_radar_site.site != site.site
+        ):
+            self._stop_radar_playback(redraw=False)
         self.velocity_radar_site = site
         self.velocity_radar_frame = self.velocity_radar_frames.get(site.site.value)
         if self.velocity_radar_frame is None:
@@ -1767,6 +2032,241 @@ class StormRadarApp:
                 self._velocity_site_status(site, self.velocity_radar_frame)
             )
         self._draw_map()
+
+    def _update_radar_replay_button(self) -> None:
+        button = self.radar_replay_button
+        if button is None:
+            return
+        if self._radar_playback_loading:
+            text = "Cancel load"
+        elif self._radar_playback_index is not None:
+            text = "Stop replay"
+        else:
+            text = "Replay"
+        state = (
+            "normal"
+            if self.map_mode == LIVE_MAP
+            else "disabled"
+        )
+        button.configure(text=text, state=state)
+        active = (
+            self.map_mode == LIVE_MAP
+            and self._radar_playback_index is not None
+            and bool(self._radar_playback_frames)
+        )
+        if self.radar_replay_slider is not None:
+            frame_count = len(self._radar_playback_frames)
+            self.radar_replay_slider.configure(
+                to=max(frame_count - 1, 1),
+                number_of_steps=max(frame_count - 1, 1),
+                state="normal" if active and frame_count > 1 else "disabled",
+            )
+            if active and self._radar_playback_index is not None:
+                self.radar_replay_slider.set(self._radar_playback_index)
+            else:
+                self.radar_replay_slider.set(0)
+        if self.radar_replay_pause_button is not None:
+            self.radar_replay_pause_button.configure(
+                text="Resume" if self._radar_playback_paused else "Pause",
+                state="normal" if active else "disabled",
+            )
+
+    def _stop_radar_playback(self, *, redraw: bool = True) -> None:
+        was_active = (
+            self._radar_playback_loading
+            or self._radar_playback_after_id is not None
+            or self._radar_playback_index is not None
+        )
+        self._radar_playback_request_id += 1
+        if self._radar_playback_after_id is not None:
+            self.root.after_cancel(self._radar_playback_after_id)
+        self._radar_playback_after_id = None
+        self._radar_playback_frames = ()
+        self._radar_playback_index = None
+        self._radar_playback_loading = False
+        self._radar_playback_paused = False
+        self._radar_playback_product = None
+        self._update_radar_replay_button()
+        if self.radar_product == VELOCITY_RADAR:
+            self.radar_product_status.set(
+                self._velocity_site_status(
+                    self.velocity_radar_site,
+                    self.velocity_radar_frame,
+                )
+                if self.velocity_radar_site is not None
+                else self._radar_status_text(VELOCITY_RADAR, None)
+            )
+        else:
+            self.radar_product_status.set(
+                self._radar_status_text(REFLECTIVITY_RADAR, self.radar_frame)
+            )
+        if redraw and was_active and not self._closed:
+            self._draw_map()
+
+    def _toggle_radar_playback(self) -> None:
+        if (
+            self._radar_playback_loading
+            or self._radar_playback_index is not None
+        ):
+            self._stop_radar_playback()
+            return
+        if self.map_mode != LIVE_MAP:
+            return
+
+        product = self.radar_product
+        site = self.velocity_radar_site if product == VELOCITY_RADAR else None
+        if product == VELOCITY_RADAR and site is None:
+            self.radar_product_status.set("Choose a velocity radar site first.")
+            return
+
+        current_time = datetime.now(timezone.utc) - timedelta(minutes=10)
+        end = current_time.replace(
+            minute=current_time.minute - current_time.minute % 5,
+            second=0,
+            microsecond=0,
+        )
+        start = end - timedelta(minutes=30)
+        self._radar_playback_request_id += 1
+        request_id = self._radar_playback_request_id
+        self._radar_playback_product = product
+        self._radar_playback_loading = True
+        self._radar_playback_paused = False
+        self.radar_product_status.set(f"Loading 30-minute {product.lower()} replay…")
+        _terminal_progress(
+            "Radar replay",
+            f"Fetching {product.lower()} frames from {self._format_time(start)} "
+            f"through {self._format_time(end)}.",
+        )
+        self._update_radar_replay_button()
+        self.loop.create_task(
+            self._load_radar_playback(request_id, product, site, start, end)
+        )
+
+    async def _load_radar_playback(
+        self,
+        request_id: int,
+        product: str,
+        site: VelocityRadarSite | None,
+        start: datetime,
+        end: datetime,
+    ) -> None:
+        parameter = (
+            VELOCITY_PRODUCT if product == VELOCITY_RADAR else REFLECTIVITY_PRODUCT
+        )
+        try:
+            frames = await self.loop.run_in_executor(
+                self.executor,
+                radar_playback,
+                start,
+                end,
+                timedelta(minutes=5),
+                parameter,
+                site.site if site is not None else None,
+            )
+        except Exception as error:
+            if request_id != self._radar_playback_request_id or self._closed:
+                return
+            self._radar_playback_loading = False
+            self._radar_playback_product = None
+            self.radar_product_status.set(
+                f"Replay unavailable: {type(error).__name__}: {error}"
+            )
+            _terminal_progress(
+                "Radar replay",
+                f"Replay load failed: {type(error).__name__}: {error}",
+            )
+            self._update_radar_replay_button()
+            return
+
+        if request_id != self._radar_playback_request_id or self._closed:
+            return
+        self._radar_playback_loading = False
+        self._radar_playback_frames = frames
+        if not frames:
+            self._radar_playback_product = None
+            self.radar_product_status.set(
+                "No archived radar frames were available for that time range."
+            )
+            _terminal_progress("Radar replay", "No radar frames were returned.")
+            self._update_radar_replay_button()
+            return
+
+        self._radar_playback_index = 0
+        self.radar_product_status.set(self._radar_playback_status())
+        _terminal_progress(
+            "Radar replay",
+            f"Loaded {len(frames)} {product.lower()} frames; starting playback.",
+        )
+        self._update_radar_replay_button()
+        self._draw_map()
+        self._schedule_next_radar_frame()
+
+    def _radar_playback_status(self) -> str:
+        index = self._radar_playback_index
+        if index is None or not self._radar_playback_frames:
+            return "Radar replay unavailable"
+        frame = self._radar_playback_frames[index]
+        product = self._radar_playback_product or self.radar_product
+        timestamp = self._format_time(frame.timestamp)
+        if product == VELOCITY_RADAR and self.velocity_radar_site is not None:
+            product = f"Velocity Â· {self.velocity_radar_site.name}"
+        return (
+            f"{product} replay Â· {timestamp} Â· "
+            f"{index + 1}/{len(self._radar_playback_frames)}"
+        )
+
+    def _on_radar_replay_seek(self, value: float) -> None:
+        if self._radar_playback_index is None or not self._radar_playback_frames:
+            return
+        self._radar_playback_index = min(
+            max(int(round(float(value))), 0),
+            len(self._radar_playback_frames) - 1,
+        )
+        self.radar_product_status.set(self._radar_playback_status())
+        self._draw_map()
+
+    def _toggle_radar_replay_pause(self) -> None:
+        if self._radar_playback_index is None or not self._radar_playback_frames:
+            return
+        if self._radar_playback_paused:
+            self._radar_playback_paused = False
+            self.radar_product_status.set(self._radar_playback_status())
+            self._schedule_next_radar_frame()
+        else:
+            if self._radar_playback_after_id is not None:
+                self.root.after_cancel(self._radar_playback_after_id)
+                self._radar_playback_after_id = None
+            self._radar_playback_paused = True
+            self.radar_product_status.set(self._radar_playback_status())
+            self._update_radar_replay_button()
+
+    def _schedule_next_radar_frame(self) -> None:
+        if (
+            self._radar_playback_index is None
+            or self._radar_playback_paused
+            or self._closed
+        ):
+            return
+        self._radar_playback_after_id = self.root.after(
+            900,
+            self._advance_radar_frame,
+        )
+        self._update_radar_replay_button()
+
+    def _advance_radar_frame(self) -> None:
+        self._radar_playback_after_id = None
+        if not self._radar_playback_frames or self._closed:
+            return
+        if self.map_mode != LIVE_MAP or self._radar_playback_product != self.radar_product:
+            self._stop_radar_playback(redraw=False)
+            return
+        count = len(self._radar_playback_frames)
+        self._radar_playback_index = (
+            (self._radar_playback_index or 0) + 1
+        ) % count
+        self.radar_product_status.set(self._radar_playback_status())
+        self._draw_map()
+        self._schedule_next_radar_frame()
 
     def _request_velocity_radar(self, site: VelocityRadarSite) -> None:
         site_code = site.site.value
@@ -2256,7 +2756,7 @@ class StormRadarApp:
                 )
             )
 
-        save_button = ttk.Button(
+        save_button = AppButton(
             frame,
             text="Save username",
             command=save_username,
@@ -2270,7 +2770,7 @@ class StormRadarApp:
         username: str,
         dialog: tk.Toplevel,
         status_text: tk.StringVar,
-        save_button: ttk.Button,
+        save_button: AppButton,
     ) -> None:
         client = self.supabase
         if client is None:
@@ -2534,6 +3034,14 @@ class StormRadarApp:
         self.figure.clear()
         self.axes = self.figure.add_subplot(111)
         outlook_mode = self.map_mode == STORMANALYZER_MAP
+        radar_replay_active = (
+            self.map_mode == LIVE_MAP
+            and self._radar_playback_index is not None
+            and self._radar_playback_product == self.radar_product
+        )
+        live_observation_overlays = (
+            self.map_mode == LIVE_MAP and not radar_replay_active
+        )
         map_background = "white" if outlook_mode else "#101b22"
         map_text = "#263238" if outlook_mode else MUTED
         self.figure.set_facecolor("white" if outlook_mode else PANEL)
@@ -2589,11 +3097,20 @@ class StormRadarApp:
                 zorder=4,
             )
 
-        if outlook_mode and self._storm_outlook:
+        has_general_weather_map = (
+            self._outlook_metric in GENERAL_WEATHER_MAP_SCALES
+            and bool(self._general_weather_outlook)
+        )
+        if outlook_mode and (self._storm_outlook or has_general_weather_map):
             day = self._outlook_day
-            entries = [entry for entry in self._storm_outlook if entry["day"] == day]
             general_weather_scale = GENERAL_WEATHER_MAP_SCALES.get(self._outlook_metric)
             general_weather_metric = general_weather_scale is not None
+            source_grid = (
+                self._general_weather_outlook
+                if general_weather_metric
+                else self._storm_outlook
+            )
+            entries = [entry for entry in source_grid if entry["day"] == day]
             metric_key = {
                 "Overall risk": "risk",
                 "Tornado": "tornado",
@@ -2611,6 +3128,7 @@ class StormRadarApp:
                 else OUTLOOK_PARAMETER_SCALES.get(self._outlook_metric)
             )
             parameter_values: list[float] = []
+            weather_grid_points: list[tuple[float, float]] | None = None
             if parameter_scale is not None:
                 available_entries = []
                 for entry in entries:
@@ -2633,6 +3151,30 @@ class StormRadarApp:
                             float(np.clip(numeric_value, parameter_minimum, parameter_scale))
                         )
                 entries = available_entries
+            if general_weather_metric and entries:
+                source_points = [
+                    (entry["latitude"], entry["longitude"])
+                    for entry in entries
+                ]
+                target_points = germany_grid_points(self.germany_outline)
+                weather_grid_points = target_points
+                known_locations = len(set(source_points))
+                missing_count = max(0, len(target_points) - known_locations)
+                _terminal_progress(
+                    "Map",
+                    f"Matching {len(source_points)} valid source values to the "
+                    f"{len(target_points)} map cells; filling {missing_count} gaps "
+                    "from the nearest valid grid points.",
+                )
+                parameter_values = _fill_grid_gaps_from_neighbors(
+                    target_points,
+                    source_points,
+                    parameter_values,
+                ).tolist()
+                entries = [
+                    {"latitude": latitude, "longitude": longitude}
+                    for latitude, longitude in target_points
+                ]
             _terminal_progress(
                 "Map",
                 f"Preparing {len(entries)} valid grid values for {self._outlook_metric}.",
@@ -2651,7 +3193,11 @@ class StormRadarApp:
                         risk_factor = np.clip(composite_risk / 100.0, 0.0, 1.0)
                         if metric_key != "tornado":
                             scores = scores * risk_factor
-                triangulation = Triangulation(longitudes, latitudes) if len(entries) >= 3 else None
+                triangulation = (
+                    Triangulation(longitudes, latitudes)
+                    if len(entries) >= 3 and not general_weather_metric
+                    else None
+                )
 
                 if parameter_scale is not None:
                     score_levels = tuple(
@@ -2687,18 +3233,44 @@ class StormRadarApp:
                 if (
                     scores.size
                     and np.nanmax(scores) >= minimum_to_render
-                    and triangulation is not None
-                ):
-                    refined_triangulation, refined_scores = UniformTriRefiner(triangulation).refine_field(scores, subdiv=4)
-                    contour = self.axes.tricontourf(
-                        refined_triangulation,
-                        refined_scores,
-                        levels=score_levels,
-                        colors=level_colors,
-                        **contour_options,
-                        alpha=0.78,
-                        zorder=3,
+                    and (
+                        general_weather_metric
+                        or triangulation is not None
                     )
+                ):
+                    if general_weather_metric:
+                        grid_points = weather_grid_points or germany_grid_points(
+                            self.germany_outline
+                        )
+                        grid_latitudes = sorted({latitude for latitude, _ in grid_points})
+                        grid_longitudes = sorted({longitude for _, longitude in grid_points})
+                        weather_grid = scores.reshape(
+                            len(grid_latitudes),
+                            len(grid_longitudes),
+                        )
+                        self.axes.contourf(
+                            grid_longitudes,
+                            grid_latitudes,
+                            weather_grid,
+                            levels=score_levels,
+                            colors=level_colors,
+                            corner_mask=False,
+                            alpha=0.9,
+                            zorder=3,
+                        )
+                    else:
+                        refined_triangulation, refined_scores = UniformTriRefiner(
+                            triangulation
+                        ).refine_field(scores, subdiv=4)
+                        self.axes.tricontourf(
+                            refined_triangulation,
+                            refined_scores,
+                            levels=score_levels,
+                            colors=level_colors,
+                            **contour_options,
+                            alpha=0.78,
+                            zorder=3,
+                        )
                 elif len(entries) < 3:
                     self.axes.text(
                         0.5,
@@ -2822,9 +3394,17 @@ class StormRadarApp:
                 zorder=8,
             )
         radar_frame = (
-            self.velocity_radar_frame
-            if self.radar_product == VELOCITY_RADAR
-            else self.radar_frame
+            self._radar_playback_frames[self._radar_playback_index]
+            if (
+                self._radar_playback_index is not None
+                and self._radar_playback_frames
+                and self._radar_playback_product == self.radar_product
+            )
+            else (
+                self.velocity_radar_frame
+                if self.radar_product == VELOCITY_RADAR
+                else self.radar_frame
+            )
         )
         if self.map_mode == LIVE_MAP:
             is_velocity = self.radar_product == VELOCITY_RADAR
@@ -2875,7 +3455,7 @@ class StormRadarApp:
             )
 
         motion_legend_drawn = False
-        for cell in self.storm_update.cells if self.map_mode == LIVE_MAP else ():
+        for cell in self.storm_update.cells if live_observation_overlays else ():
             history = self.track_history.get(cell.identifier, [])
 
             path = [(longitude, latitude) for latitude, longitude in history]
@@ -2950,7 +3530,7 @@ class StormRadarApp:
                     bbox={"facecolor": "#263238", "edgecolor": "none", "alpha": 0.75, "pad": 1},
                 )
 
-        if self.map_mode == LIVE_MAP and self.storm_update.cells:
+        if live_observation_overlays and self.storm_update.cells:
             reflectivity = [
                 cell.reflectivity_dbz
                 if cell.reflectivity_dbz is not None
@@ -2972,7 +3552,7 @@ class StormRadarApp:
         else:
             self._cell_artist = None
 
-        for cell in self.rain_cells if self.map_mode == LIVE_MAP else ():
+        for cell in self.rain_cells if live_observation_overlays else ():
             if len(cell.track) > 1:
                 projected_position = project_rain_cell_direction(
                     cell.track,
@@ -2993,7 +3573,7 @@ class StormRadarApp:
                         zorder=6,
                     )
 
-        if self.map_mode == LIVE_MAP and self.rain_cells:
+        if live_observation_overlays and self.rain_cells:
             self._rain_artist = self.axes.scatter(
                 [cell.longitude for cell in self.rain_cells],
                 [cell.latitude for cell in self.rain_cells],
@@ -3016,6 +3596,7 @@ class StormRadarApp:
             self.map_mode == LIVE_MAP
             and self.radar_product == VELOCITY_RADAR
             and self.velocity_radar_site is not None
+            and not radar_replay_active
         ):
             level_colors = {
                 1: "#22c55e",
@@ -3111,7 +3692,7 @@ class StormRadarApp:
                         zorder=12,
                     )
 
-        if not outlook_mode and self.lightning_strikes:
+        if not outlook_mode and not radar_replay_active and self.lightning_strikes:
             strikes = tuple(self.lightning_strikes.values())
             self.axes.scatter(
                 [strike.longitude for strike in strikes],
@@ -3164,7 +3745,7 @@ class StormRadarApp:
         if not outlook_mode and (
             self.location is not None
             or self._weather_location is not None
-            or self.lightning_strikes
+            or (self.lightning_strikes and not radar_replay_active)
             or motion_legend_drawn
             or (
                 self.radar_product == VELOCITY_RADAR
@@ -3181,7 +3762,7 @@ class StormRadarApp:
         attribution = "" if outlook_mode else ESRI_ATTRIBUTION
         if self.map_mode == DWD_WARNING_MAP:
             attribution = f"Warning data © DWD · {ESRI_ATTRIBUTION}"
-        if not outlook_mode and self.lightning_strikes:
+        if not outlook_mode and not radar_replay_active and self.lightning_strikes:
             attribution += " · Lightning data © Blitzortung.org / LightningMaps.org"
         if attribution:
             self.axes.text(
@@ -3282,6 +3863,9 @@ class StormRadarApp:
 
     def _on_map_mode_change(self, *_args: Any) -> None:
         self.map_mode = self.map_mode_var.get()
+        if self.map_mode != LIVE_MAP:
+            self._stop_radar_playback(redraw=False)
+        self._update_radar_replay_button()
         self.radar_product_combo.configure(
             state="readonly" if self.map_mode == LIVE_MAP else "disabled"
         )
@@ -3373,6 +3957,7 @@ class StormRadarApp:
 
     async def _load_storm_outlook(self) -> None:
         load_started = time_module.perf_counter()
+        general_weather_outlook: list[dict[str, Any]] = []
         try:
             outlook, issued_at = await self.loop.run_in_executor(
                 self.executor,
@@ -3380,6 +3965,7 @@ class StormRadarApp:
                 self.germany_outline,
                 self.supabase,
                 not self._outlook_use_local_feed,
+                general_weather_outlook,
             )
         except Exception as error:
             self._storm_outlook_loading = False
@@ -3399,6 +3985,7 @@ class StormRadarApp:
                 self._draw_map()
             return
         self._storm_outlook = outlook
+        self._general_weather_outlook = general_weather_outlook
         self._storm_outlook_loaded_at = issued_at
         self._storm_outlook_loading = False
         self._storm_outlook_error = None
@@ -3458,24 +4045,6 @@ class StormRadarApp:
             lambda: self._start_warning_refresh(key),
         )
 
-    def radar_playback_button(self) -> None:
-        if self._radar_playback_after_id is not None:
-            self.root.after_cancel(self._radar_playback_after_id)
-            self._radar_playback_after_id = None
-            self.radar_playback_button.configure(text="▶ Play radar")
-        else:
-            self.radar_playback_button.configure(text="⏸ Pause radar")
-            self._radar_playback_after_id = self.root.after(
-                1000,
-                self._advance_radar_frame,
-            )
-        playback_interval = 1000 if self._radar_playback_after_id is not None else 0
-        if playback_interval > 0:
-            self._radar_playback_after_id = self.root.after(
-                playback_interval,
-                self._advance_radar_frame,
-            )
-
     def file_report_button(self) -> None:
         cell = self.selected_cell
         if not isinstance(cell, StormCell):
@@ -3516,7 +4085,7 @@ class StormRadarApp:
             anchor="w",
             pady=(6, 4),
         )
-        submit_button = ttk.Button(
+        submit_button = AppButton(
             frame,
             text="Submit report",
             command=lambda: self._submit_report(
@@ -3534,7 +4103,7 @@ class StormRadarApp:
         cell: StormCell,
         report: str,
         dialog: tk.Toplevel,
-        submit_button: ttk.Button,
+        submit_button: AppButton,
         status_text: tk.StringVar,
     ) -> None:
         report = report.strip()
@@ -3566,7 +4135,7 @@ class StormRadarApp:
         cell: StormCell,
         report: str,
         dialog: tk.Toplevel,
-        submit_button: ttk.Button,
+        submit_button: AppButton,
         status_text: tk.StringVar,
     ) -> None:
         client = self.supabase
@@ -4280,6 +4849,7 @@ class StormRadarApp:
         if self._closed:
             return
         _terminal_progress("App", "Stopping background tasks and closing StormChase.")
+        self._stop_radar_playback(redraw=False)
         self._closed = True
         if self._basemap_after_id is not None:
             self.root.after_cancel(self._basemap_after_id)
