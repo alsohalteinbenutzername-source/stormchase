@@ -41,7 +41,12 @@ class CaseAnalysisStore:
 
     def __init__(self, path: str | Path | None = None) -> None:
         if path is None:
-            root = Path(os.getenv("LOCALAPPDATA") or (Path.home() / ".stormchase"))
+            local_app_data = os.getenv("LOCALAPPDATA")
+            root = (
+                Path(local_app_data) / "StormChase"
+                if local_app_data
+                else Path.home() / ".stormchase"
+            )
             root.mkdir(parents=True, exist_ok=True)
             path = root / "analysis.sqlite3"
         self.path = Path(path)
@@ -166,8 +171,9 @@ class CaseAnalysisStore:
 
                 active_case = None
                 if previous is not None:
-                    previous_time = datetime.fromisoformat(previous["observed_at"])
-                    if stamp - _utc(previous_time) <= timedelta(minutes=45):
+                    previous_time = _utc(datetime.fromisoformat(previous["observed_at"]))
+                    elapsed = stamp - previous_time
+                    if timedelta(0) <= elapsed <= timedelta(minutes=45):
                         active_case = connection.execute(
                             "SELECT * FROM cell_cases WHERE case_id = ?",
                             (previous["case_id"],),
@@ -272,6 +278,7 @@ class CaseAnalysisStore:
             # Keep this local analysis database bounded without deleting case summaries.
             retention = (stamp - timedelta(days=45)).isoformat()
             connection.execute("DELETE FROM cell_observations WHERE observed_at < ?", (retention,))
+            connection.execute("DELETE FROM cell_cases WHERE last_seen < ?", (retention,))
             connection.execute(
                 "DELETE FROM cell_forecasts WHERE issued_at < ? AND verified_at IS NOT NULL",
                 (retention,),
