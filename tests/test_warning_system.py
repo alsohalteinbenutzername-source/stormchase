@@ -23,7 +23,7 @@ class WarningLevelTests(unittest.TestCase):
     def test_tornado_escalation_requires_confirmation_for_catastrophic_tier(self) -> None:
         self.assertEqual(warning_level("tornado", 2).tag, "CONSIDERABLE / PDS WORDING")
         self.assertEqual(warning_level("tornado", 3).tag, "CATASTROPHIC / TORNADO EMERGENCY CRITERIA")
-        with self.assertRaisesRegex(ValueError, "reliable-confirmation"):
+        with self.assertRaisesRegex(ValueError, "catastrophic-impact"):
             validate_warning_payload(
                 "tornado", 3, [[8, 50], [9, 50], [9, 51]],
                 "Catastrophic tornado threat", "Confirmed catastrophic threat",
