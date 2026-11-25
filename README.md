@@ -262,6 +262,77 @@ database-client tests use mocked responses. Verify the live project after
 deploying the SQL and configuring the publisher; those services are not
 available to the local test suite.
 
+## Case analysis and community warnings
+
+The **Case analysis** tab keeps a local SQLite history at
+`%LOCALAPPDATA%/StormChase/analysis.sqlite3` (or `~/.stormchase/`). It tracks
+cell reflectivity and movement, stores existing cell-motion projections,
+verifies those projections against later KONRAD3D observations, and reports
+position, heading and speed errors. It also provides a simple historical-case
+similarity view and a local storm-event timeline. These features use already
+loaded observations and forecast data; they do not add weather-provider API
+requests. Historical similarity is a reflectivity/path-length/duration heuristic,
+not a forecast probability or a validated meteorological analogue model.
+
+In velocity mode, StormChase can draw approximate 0.5, 1, 2 and 3 km
+radar-beam-centre rings when the DWD ODIM metadata contains the scan elevation
+angle and radar-site location. They use a 4/3-Earth propagation approximation,
+are relative to the radar site, and are not terrain-corrected AGL heights or a
+guarantee of signal coverage. Missing metadata means the overlay is omitted.
+
+### Warning-admin setup
+
+Run [`supabase/007_warning_admin_and_moderation.sql`](./supabase/007_warning_admin_and_moderation.sql)
+after migrations 001 and 004. It creates the public read-only warning feed,
+database-enforced admin-only issue/cancel permissions, warning audit records,
+report-verification states (`unverified`, `under_review`, `corroborated`,
+`rejected`), report-review audit records, and a five-minute warning-expiry job.
+
+To grant warning-issuer/moderator access, the Supabase project owner should
+find the user's UUID under **Authentication → Users** after that user has signed
+into StormChase once, then run the following in the SQL editor:
+
+```sql
+insert into public.stormchase_admins (user_id)
+values ('AUTH_USER_UUID')
+on conflict (user_id) do nothing;
+```
+
+Only the project owner should run this statement. Membership is checked by a
+database function and enforced again by Row Level Security. A local setting,
+username, or client-side flag cannot grant admin access. Never put a Supabase
+`service_role` key in the desktop app.
+
+### Community-warning severity levels
+
+These are display tiers for **unofficial StormChase community polygons**, not
+official DWD/NWS warnings or a German legal warning scale:
+
+- **Damaging wind:** NWS severe-thunderstorm Base (58 mph / 93 km/h),
+  Considerable (70 mph / 113 km/h), and Destructive (80 mph / 129 km/h).
+- **Hail:** NWS Base (1.00 in / 25 mm), Considerable (1.75 in / 44 mm),
+  and Destructive (2.75 in / 70 mm).
+- **Tornado:** NWS Base, Considerable/PDS, and Catastrophic/Tornado Emergency.
+  The highest tier requires explicit confirmation of reliable evidence and
+  catastrophic impacts. NWS operational guidance also requires supervisor/team
+  concurrence; StormChase cannot reproduce that official authorization process
+  and does not issue an NWS Tornado Emergency.
+- **Heavy rain:** StormChase levels 1–3 map to DWD Warnstufen 2–4:
+  15–25 mm/1 h or 20–35 mm/6 h; 25–40 mm/1 h or 35–60 mm/6 h;
+  >40 mm/1 h or >60 mm/6 h.
+
+The NWS severe-thunderstorm criteria are US warning standards adapted for a
+community display; they are not DWD criteria. Community polygons may be delayed
+or incomplete and must never replace DWD WarnWetter, official warnings, or
+instructions from local authorities. The Admin tab requires database-authorized
+membership. Administrators draw polygons by clicking at least three distinct
+vertices on the live or DWD warning map, choose a hazard level and expiry, and
+publish the polygon to the shared feed. Warnings expire automatically;
+cancellations and report reviews are audited.
+
+Official criteria references: [NWS severe-thunderstorm damage-threat categories](https://www.weather.gov/lot/SevereThunderstormWarningsUpdate),
+[NWS tornado impact-based warnings](https://www.weather.gov/media/impacts/Tornado-IBW.pdf),
+and [DWD warning criteria](https://www.dwd.de/warnkriterien).
 ## Location privacy
 
 Device location is off by default. Select **Enable device location**, accept the

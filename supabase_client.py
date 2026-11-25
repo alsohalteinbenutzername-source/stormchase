@@ -985,7 +985,7 @@ class SupabaseClient:
             rows = self._table_rows(
                 "storm_reports",
                 {
-                    "select": "id,reporter_username,cell_id,latitude,longitude,report,created_at",
+                    "select": "id,reporter_username,cell_id,latitude,longitude,report,created_at,verification_status,reviewed_at,review_note",
                     "order": "created_at.desc",
                     "limit": str(limit),
                 },
@@ -1029,3 +1029,116 @@ class SupabaseClient:
                     "it cannot be recovered."
                 )
             raise
+
+
+    def is_stormchase_admin(self) -> bool:
+        """Ask the database whether the current authenticated identity is an admin."""
+        token = self._access_token()
+        result = self._request(
+            "POST",
+            "/rest/v1/rpc/is_stormchase_admin",
+            payload={},
+            access_token=token,
+        )
+        if isinstance(result, bool):
+            return result
+        if isinstance(result, dict):
+            value = result.get("is_stormchase_admin")
+            return value is True
+        raise SupabaseError("Supabase returned an invalid admin-check response.")
+
+    def active_community_warnings(self, limit: int = 100) -> tuple[dict[str, Any], ...]:
+        if not 1 <= limit <= 250:
+            raise ValueError("Community warning limit must be between 1 and 250.")
+        rows = self._table_rows(
+            "storm_warnings",
+            {
+                "select": (
+                    "id,category,level,level_tag,headline,description,polygon,"
+                    "created_at,expires_at,status"
+                ),
+                "status": "eq.active",
+                "expires_at": f"gt.{datetime.now(timezone.utc).isoformat()}",
+                "order": "created_at.desc",
+                "limit": str(limit),
+            },
+        )
+        return tuple(rows)
+
+    def issue_community_warning(
+        self,
+        category: str,
+        level: int,
+        polygon: Any,
+        headline: str,
+        description: str,
+        expires_at: datetime,
+        *,
+        catastrophic_confirmed: bool = False,
+    ) -> None:
+        from warning_system import validate_warning_payload
+
+        user = self.current_user
+        if user is None:
+            raise SupabaseError("An authenticated identity is required to issue warnings.")
+        payload = validate_warning_payload(
+            category,
+            level,
+            polygon,
+            headline,
+            description,
+            expires_at,
+            catastrophic_confirmed=catastrophic_confirmed,
+        )
+        token = self._access_token()
+        if not self.is_stormchase_admin():
+            raise SupabaseError("This account is not authorized to issue community warnings.")
+        payload["created_by"] = user.identifier
+        self._request(
+            "POST",
+            "/rest/v1/storm_warnings",
+            payload=payload,
+            access_token=token,
+        )
+
+    def cancel_community_warning(self, warning_id: str) -> None:
+        if not warning_id or len(warning_id) > 64:
+            raise ValueError("A valid warning ID is required.")
+        token = self._access_token()
+        if not self.is_stormchase_admin():
+            raise SupabaseError("This account is not authorized to cancel community warnings.")
+        self._request(
+            "PATCH",
+            "/rest/v1/storm_warnings",
+            query={"id": f"eq.{warning_id}", "status": "eq.active"},
+            payload={"status": "cancelled"},
+            access_token=token,
+        )
+
+    def moderate_storm_report(
+        self,
+        report_id: str,
+        verification_status: str,
+        review_note: str = "",
+    ) -> None:
+        if not report_id or len(report_id) > 64:
+            raise ValueError("A valid report ID is required.")
+        if verification_status not in {
+            "unverified", "under_review", "corroborated", "rejected"
+        }:
+            raise ValueError("Unsupported community-report verification status.")
+        if len(review_note.strip()) > 500:
+            raise ValueError("Moderator notes must not exceed 500 characters.")
+        token = self._access_token()
+        if not self.is_stormchase_admin():
+            raise SupabaseError("This account is not authorized to moderate community reports.")
+        self._request(
+            "PATCH",
+            "/rest/v1/storm_reports",
+            query={"id": f"eq.{report_id}"},
+            payload={
+                "verification_status": verification_status,
+                "review_note": review_note.strip() or None,
+            },
+            access_token=token,
+        )

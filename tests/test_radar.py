@@ -99,6 +99,30 @@ class DecodeRadarFileTests(unittest.TestCase):
         )
         self.assertEqual((frame.xscale, frame.yscale), (0.5, 0.5))
 
+    def test_decodes_velocity_beam_and_station_metadata(self) -> None:
+        contents = BytesIO()
+        with h5py.File(contents, "w") as radar_file:
+            scan = radar_file.create_group("dataset1")
+            scan_where = scan.create_group("where")
+            scan_where.attrs["elangle"] = 0.5
+            scan_where.attrs["rscale"] = 1000.0
+            scan_where.attrs["rstart"] = 0.0
+            data_group = scan.create_group("data1")
+            data_group.create_dataset("data", data=np.ones((2, 2), dtype="u1"))
+            station_where = radar_file.create_group("where")
+            station_where.attrs["lat"] = 50.0
+            station_where.attrs["lon"] = 9.0
+            station_where.attrs["height"] = 250.0
+
+        frame = decode_radar_file(contents.getvalue())
+
+        self.assertEqual(frame.site_latitude, 50.0)
+        self.assertEqual(frame.site_longitude, 9.0)
+        self.assertEqual(frame.site_altitude_m, 250.0)
+        self.assertEqual(frame.elevation_angle_degrees, 0.5)
+        self.assertEqual(frame.range_scale_m, 1000.0)
+        self.assertEqual(frame.range_start_km, 0.0)
+
     def test_reprojects_projected_grid_for_geographic_map_display(self) -> None:
         frame = RadarFrame(
             np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32),
@@ -157,17 +181,19 @@ class NearestVelocityRadarSiteTests(unittest.TestCase):
 
 class RotationDetectionTests(unittest.TestCase):
     def test_detects_adjacent_velocity_couplet_and_returns_its_map_location(self) -> None:
-        velocity = np.zeros((5, 10), dtype=np.float32)
-        velocity[2:4, 0:5] = -20.0
-        velocity[2:4, 5:10] = 20.0
-        frame = RadarFrame(velocity, None, extent=(0.0, 10.0, 0.0, 5.0))
+        velocity = np.empty((5, 10), dtype=np.float32)
+        velocity[:, :5] = -20.0
+        velocity[:, 5:] = 20.0
+        # Use a compact, uniformly sampled couplet without a large zero-flow
+        # background that would merge into the local-residual lobes.
+        frame = RadarFrame(velocity, None, extent=(0.0, 0.015, 0.0, 0.005))
 
         detections = detect_rotations(frame)
 
         self.assertEqual(len(detections), 1)
         detection = detections[0]
-        self.assertAlmostEqual(detection.latitude, 2.0)
-        self.assertAlmostEqual(detection.longitude, 5.0)
+        self.assertAlmostEqual(detection.latitude, 0.0025)
+        self.assertAlmostEqual(detection.longitude, 0.0075)
         self.assertEqual(detection.negative_pixels, 10)
         self.assertEqual(detection.positive_pixels, 10)
         self.assertTrue(rotation_detection(frame))
