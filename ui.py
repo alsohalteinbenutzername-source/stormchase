@@ -1297,6 +1297,19 @@ class StormRadarApp:
             text="Set map location",
             command=self.set_manual_location,
         ).pack(fill="x")
+        self.measure_button = AppButton(
+            sidebar_content,
+            text="Measure distance",
+            command=self._toggle_measurement,
+        )
+        self.measure_button.pack(fill="x", pady=(6, 0))
+        ttk.Label(
+            sidebar_content,
+            textvariable=self.measure_status,
+            style="Status.TLabel",
+            wraplength=230,
+            justify="left",
+        ).pack(anchor="w", pady=(3, 0))
 
         ttk.Label(sidebar_content, text="STORM CELLS", style="Section.TLabel").pack(
             anchor="w", pady=(20, 7)
@@ -1444,18 +1457,6 @@ class StormRadarApp:
             text="RADAR REPLAY",
             style="Status.TLabel",
         ).pack(side="left", padx=(4, 10))
-        self.measure_button = AppButton(
-            replay_controls,
-            text="Measure distance",
-            width=132,
-            command=self._toggle_measurement,
-        )
-        self.measure_button.pack(side="left", padx=(0, 8))
-        ttk.Label(
-            replay_controls,
-            textvariable=self.measure_status,
-            style="Status.TLabel",
-        ).pack(side="left", padx=(0, 8))
         self.radar_replay_slider = ctk.CTkSlider(
             replay_controls,
             from_=0,
