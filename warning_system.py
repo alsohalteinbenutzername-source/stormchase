@@ -81,6 +81,37 @@ def validate_polygon(points: Any) -> list[list[float]]:
         ring.append(ring[0])
     if len(ring) < 4:
         raise ValueError("A warning polygon needs at least 3 distinct vertices.")
+    def orientation(a: list[float], b: list[float], c: list[float]) -> float:
+        return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+
+    def on_segment(a: list[float], b: list[float], point: list[float]) -> bool:
+        return (
+            min(a[0], b[0]) - 1e-10 <= point[0] <= max(a[0], b[0]) + 1e-10
+            and min(a[1], b[1]) - 1e-10 <= point[1] <= max(a[1], b[1]) + 1e-10
+        )
+
+    def intersects(a: list[float], b: list[float], c: list[float], d: list[float]) -> bool:
+        o1, o2 = orientation(a, b, c), orientation(a, b, d)
+        o3, o4 = orientation(c, d, a), orientation(c, d, b)
+        if (o1 > 1e-10 and o2 < -1e-10 or o1 < -1e-10 and o2 > 1e-10) and (
+            o3 > 1e-10 and o4 < -1e-10 or o3 < -1e-10 and o4 > 1e-10
+        ):
+            return True
+        return (
+            abs(o1) <= 1e-10 and on_segment(a, b, c)
+            or abs(o2) <= 1e-10 and on_segment(a, b, d)
+            or abs(o3) <= 1e-10 and on_segment(c, d, a)
+            or abs(o4) <= 1e-10 and on_segment(c, d, b)
+        )
+
+    segment_count = len(ring) - 1
+    for first in range(segment_count):
+        for second in range(first + 1, segment_count):
+            if second == first + 1 or (first == 0 and second == segment_count - 1):
+                continue
+            if intersects(ring[first], ring[first + 1], ring[second], ring[second + 1]):
+                raise ValueError("Polygon edges must not cross or touch non-adjacent edges.")
+
     area_twice = sum(
         ring[index][0] * ring[index + 1][1] - ring[index + 1][0] * ring[index][1]
         for index in range(len(ring) - 1)
