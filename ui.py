@@ -113,6 +113,7 @@ THREAT_PROBABILITIES = {
     "Wind": ((20, 2), (30, 5), (40, 10), (50, 15), (60, 30), (70, 45)),
 }
 OUTLOOK_PARAMETER_SCALES = {"STP": 10.0, "SCP": 25.0}
+GENERAL_WEATHER_MAP_METRIC = "Precip chance"
 
 
 def _format_optional_parameter(value: Any) -> str:
@@ -143,6 +144,7 @@ def germany_grid_points(outlines: tuple[tuple[tuple[float, float], ...], ...], s
 def calculate_germany_outlook(
     outlines: tuple[tuple[tuple[float, float], ...], ...],
     supabase: SupabaseClient | None = None,
+    use_shared_outlook: bool = True,
 ) -> tuple[list[dict[str, Any]], datetime]:
     from weather_api import (
         OPTIONAL_STORMANALYZER_HOURLY_FIELDS,
@@ -156,12 +158,12 @@ def calculate_germany_outlook(
     cached_outlook = None
     general_weather_grid = None
     if supabase is not None:
-        cached_outlook = supabase.daily_outlook_grid(now.date())
-        if cached_outlook is not None:
-            try:
-                general_weather_grid = supabase.daily_general_weather_grid(now.date())
-            except SupabaseError as error:
-                print(f"WARNING: Shared general-weather analysis is unavailable: {error}")
+        if use_shared_outlook:
+            cached_outlook = supabase.daily_outlook_grid(now.date())
+        try:
+            general_weather_grid = supabase.daily_general_weather_grid(now.date())
+        except SupabaseError as error:
+            print(f"WARNING: Shared general-weather data is unavailable: {error}")
 
     if cached_outlook is None:
         weather = get_germany_grid_weather(points)
@@ -1114,8 +1116,11 @@ class StormRadarApp:
         self.outlook_day_var.trace_add("write", self._on_outlook_selection_change)
         self.outlook_metric_combo = ttk.Combobox(
             map_toolbar, textvariable=self.outlook_metric_var,
-            values=("Overall risk", "Tornado", "Hail", "Wind", "STP", "SCP"),
-            state="readonly", width=12,
+            values=(
+                "Overall risk", "Tornado", "Hail", "Wind", "STP", "SCP",
+                GENERAL_WEATHER_MAP_METRIC,
+            ),
+            state="readonly", width=14,
         )
         self.outlook_metric_combo.pack(side="left", padx=(5, 0))
         self.outlook_metric_var.trace_add("write", self._on_outlook_selection_change)
@@ -1325,6 +1330,24 @@ class StormRadarApp:
             wraplength=900,
         ).pack(anchor="w", fill="x")
 
+        general_weather_box = ttk.LabelFrame(
+            content,
+            text="General weather",
+            style="Panel.TLabelframe",
+            padding=8,
+        )
+        general_weather_box.pack(fill="x", pady=(0, 10))
+        self.general_weather_text = tk.StringVar(
+            value="General-weather forecast will appear here when available."
+        )
+        ttk.Label(
+            general_weather_box,
+            textvariable=self.general_weather_text,
+            style="Panel.TLabel",
+            justify="left",
+            wraplength=900,
+        ).pack(anchor="w", fill="x")
+
         manual_box = ttk.LabelFrame(
             content,
             text="Manual environment calculation",
@@ -1503,6 +1526,9 @@ class StormRadarApp:
     def _clear_outlook_calculation(self, message: str) -> None:
         self._outlook_location = None
         self.outlook_calculation_text.set(message)
+        self.general_weather_text.set(
+            "Enter coordinates or enable device location to show the general-weather forecast."
+        )
 
     def _calculate_manual_outlook(self) -> None:
         try:
@@ -1562,32 +1588,45 @@ class StormRadarApp:
                 f"No calculation is available for Day {self._outlook_day + 1} at "
                 f"{latitude:.2f}° N, {longitude:.2f}° E yet."
             )
+            self.general_weather_text.set(
+                f"No general-weather forecast is available for Day {self._outlook_day + 1} yet."
+            )
+            if self._storm_outlook_loaded_at is None and not self._storm_outlook_loading:
+                self._ensure_storm_outlook()
             return
 
         environment = entry["environment"]
         threats = ", ".join(entry["threats"]) or "No specific severe-weather threats indicated"
         criticism = "\n".join(entry["criticism"]) or "No additional assessment notes."
-        general_weather_text = ""
         general_weather = entry.get("general_weather")
         analysis = general_weather.get("analysis") if isinstance(general_weather, dict) else None
         if isinstance(analysis, dict):
             probability = analysis.get("precipitation_probability_percent")
             probability_text = (
-                f"{probability:.0f}% precipitation chance"
+                f"{probability:.0f}%"
                 if isinstance(probability, (int, float))
-                else "precipitation chance unavailable"
+                else "unavailable"
             )
             rain_text = "Rain likely" if analysis.get("rain_likely") else "Rain not indicated"
             if analysis.get("snow_likely"):
-                frozen_text = " · Snow likely"
+                frozen_text = "Snow likely"
             elif analysis.get("frozen_precipitation_likely"):
-                frozen_text = " · Frozen precipitation likely"
+                frozen_text = "Frozen precipitation likely"
             else:
-                frozen_text = ""
-            general_weather_text = (
-                f"General weather: {analysis.get('headline', analysis.get('condition', 'Unavailable'))} · "
-                f"{analysis.get('condition', 'Unavailable')} · {probability_text} · {rain_text}"
-                f"{frozen_text}\n"
+                frozen_text = "No frozen precipitation indicated"
+            self.general_weather_text.set(
+                f"{analysis.get('headline', analysis.get('condition', 'Unavailable'))} · "
+                f"{analysis.get('condition', 'Unavailable')}\n"
+                f"Precipitation chance: {probability_text} · {rain_text} · {frozen_text}\n"
+                f"High / low: {_format_optional_parameter(general_weather.get('temperature_max_c'))} / "
+                f"{_format_optional_parameter(general_weather.get('temperature_min_c'))} °C · "
+                f"Total precipitation: {_format_optional_parameter(general_weather.get('precipitation_sum_mm'))} mm · "
+                f"Rain: {_format_optional_parameter(general_weather.get('rain_sum_mm'))} mm · "
+                f"Wind max: {_format_optional_parameter(general_weather.get('wind_speed_max_kmh'))} km/h"
+            )
+        else:
+            self.general_weather_text.set(
+                "The published general-weather forecast is unavailable for this point and day."
             )
         self.outlook_calculation_text.set(
             f"Day {self._outlook_day + 1} · nearest forecast grid point "
@@ -1601,7 +1640,6 @@ class StormRadarApp:
             f"Full-profile SRH {environment['srh']} m²/s² · "
             f"Deep shear {environment['high_shear']} kt · "
             f"Low-level shear {environment['low_shear']} kt\n"
-            f"{general_weather_text}"
             f"Near-surface: 0–1 km SRH {environment['srh_0_1km']:.0f} · "
             f"0–3 km SRH {environment['srh_0_3km']:.0f} · "
             f"efficiency {environment['srh_efficiency']:.2f} · "
@@ -2267,7 +2305,17 @@ class StormRadarApp:
             )
 
     def _draw_outlook_legend(self) -> None:
-        if self._outlook_metric in OUTLOOK_PARAMETER_SCALES:
+        if self._outlook_metric == GENERAL_WEATHER_MAP_METRIC:
+            maximum = 100.0
+            levels = np.linspace(0.0, maximum, len(OUTLOOK_COLORS) + 1)
+            labels = [
+                f"{levels[index]:.0f}–<{levels[index + 1]:.0f}%"
+                for index in range(len(levels) - 2)
+            ]
+            labels.append(f"{levels[-2]:.0f}–{maximum:.0f}%")
+            colors = OUTLOOK_COLORS
+            title = f"{self.outlook_day_var.get()} · General weather precipitation chance"
+        elif self._outlook_metric in OUTLOOK_PARAMETER_SCALES:
             maximum = OUTLOOK_PARAMETER_SCALES[self._outlook_metric]
             levels = np.linspace(0.0, maximum, len(OUTLOOK_COLORS) + 1)
             labels = [
@@ -2384,6 +2432,7 @@ class StormRadarApp:
         if outlook_mode and self._storm_outlook:
             day = self._outlook_day
             entries = [entry for entry in self._storm_outlook if entry["day"] == day]
+            general_weather_metric = self._outlook_metric == GENERAL_WEATHER_MAP_METRIC
             metric_key = {
                 "Overall risk": "risk",
                 "Tornado": "tornado",
@@ -2391,16 +2440,29 @@ class StormRadarApp:
                 "Wind": "wind",
                 "STP": "stp",
                 "SCP": "scp",
-            }[self._outlook_metric]
-            parameter_scale = OUTLOOK_PARAMETER_SCALES.get(self._outlook_metric)
+            }.get(self._outlook_metric)
+            parameter_scale = (
+                100.0
+                if general_weather_metric
+                else OUTLOOK_PARAMETER_SCALES.get(self._outlook_metric)
+            )
             parameter_values: list[float] = []
             if parameter_scale is not None:
                 available_entries = []
                 for entry in entries:
-                    environment = entry.get("environment")
-                    if not isinstance(environment, dict):
+                    source = (
+                        entry.get("general_weather")
+                        if general_weather_metric
+                        else entry.get("environment")
+                    )
+                    if not isinstance(source, dict):
                         continue
-                    value = environment.get(metric_key)
+                    value_key = (
+                        "precipitation_probability_max_percent"
+                        if general_weather_metric
+                        else metric_key
+                    )
+                    value = source.get(value_key)
                     try:
                         numeric_value = float(value)
                     except (TypeError, ValueError):
@@ -2432,7 +2494,9 @@ class StormRadarApp:
                     scores = np.minimum(scores, np.nextafter(parameter_scale, 0.0))
                     level_colors = OUTLOOK_COLORS
                     contour_options: dict[str, Any] = {}
-                    minimum_to_render = score_levels[1]
+                    minimum_to_render = (
+                        0.0 if general_weather_metric else score_levels[1]
+                    )
                 elif metric_key == "risk":
                     score_levels = (-1, *OVERALL_LEVELS, 101)
                     level_colors = ("#ffffff", *OUTLOOK_COLORS[1:])
@@ -3113,7 +3177,8 @@ class StormRadarApp:
                 self.executor,
                 calculate_germany_outlook,
                 self.germany_outline,
-                None if self._outlook_use_local_feed else self.supabase,
+                self.supabase,
+                not self._outlook_use_local_feed,
             )
         except Exception as error:
             self._storm_outlook_loading = False
@@ -3124,6 +3189,9 @@ class StormRadarApp:
                 self.outlook_calculation_text.set(
                     f"StormAnalyzer outlook calculation unavailable: "
                     f"{self._storm_outlook_error}"
+                )
+                self.general_weather_text.set(
+                    f"General-weather outlook unavailable: {self._storm_outlook_error}"
                 )
             if self.map_mode == STORMANALYZER_MAP:
                 self._draw_map()
