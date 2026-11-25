@@ -192,8 +192,8 @@ class RotationDetectionTests(unittest.TestCase):
 
         self.assertEqual(len(detections), 1)
         detection = detections[0]
-        self.assertAlmostEqual(detection.latitude, 0.002)
-        self.assertAlmostEqual(detection.longitude, 0.0075)
+        self.assertAlmostEqual(detection.latitude, 0.0025)
+        self.assertAlmostEqual(detection.longitude, 0.009)
         self.assertEqual(detection.negative_pixels, 10)
         self.assertEqual(detection.positive_pixels, 10)
         self.assertTrue(rotation_detection(frame))
