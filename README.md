@@ -120,15 +120,14 @@ cell-motion wind projections continue to use live third-party requests. When
 configured, Supabase also supplies shared KONRAD3D tracking/prediction
 snapshots and authenticated community-report features.
 
-The separate general-weather analysis loads today's 744-point ICON-D2
-environment from the daily outlook tables, fetches matching daily weather
-extras from Open-Meteo, and combines them with StormAnalyzer. It stores two
-days of WMO-coded conditions, precipitation and rain probabilities, amounts,
-temperatures, wind, sunrise/sunset, UV index, and analysis in
-`general_weather_forecasts` and `general_weather_forecast_points`. The analysis
-uses WMO conditions, precipitation probability, and the ICON-D2 CAPE, wind,
-temperature, humidity, and precipitation environment to estimate whether rain,
-frozen precipitation, or a thunderstorm signal is likely.
+The separate publisher fetches two days of Open-Meteo weather extras and stores
+the raw WMO codes, precipitation probabilities and amounts, temperatures,
+wind, sunrise/sunset, and UV index in `general_weather_forecasts` and
+`general_weather_forecast_points`. The desktop loads those values alongside
+the ICON-D2 environment from the daily outlook tables, then runs StormAnalyzer
+locally for the selected grid point. It combines the WMO condition and
+precipitation guidance with ICON-D2 CAPE, CIN, wind, temperature, humidity, and
+precipitation to estimate rain, snowfall, freezing-rain, and thunderstorm signals.
 
 1. In the Supabase SQL editor, run
    [`supabase/001_stormchase_schema.sql`](./supabase/001_stormchase_schema.sql).

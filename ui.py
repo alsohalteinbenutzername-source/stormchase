@@ -66,6 +66,7 @@ from calculations import (
     calculate_manual_storm,
     nearest_outlook_entry,
 )
+from stormanalyzer import analyze_general_weather, summarize_daily_outlook_environment
 
 
 BACKGROUND = "#101820"
@@ -252,7 +253,27 @@ def calculate_germany_outlook(
                         None,
                     )
                     if general_day is not None:
-                        best_by_day[day]["general_weather"] = general_day
+                        try:
+                            local_environment = summarize_daily_outlook_environment(
+                                hourly,
+                                target_date,
+                            )
+                        except ValueError as error:
+                            print(
+                                "WARNING: Could not summarize ICON-D2 environment "
+                                f"for local weather analysis: {error}"
+                            )
+                        else:
+                            local_weather = dict(general_day)
+                            local_weather["environment"] = local_environment
+                            local_weather["analysis"] = analyze_general_weather(
+                                local_environment,
+                                local_weather,
+                            )
+                            local_weather["weather_description"] = (
+                                local_weather["analysis"]["condition"]
+                            )
+                            best_by_day[day]["general_weather"] = local_weather
         outlook.extend({**entry, "day": day} for day, entry in best_by_day.items())
     return outlook, issued_at
 
@@ -1557,11 +1578,12 @@ class StormRadarApp:
                 else "precipitation chance unavailable"
             )
             rain_text = "Rain likely" if analysis.get("rain_likely") else "Rain not indicated"
-            frozen_text = (
-                " · Frozen precipitation likely"
-                if analysis.get("frozen_precipitation_likely")
-                else ""
-            )
+            if analysis.get("snow_likely"):
+                frozen_text = " · Snow likely"
+            elif analysis.get("frozen_precipitation_likely"):
+                frozen_text = " · Frozen precipitation likely"
+            else:
+                frozen_text = ""
             general_weather_text = (
                 f"General weather: {analysis.get('headline', analysis.get('condition', 'Unavailable'))} · "
                 f"{analysis.get('condition', 'Unavailable')} · {probability_text} · {rain_text}"

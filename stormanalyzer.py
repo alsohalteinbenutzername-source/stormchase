@@ -21,22 +21,23 @@ WMO_WEATHER_DESCRIPTIONS = {
     65: "Heavy rain",
     66: "Light freezing rain",
     67: "Heavy freezing rain",
-    71: "Light frozen precipitation",
-    73: "Moderate frozen precipitation",
-    75: "Heavy frozen precipitation",
+    71: "Slight snowfall",
+    73: "Moderate snowfall",
+    75: "Heavy snowfall",
     77: "Ice grains",
     80: "Slight rain showers",
     81: "Moderate rain showers",
     82: "Heavy rain showers",
-    85: "Light frozen showers",
-    86: "Heavy frozen showers",
+    85: "Slight snow showers",
+    86: "Heavy snow showers",
     95: "Thunderstorm",
     96: "Thunderstorm with slight hail",
     97: "Heavy thunderstorm",
     99: "Heavy thunderstorm with hail",
 }
 _RAIN_CODES = frozenset((51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 80, 81, 82, 95, 96, 97, 99))
-_FROZEN_PRECIPITATION_CODES = frozenset((71, 73, 75, 77, 85, 86))
+_SNOW_CODES = frozenset((71, 73, 75, 77, 85, 86))
+_FREEZING_RAIN_CODES = frozenset((56, 57, 66, 67))
 _THUNDERSTORM_CODES = frozenset((95, 96, 97, 99))
 
 
@@ -46,6 +47,49 @@ def _finite_score_value(value):
     except (TypeError, ValueError):
         return None
     return result if math.isfinite(result) else None
+
+
+def summarize_daily_outlook_environment(hourly, forecast_date):
+    """Summarize ICON-D2 hourly fields for local general-weather analysis."""
+    times = hourly.get("time") if isinstance(hourly, dict) else None
+    if not isinstance(times, list):
+        raise ValueError("The shared outlook has no hourly timestamps.")
+    indices = [
+        index
+        for index, timestamp in enumerate(times)
+        if isinstance(timestamp, str) and timestamp[:10] == forecast_date
+    ]
+    if not indices:
+        raise ValueError(f"The shared outlook has no hours for {forecast_date}.")
+
+    def values_for(field):
+        values = hourly.get(field)
+        if not isinstance(values, list) or len(values) != len(times):
+            raise ValueError(f"The shared outlook is missing hourly {field} data.")
+        return [
+            numeric
+            for index in indices
+            if (numeric := _finite_score_value(values[index])) is not None
+        ]
+
+    cape = values_for("cape")
+    cin = values_for("cin")
+    temperatures = values_for("temperature_2m")
+    precipitation = values_for("precipitation")
+    wind = values_for("wind_speed_10m")
+    humidity = values_for("relative_humidity_2m")
+    return {
+        "cape_max_jkg": max(cape) if cape else None,
+        "cin_min_jkg": min(cin) if cin else None,
+        "temperature_min_c": min(temperatures) if temperatures else None,
+        "temperature_max_c": max(temperatures) if temperatures else None,
+        "precipitation_sum_mm": sum(precipitation) if precipitation else None,
+        "precipitation_hours": sum(value >= 0.1 for value in precipitation),
+        "wind_speed_max_kmh": max(wind) if wind else None,
+        "relative_humidity_mean_percent": (
+            sum(humidity) / len(humidity) if humidity else None
+        ),
+    }
 
 
 def analyze_general_weather(environment, weather):
@@ -104,8 +148,18 @@ def analyze_general_weather(environment, weather):
         if weather_code is not None
         else False
     )
+    snow_likely = (
+        weather_code in _SNOW_CODES
+        and (
+            probability is None
+            or probability >= 40.0
+            or (measurable_precipitation is not None and measurable_precipitation >= 1.0)
+        )
+        if weather_code is not None
+        else False
+    )
     frozen_precipitation_likely = (
-        weather_code in _FROZEN_PRECIPITATION_CODES
+        weather_code in _FREEZING_RAIN_CODES
         and (
             probability is None
             or probability >= 40.0
@@ -116,6 +170,7 @@ def analyze_general_weather(environment, weather):
     )
     if (
         not frozen_precipitation_likely
+        and not snow_likely
         and max_temperature is not None
         and max_temperature <= 0.0
         and precipitation_likely
@@ -136,6 +191,8 @@ def analyze_general_weather(environment, weather):
 
     if thunderstorm_signal:
         headline = "Thunderstorm signal"
+    elif snow_likely:
+        headline = "Snow likely"
     elif frozen_precipitation_likely:
         headline = "Frozen precipitation likely"
     elif rain_likely:
@@ -156,6 +213,7 @@ def analyze_general_weather(environment, weather):
         "precipitation_probability_percent": probability,
         "precipitation_likely": precipitation_likely,
         "rain_likely": rain_likely,
+        "snow_likely": snow_likely,
         "frozen_precipitation_likely": frozen_precipitation_likely,
         "thunderstorm_signal": thunderstorm_signal,
         "strong_wind_signal": strong_wind_signal,
