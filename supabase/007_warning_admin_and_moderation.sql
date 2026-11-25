@@ -67,7 +67,7 @@ create table if not exists public.storm_warnings (
         or (category = 'tornado' and threshold is null)
         or (category = 'heavy_rain' and (
             (level = 1 and threshold = '15–25 mm/1 h or 20–35 mm/6 h')
-            or (level = 2 and threshold = '>25–40 mm/1 h or >35–60 mm/6 h')
+            or (level = 2 and threshold = '25–40 mm/1 h or 35–60 mm/6 h')
             or (level = 3 and threshold = '>40 mm/1 h or >60 mm/6 h')
         ))
     ),
@@ -84,8 +84,8 @@ create table if not exists public.storm_warnings (
         ))
         or (category = 'tornado' and (
             (level = 1 and level_tag = 'BASE')
-            or (level = 2 and level_tag = 'CONSIDERABLE / PDS WORDING')
-            or (level = 3 and level_tag = 'CATASTROPHIC / TORNADO EMERGENCY CRITERIA')
+            or (level = 2 and level_tag = 'CONSIDERABLE')
+            or (level = 3 and level_tag = 'CATASTROPHIC')
         ))
         or (category = 'heavy_rain' and (
             (level = 1 and level_tag = 'DWD LEVEL 2')
