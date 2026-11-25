@@ -265,7 +265,7 @@ available to the local test suite.
 ## Case analysis and community warnings
 
 The **Case analysis** tab keeps a local SQLite history at
-`%LOCALAPPDATA%\\StormChase\\analysis.sqlite3` (or `~/.stormchase/`). It tracks
+`%LOCALAPPDATA%/StormChase/analysis.sqlite3` (or `~/.stormchase/`). It tracks
 cell reflectivity and movement, stores existing cell-motion projections,
 verifies those projections against later KONRAD3D observations, and reports
 position, heading and speed errors. It also provides a simple historical-case
