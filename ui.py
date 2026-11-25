@@ -1945,7 +1945,20 @@ class StormRadarApp:
     def _populate_admin_warning_list(self) -> None:
         if not hasattr(self, "admin_warning_list"):
             return
-        self._admin_warning_rows = tuple(self.active_community_warnings)
+        now = datetime.now(timezone.utc)
+        visible_warnings = []
+        for warning in self.active_community_warnings:
+            try:
+                expiry = datetime.fromisoformat(
+                    str(warning.get("expires_at", "")).replace("Z", "+00:00")
+                )
+                if expiry.tzinfo is None:
+                    expiry = expiry.replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError):
+                continue
+            if expiry > now:
+                visible_warnings.append(warning)
+        self._admin_warning_rows = tuple(visible_warnings)
         self.admin_warning_list.delete(0, tk.END)
         for warning in self._admin_warning_rows:
             category = WARNING_CATEGORY_LABELS.get(warning.get("category"), "Warning")
@@ -3126,6 +3139,14 @@ class StormRadarApp:
             else:
                 radar_frame = radar_result
                 self.radar_frame = radar_frame
+                if radar_frame.timestamp is not None:
+                    self.case_analysis.record_event(
+                        "radar_scan",
+                        f"reflectivity:{radar_frame.timestamp.isoformat()}",
+                        radar_frame.timestamp,
+                        "DWD reflectivity volume received",
+                        source="DWD radar",
+                    )
                 self._record_source_success(
                     "DWD reflectivity",
                     observed_at=radar_frame.timestamp,
@@ -4181,6 +4202,13 @@ class StormRadarApp:
                 if category not in WARNING_COLORS:
                     continue
                 try:
+                    expiry = datetime.fromisoformat(
+                        str(warning.get("expires_at", "")).replace("Z", "+00:00")
+                    )
+                    if expiry.tzinfo is None:
+                        expiry = expiry.replace(tzinfo=timezone.utc)
+                    if expiry <= datetime.now(timezone.utc):
+                        continue
                     vertices = warning.get("polygon")
                     if not isinstance(vertices, list) or len(vertices) < 4:
                         continue
