@@ -125,6 +125,11 @@ GENERAL_WEATHER_MAP_SCALES = {
 }
 
 
+def _terminal_progress(area: str, message: str) -> None:
+    timestamp = datetime.now().astimezone().strftime("%H:%M:%S")
+    print(f"[{timestamp}] [{area}] {message}", flush=True)
+
+
 def _format_optional_parameter(value: Any) -> str:
     try:
         numeric_value = float(value)
@@ -164,17 +169,40 @@ def calculate_germany_outlook(
 
     points = germany_grid_points(outlines)
     now = datetime.now(ZoneInfo("Europe/Berlin"))
+    calculation_started = time_module.perf_counter()
+    _terminal_progress(
+        "Outlook",
+        f"Starting a two-day calculation for {len(points)} locations.",
+    )
     cached_outlook = None
     general_weather_grid = None
     if supabase is not None:
         if use_shared_outlook:
+            _terminal_progress("Outlook", "Loading the shared ICON-D2 grid from Supabase.")
             cached_outlook = supabase.daily_outlook_grid(now.date())
+            _terminal_progress(
+                "Outlook",
+                "Shared ICON-D2 grid loaded."
+                if cached_outlook is not None
+                else "No shared ICON-D2 grid was available.",
+            )
+        _terminal_progress("Outlook", "Loading published general-weather data from Supabase.")
         try:
             general_weather_grid = supabase.daily_general_weather_grid(now.date())
+            _terminal_progress(
+                "Outlook",
+                f"Loaded {len(general_weather_grid)} general-weather locations."
+                if general_weather_grid is not None
+                else "No published general-weather grid was available.",
+            )
         except SupabaseError as error:
-            print(f"WARNING: Shared general-weather data is unavailable: {error}")
+            _terminal_progress("Outlook", f"WARNING: General-weather data unavailable: {error}")
 
     if cached_outlook is None:
+        _terminal_progress(
+            "Outlook",
+            f"Fetching ICON-D2 environment locally for {len(points)} locations.",
+        )
         weather = get_germany_grid_weather(points)
         issued_at = now
         calculation_time = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -234,9 +262,18 @@ def calculate_germany_outlook(
             )
 
     validate_grid_profiles(weather)
+    _terminal_progress(
+        "Outlook",
+        f"Validated {len(weather)} environment profiles; calculating daily storm and weather scores.",
+    )
 
     outlook = []
     for point_index, ((latitude, longitude), location) in enumerate(zip(points, weather)):
+        if point_index % 100 == 0:
+            _terminal_progress(
+                "Outlook",
+                f"Analyzing location {point_index + 1}/{len(points)}.",
+            )
         best_by_day: dict[int, dict[str, Any]] = {}
         hourly = location.get("icon_d2")
         for day in range(2):
@@ -286,6 +323,11 @@ def calculate_germany_outlook(
                             )
                             best_by_day[day]["general_weather"] = local_weather
         outlook.extend({**entry, "day": day} for day, entry in best_by_day.items())
+    _terminal_progress(
+        "Outlook",
+        f"Analysis complete: {len(outlook)} day/location results in "
+        f"{time_module.perf_counter() - calculation_started:.1f}s.",
+    )
     return outlook, issued_at
 
 
@@ -821,6 +863,7 @@ class StormRadarApp:
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
+        _terminal_progress("App", "Starting StormChase and initializing local feeds.")
         self.root.title("StormChase | Live Storm Radar")
         self.root.geometry("1280x820")
         self.root.minsize(1000, 680)
@@ -891,6 +934,9 @@ class StormRadarApp:
         self._outlook_metric = "Overall risk"
         self._outlook_location: tuple[float, float] | None = None
         self._outlook_location_source: str | None = None
+        self._map_draw_started_at: float | None = None
+        self._map_draw_label: str | None = None
+        self._last_map_progress_at = 0.0
 
         self._build_ui()
         self.lightning_status.set("Blitzortung lightning: connecting")
@@ -910,9 +956,10 @@ class StormRadarApp:
         self._lightning_task = self.loop.create_task(
             stream_blitzortung_lightning(
                 self._on_lightning_strike,
-                self.lightning_status.set,
+                self._on_lightning_status,
             )
         )
+        _terminal_progress("App", "Startup complete; background refreshes are running.")
 
     def _build_ui(self) -> None:
         style = ttk.Style(self.root)
@@ -1177,6 +1224,7 @@ class StormRadarApp:
         self.map_canvas.mpl_connect("button_press_event", self._on_map_click)
         self.map_canvas.mpl_connect("scroll_event", self._on_map_scroll)
         self.map_canvas.mpl_connect("resize_event", self._on_map_resize)
+        self.map_canvas.mpl_connect("draw_event", self._on_map_draw_complete)
         report_panel = ttk.LabelFrame(
             map_panel,
             text="Details and community reports",
@@ -1525,6 +1573,10 @@ class StormRadarApp:
             return
 
         self._outlook_location_source = "manual"
+        _terminal_progress(
+            "Outlook",
+            f"Using manually selected location {latitude:.4f}, {longitude:.4f}.",
+        )
         self.outlook_location_status.set(
             f"Using manual coordinates: {latitude:.4f}, {longitude:.4f}"
         )
@@ -1721,6 +1773,7 @@ class StormRadarApp:
         self.radar_product_status.set(f"Velocity · {site.name}: loading…")
         if site_code in self._velocity_loading_sites:
             return
+        _terminal_progress("Radar", f"Requesting Doppler velocity for {site.name} ({site_code}).")
         self._velocity_loading_sites.add(site_code)
         self.loop.create_task(self._load_velocity_radar(site))
 
@@ -1741,14 +1794,17 @@ class StormRadarApp:
         if self._closed or self._refreshing:
             return
         self._refreshing = True
+        _terminal_progress("Refresh", "Starting radar, storm-tracking, and report refresh.")
         self.loop.create_task(self._load_weather_data())
         if self.radar_product == VELOCITY_RADAR and self.velocity_radar_site is not None:
             self._request_velocity_radar(self.velocity_radar_site)
 
     async def _load_weather_data(self) -> None:
+        refresh_started = time_module.perf_counter()
         reports_future = None
         try:
             client = self.supabase
+            _terminal_progress("Refresh", "Requesting the latest local DWD radar frame.")
             radar_future = self.loop.run_in_executor(
                 self.executor,
                 fetch_latest_radar,
@@ -1762,10 +1818,13 @@ class StormRadarApp:
                 )
                 else None
             )
+            if reports_future is not None:
+                _terminal_progress("Refresh", "Requesting community reports in parallel.")
 
             storm_error: BaseException | None = None
             if client is not None:
                 try:
+                    _terminal_progress("Refresh", "Checking Supabase for the latest storm tracks.")
                     storm_result = await self.loop.run_in_executor(
                         self.executor,
                         client.latest_storm_update,
@@ -1778,6 +1837,7 @@ class StormRadarApp:
 
             if storm_result is None:
                 try:
+                    _terminal_progress("Refresh", "Fetching storm tracks from the local DWD feed.")
                     storm_result = await self.loop.run_in_executor(
                         self.executor,
                         fetch_latest_storm_cells,
@@ -1788,6 +1848,11 @@ class StormRadarApp:
                             f"Supabase tracking lookup also failed: {storm_error}"
                         )
                     storm_result = error
+            elif not isinstance(storm_result, BaseException):
+                _terminal_progress(
+                    "Refresh",
+                    f"Loaded {len(storm_result.cells)} storm tracks from Supabase.",
+                )
 
             radar_result = await asyncio.gather(radar_future, return_exceptions=True)
             radar_result = radar_result[0]
@@ -1796,9 +1861,17 @@ class StormRadarApp:
 
             if isinstance(radar_result, BaseException):
                 errors.append(radar_result)
+                _terminal_progress(
+                    "Refresh",
+                    f"Radar request failed: {type(radar_result).__name__}: {radar_result}",
+                )
             elif radar_result is not None:
                 radar_frame = radar_result
                 self.radar_frame = radar_frame
+                _terminal_progress(
+                    "Refresh",
+                    f"Radar frame received at {self._format_time(radar_frame.timestamp)}; detecting rain echoes.",
+                )
                 try:
                     detected_cells = await self.loop.run_in_executor(
                         self.executor,
@@ -1812,6 +1885,10 @@ class StormRadarApp:
                         detected_cells,
                         radar_frame.timestamp,
                     )
+                    _terminal_progress(
+                        "Refresh",
+                        f"Rain-echo analysis complete: {len(self.rain_cells)} active cells.",
+                    )
                 if self.radar_product == REFLECTIVITY_RADAR:
                     self.radar_product_status.set(
                         self._radar_status_text(REFLECTIVITY_RADAR, radar_frame)
@@ -1819,12 +1896,20 @@ class StormRadarApp:
 
             if isinstance(storm_result, BaseException):
                 errors.append(storm_result)
+                _terminal_progress(
+                    "Refresh",
+                    f"Storm-track request failed: {type(storm_result).__name__}: {storm_result}",
+                )
             elif storm_result is not None:
                 self.storm_update = storm_result
                 self._remember_tracks(storm_result.cells)
                 try:
                     cells_without_forecast = tuple(
                         cell for cell in storm_result.cells if not cell.forecast
+                    )
+                    _terminal_progress(
+                        "Refresh",
+                        f"Projecting motion for {len(cells_without_forecast)} storm cells without forecasts.",
                     )
                     self.cell_motion_winds = await self.loop.run_in_executor(
                         self.executor,
@@ -1853,6 +1938,10 @@ class StormRadarApp:
                 else:
                     self.community_reports = reports_result
                     self._render_community_reports()
+                    _terminal_progress(
+                        "Refresh",
+                        f"Loaded {len(reports_result)} community reports.",
+                    )
             else:
                 self._render_community_reports()
 
@@ -1886,6 +1975,11 @@ class StormRadarApp:
             elif client is None:
                 tracking_status = " · Supabase reports/tracking not configured"
             if errors:
+                _terminal_progress(
+                    "Refresh",
+                    "Completed with errors: "
+                    + "; ".join(f"{type(error).__name__}: {error}" for error in errors),
+                )
                 self.status.set(
                     "Local data refresh failed: "
                     + "; ".join(
@@ -1934,8 +2028,17 @@ class StormRadarApp:
                         + wind_status
                         + tracking_status
                     )
+                _terminal_progress(
+                    "Refresh",
+                    f"Refresh complete in {time_module.perf_counter() - refresh_started:.1f}s; "
+                    f"{len(self.storm_update.cells)} storm cells and {len(self.rain_cells)} rain echoes.",
+                )
             self._draw_map()
         except Exception as error:
+            _terminal_progress(
+                "Refresh",
+                f"Refresh failed: {type(error).__name__}: {error}",
+            )
             self.status.set(f"Data update failed: {type(error).__name__}: {error}")
             self._draw_map()
         finally:
@@ -1966,6 +2069,10 @@ class StormRadarApp:
                 site.site,
             )
         except Exception as error:
+            _terminal_progress(
+                "Radar",
+                f"Velocity request for {site.name} failed: {type(error).__name__}: {error}",
+            )
             if (
                 not self._closed
                 and self.radar_product == VELOCITY_RADAR
@@ -1988,6 +2095,13 @@ class StormRadarApp:
                 # Keep the velocity image available when the optional volume
                 # mesocyclone product is delayed or unavailable.
                 rotations = ()
+            if frame is None:
+                _terminal_progress("Radar", f"No velocity frame is currently available for {site.name}.")
+            else:
+                _terminal_progress(
+                    "Radar",
+                    f"Velocity frame loaded for {site.name}; found {len(rotations)} supported rotation detections.",
+                )
             if not self._closed:
                 if frame is not None:
                     self.velocity_radar_frames[site_code] = frame
@@ -2016,11 +2130,16 @@ class StormRadarApp:
             return
         restore_warning = None
         try:
+            _terminal_progress("Account", "Restoring the saved reporter session.")
             user = await self.loop.run_in_executor(
                 self.executor,
                 client.restore_session,
             )
         except Exception as error:
+            _terminal_progress(
+                "Account",
+                f"Session restore failed: {type(error).__name__}: {error}",
+            )
             self.status.set(
                 f"Could not restore reporter identity: {type(error).__name__}: {error}"
             )
@@ -2028,6 +2147,10 @@ class StormRadarApp:
             restore_warning = f"Identity restore failed: {type(error).__name__}"
         else:
             self.auth_user = user
+            _terminal_progress(
+                "Account",
+                f"Session restore complete ({user.username or 'no reporter name'}).",
+            )
             if client.session_persistence_error:
                 self.status.set(client.session_persistence_error)
             elif client.session_restore_notice:
@@ -2237,7 +2360,17 @@ class StormRadarApp:
             f"Blitzortung lightning · {len(self.lightning_strikes)} strokes · "
             f"{self._format_time(strike.timestamp)}"
         )
+        if len(self.lightning_strikes) == 1 or len(self.lightning_strikes) % 10 == 0:
+            _terminal_progress(
+                "Lightning",
+                f"Received a strike at {strike.latitude:.3f}, {strike.longitude:.3f}; "
+                f"{len(self.lightning_strikes)} recent strokes tracked.",
+            )
         self._draw_map()
+
+    def _on_lightning_status(self, status: str) -> None:
+        self.lightning_status.set(status)
+        _terminal_progress("Lightning", status)
 
     @staticmethod
     def _format_time(value: datetime | None) -> str:
@@ -2385,6 +2518,19 @@ class StormRadarApp:
         )
 
     def _draw_map(self) -> None:
+        draw_started = time_module.perf_counter()
+        draw_label = self.map_mode
+        if self.map_mode == STORMANALYZER_MAP:
+            draw_label = (
+                f"{self.outlook_day_var.get()} / {self._outlook_metric} outlook"
+            )
+        log_map_progress = (
+            self.map_mode == STORMANALYZER_MAP
+            or draw_started - self._last_map_progress_at >= 2.0
+        )
+        if log_map_progress:
+            self._last_map_progress_at = draw_started
+            _terminal_progress("Map", f"Building {draw_label} layers.")
         self.figure.clear()
         self.axes = self.figure.add_subplot(111)
         outlook_mode = self.map_mode == STORMANALYZER_MAP
@@ -2487,6 +2633,10 @@ class StormRadarApp:
                             float(np.clip(numeric_value, parameter_minimum, parameter_scale))
                         )
                 entries = available_entries
+            _terminal_progress(
+                "Map",
+                f"Preparing {len(entries)} valid grid values for {self._outlook_metric}.",
+            )
             if entries:
                 longitudes = np.asarray([entry["longitude"] for entry in entries])
                 latitudes = np.asarray([entry["latitude"] for entry in entries])
@@ -3055,11 +3205,26 @@ class StormRadarApp:
             pad=10,
         )
         self.figure.tight_layout()
+        self._map_draw_started_at = draw_started if log_map_progress else None
+        self._map_draw_label = draw_label if log_map_progress else None
+        if log_map_progress:
+            _terminal_progress("Map", f"Layers assembled for {draw_label}; painting the canvas.")
         self.map_canvas.draw_idle()
         if not outlook_mode:
             self._schedule_basemap_refresh()
         if self.map_mode == DWD_WARNING_MAP:
             self._schedule_warning_refresh()
+
+    def _on_map_draw_complete(self, _event: Any) -> None:
+        if self._map_draw_started_at is None or self._map_draw_label is None:
+            return
+        elapsed = time_module.perf_counter() - self._map_draw_started_at
+        _terminal_progress(
+            "Map",
+            f"Canvas paint finished for {self._map_draw_label} in {elapsed:.2f}s.",
+        )
+        self._map_draw_started_at = None
+        self._map_draw_label = None
 
     def _draw_movement_track(
         self,
@@ -3176,11 +3341,17 @@ class StormRadarApp:
 
     def _ensure_storm_outlook(self) -> None:
         if self._storm_outlook_loading:
+            _terminal_progress("Outlook", "A load is already running; keeping it in progress.")
             return
         self._storm_outlook_loading = True
         self._storm_outlook_error = None
         self._update_outlook_load_button()
         point_count = len(germany_grid_points(self.germany_outline))
+        _terminal_progress(
+            "Outlook",
+            f"Starting grid load for {point_count} locations using "
+            f"{'the local ICON-D2 feed' if self._outlook_use_local_feed else 'the shared database feed'}.",
+        )
         self.status.set(
             f"Loading the two-day StormAnalyzer outlook for {point_count} grid points; "
             "this may take several minutes."
@@ -3192,9 +3363,16 @@ class StormRadarApp:
         if self._storm_outlook_loading:
             return
         self._outlook_use_local_feed = not self._outlook_use_local_feed
+        _terminal_progress(
+            "Outlook",
+            "Switching to the local ICON-D2 feed."
+            if self._outlook_use_local_feed
+            else "Switching to the shared database ICON-D2 feed.",
+        )
         self._ensure_storm_outlook()
 
     async def _load_storm_outlook(self) -> None:
+        load_started = time_module.perf_counter()
         try:
             outlook, issued_at = await self.loop.run_in_executor(
                 self.executor,
@@ -3206,6 +3384,7 @@ class StormRadarApp:
         except Exception as error:
             self._storm_outlook_loading = False
             self._storm_outlook_error = f"{type(error).__name__}: {error}"
+            _terminal_progress("Outlook", f"Load failed: {self._storm_outlook_error}")
             self._update_outlook_load_button()
             self.status.set(f"StormAnalyzer Germany outlook unavailable: {self._storm_outlook_error}")
             if self._outlook_location is not None:
@@ -3223,6 +3402,11 @@ class StormRadarApp:
         self._storm_outlook_loaded_at = issued_at
         self._storm_outlook_loading = False
         self._storm_outlook_error = None
+        _terminal_progress(
+            "Outlook",
+            f"Loaded {len(outlook)} forecast results in "
+            f"{time_module.perf_counter() - load_started:.1f}s; issued {issued_at.isoformat()}.",
+        )
         self._update_outlook_load_button()
         self.status.set(f"StormAnalyzer Germany grid updated {issued_at:%H:%M} CET/CEST.")
         if self._outlook_location is not None:
@@ -3442,6 +3626,10 @@ class StormRadarApp:
         height: int,
     ) -> None:
         try:
+            _terminal_progress(
+                "Warnings",
+                f"Requesting a DWD warning overlay for {width}×{height} map pixels.",
+            )
             image, image_extent = await self.loop.run_in_executor(
                 self.executor,
                 fetch_dwd_warning_overlay,
@@ -3450,6 +3638,10 @@ class StormRadarApp:
                 height,
             )
         except Exception as error:
+            _terminal_progress(
+                "Warnings",
+                f"Overlay request failed: {type(error).__name__}: {error}",
+            )
             if not self._closed and key == self._warning_requested_key:
                 self.status.set(
                     f"DWD warnings unavailable: {type(error).__name__}: {error}"
@@ -3463,6 +3655,7 @@ class StormRadarApp:
             return
         self._warning_image = image
         self._warning_extent = image_extent
+        _terminal_progress("Warnings", "Overlay received; redrawing the map.")
         self._draw_map()
 
     def _start_basemap_refresh(
@@ -3484,6 +3677,10 @@ class StormRadarApp:
         height: int,
     ) -> None:
         try:
+            _terminal_progress(
+                "Basemap",
+                f"Requesting Esri imagery ({width}×{height}) for the current extent.",
+            )
             image, image_extent = await self.loop.run_in_executor(
                 self.executor,
                 fetch_esri_imagery,
@@ -3492,6 +3689,10 @@ class StormRadarApp:
                 height,
             )
         except Exception as error:
+            _terminal_progress(
+                "Basemap",
+                f"Imagery request failed: {type(error).__name__}: {error}",
+            )
             if not self._closed and key == self._basemap_requested_key:
                 self.status.set(
                     f"Esri World Imagery unavailable: {type(error).__name__}: {error}"
@@ -3501,6 +3702,7 @@ class StormRadarApp:
             return
         self._basemap_image = image
         self._basemap_extent = image_extent
+        _terminal_progress("Basemap", "Imagery received and cached for the current extent.")
         if self._basemap_artist is not None:
             self._basemap_artist.set_data(image)
             self._basemap_artist.set_extent(image_extent)
@@ -3645,6 +3847,10 @@ class StormRadarApp:
             return
         latitude = float(event.ydata)
         longitude = float(event.xdata)
+        _terminal_progress(
+            "Map",
+            f"Selected map point {latitude:.4f}, {longitude:.4f} in {self.map_mode}.",
+        )
         if self.map_mode == LIVE_MAP and self.radar_product == VELOCITY_RADAR:
             self._select_velocity_radar_site(
                 nearest_velocity_radar_site(latitude, longitude)
@@ -3667,6 +3873,10 @@ class StormRadarApp:
         longitude: float,
     ) -> None:
         try:
+            _terminal_progress(
+                "Nowcast",
+                f"Requesting point forecast for {latitude:.3f}, {longitude:.3f}.",
+            )
             model, payload = await self.loop.run_in_executor(
                 self.executor,
                 fetch_openmeteo_nowcast,
@@ -3674,6 +3884,10 @@ class StormRadarApp:
                 longitude,
             )
         except Exception as error:
+            _terminal_progress(
+                "Nowcast",
+                f"Point forecast failed: {type(error).__name__}: {error}",
+            )
             if not self._closed and request_id == self._weather_request_id:
                 self.weather_detail.set(
                     f"Open-Meteo nowcast unavailable: {type(error).__name__}: {error}"
@@ -3684,6 +3898,7 @@ class StormRadarApp:
         self.weather_detail.set(
             self._format_nowcast(model, latitude, longitude, payload)
         )
+        _terminal_progress("Nowcast", f"Point forecast loaded using {model}.")
 
     @staticmethod
     def _format_nowcast(
@@ -3826,6 +4041,10 @@ class StormRadarApp:
         longitude: float,
     ) -> None:
         try:
+            _terminal_progress(
+                "Warnings",
+                f"Checking active DWD warnings at {latitude:.3f}, {longitude:.3f}.",
+            )
             features = await self.loop.run_in_executor(
                 self.executor,
                 fetch_dwd_warning_at,
@@ -3833,6 +4052,10 @@ class StormRadarApp:
                 longitude,
             )
         except Exception as error:
+            _terminal_progress(
+                "Warnings",
+                f"Point warning lookup failed: {type(error).__name__}: {error}",
+            )
             if (
                 not self._closed
                 and self.map_mode == DWD_WARNING_MAP
@@ -3849,11 +4072,13 @@ class StormRadarApp:
         ):
             return
         if not features:
+            _terminal_progress("Warnings", "No active warning covers the selected point.")
             self.warning_detail.set(
                 f"No active DWD municipality warning at {latitude:.4f}° N, "
                 f"{longitude:.4f}° E."
             )
             return
+        _terminal_progress("Warnings", f"Found {len(features)} warning feature(s) at the selected point.")
         details: list[str] = []
         for feature in features[:4]:
             fields = (
@@ -3930,6 +4155,7 @@ class StormRadarApp:
 
     async def _start_location_tracking(self) -> None:
         try:
+            _terminal_progress("Location", "Requesting device-location permission.")
             permitted = await request_location_access()
             if not permitted:
                 raise PermissionError(
@@ -3939,11 +4165,16 @@ class StormRadarApp:
             self._geolocator = create_geolocator()
             self._subscribe_to_location_updates()
             self.location_status.set("Waiting for device location…")
+            _terminal_progress("Location", "Permission granted; waiting for a device fix.")
             await self._poll_device_location()
             await asyncio.Event().wait()
         except asyncio.CancelledError:
             raise
         except Exception as error:
+            _terminal_progress(
+                "Location",
+                f"Location unavailable: {type(error).__name__}: {error}",
+            )
             self.location_status.set(f"Location unavailable: {error}")
             self.status.set(f"Location error: {type(error).__name__}: {error}")
         finally:
@@ -3989,6 +4220,12 @@ class StormRadarApp:
         if self._closed:
             return
         initial = not self._has_device_fix
+        if initial:
+            _terminal_progress(
+                "Location",
+                f"First device fix: {location.latitude:.4f}, {location.longitude:.4f} "
+                f"(±{location.accuracy_meters:.0f} m).",
+            )
         self._has_device_fix = True
         self.location = location
         self.location_status.set(
@@ -4020,6 +4257,7 @@ class StormRadarApp:
         self._map_ylim = (center_y - half_height, center_y + half_height)
 
     def stop_location_tracking(self) -> None:
+        _terminal_progress("Location", "Stopping device-location tracking.")
         if self._tracking_task is not None:
             self._tracking_task.cancel()
             self._tracking_task = None
@@ -4041,6 +4279,7 @@ class StormRadarApp:
     def _close(self) -> None:
         if self._closed:
             return
+        _terminal_progress("App", "Stopping background tasks and closing StormChase.")
         self._closed = True
         if self._basemap_after_id is not None:
             self.root.after_cancel(self._basemap_after_id)
