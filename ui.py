@@ -3615,6 +3615,20 @@ class StormRadarApp:
             self.auth_status.set("Reporter identity storage failed")
         elif client.session_restore_notice:
             self.auth_status.set("Reporter identity needs to be set again")
+        self._is_stormchase_admin = False
+        if self.auth_user is not None and client.current_user is not None:
+            try:
+                self._is_stormchase_admin = await self.loop.run_in_executor(
+                    self.executor,
+                    client.is_stormchase_admin,
+                )
+            except Exception as error:
+                self._is_stormchase_admin = False
+                _terminal_progress(
+                    "Admin",
+                    f"Administrator authorization check unavailable: {type(error).__name__}: {error}",
+                )
+        self._refresh_admin_controls()
         self._render_community_reports()
         if self.auth_user is not None and self.auth_user.username is not None:
             self.refresh_data()
@@ -3654,6 +3668,7 @@ class StormRadarApp:
             self.copy_cell_button.configure(
                 state="normal" if self.selected_cell is not None else "disabled"
             )
+        self._refresh_admin_controls()
 
     def _sync_auth_state(self) -> None:
         if (
@@ -3662,6 +3677,7 @@ class StormRadarApp:
             and self.supabase.current_user is None
         ):
             self.auth_user = None
+            self._is_stormchase_admin = False
             self.community_reports = ()
             self._refresh_auth_controls()
             self._render_community_reports()
@@ -3748,6 +3764,17 @@ class StormRadarApp:
             return
 
         self.auth_user = user
+        self._is_stormchase_admin = False
+        try:
+            self._is_stormchase_admin = await self.loop.run_in_executor(
+                self.executor,
+                client.is_stormchase_admin,
+            )
+        except Exception as error:
+            _terminal_progress(
+                "Admin",
+                f"Administrator authorization check unavailable: {type(error).__name__}: {error}",
+            )
         self._refresh_auth_controls()
         if client.session_persistence_error:
             self.status.set(client.session_persistence_error)
@@ -3782,12 +3809,16 @@ class StormRadarApp:
                 username = report.get("reporter_username", "unknown reporter")
                 cell_id = report.get("cell_id", "unknown cell")
                 body = report.get("report", "")
-                entries.append(f"{username} · {created_at} · {cell_id}\n{body}")
+                verification = report.get("verification_status", "unverified")
+                review_note = report.get("review_note")
+                review_suffix = f"\nModerator note: {review_note}" if review_note else ""
+                entries.append(f"{username} · {created_at} · {cell_id} · {verification.upper()}\n{body}{review_suffix}")
             content = "\n\n".join(entries)
         self.community_report_text.configure(state="normal")
         self.community_report_text.delete("1.0", tk.END)
         self.community_report_text.insert("1.0", content)
         self.community_report_text.configure(state="disabled")
+        self._populate_admin_report_list()
 
     def _expire_lightning_strikes(self) -> None:
         if self._closed:
@@ -3808,6 +3839,15 @@ class StormRadarApp:
         if self._closed:
             return
         self.lightning_strikes[strike.identifier] = strike
+        self.case_analysis.record_event(
+            "lightning",
+            str(strike.identifier),
+            strike.timestamp,
+            f"Community lightning stroke · {strike.latitude:.3f}, {strike.longitude:.3f}",
+            latitude=strike.latitude,
+            longitude=strike.longitude,
+            source="Blitzortung community feed",
+        )
         self._session_lightning_ids.add(str(strike.identifier))
         self._record_source_success(
             "Blitzortung lightning",
@@ -5395,6 +5435,7 @@ class StormRadarApp:
                 f"Track points: {track_points}"
             )
         self.cell_detail.set("\n".join(details))
+        self._refresh_case_analysis_panel()
         self.cell_list.selection_clear(0, tk.END)
         self.cell_list.selection_set(index)
         self._refresh_auth_controls()
@@ -5461,6 +5502,17 @@ class StormRadarApp:
             return
         latitude = float(event.ydata)
         longitude = float(event.xdata)
+        if self._warning_drawing_enabled:
+            if self.map_mode == STORMANALYZER_MAP:
+                self.status.set("Switch away from the outlook map to draw a warning polygon.")
+                return
+            self._warning_polygon_draft.append([longitude, latitude])
+            self.admin_polygon_status.set(
+                f"Polygon vertices: {len(self._warning_polygon_draft)} · "
+                "click more map points, then publish"
+            )
+            self._draw_map()
+            return
         if self._measurement_enabled:
             self._measurement_points.append((latitude, longitude))
             if len(self._measurement_points) == 1:
