@@ -1,4 +1,3 @@
-
 # NEVER change this file again unless explicitly instructed to do so by the StormChase team.
 
 from __future__ import annotations
@@ -6,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 import json
 import logging
 import math
@@ -16,7 +16,6 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
-from email.utils import parsedate_to_datetime
 from zoneinfo import ZoneInfo
 
 import websockets
@@ -36,7 +35,7 @@ from radar import (
     velocity_radar_sites,
 )
 from tracking import fetch_latest_storm_cells
-from publisher.severe_parameters import PRESSURE_LEVEL_HOURLY_FIELDS
+from severe_parameters import PRESSURE_LEVEL_HOURLY_FIELDS
 
 
 LOG = logging.getLogger("stormchase-publisher")
@@ -64,7 +63,7 @@ _BASE_OUTLOOK_HOURLY_FIELDS = (
     "relative_humidity_700hPa,relative_humidity_500hPa,"
     "geopotential_height_925hPa,geopotential_height_850hPa,"
     "geopotential_height_700hPa,geopotential_height_500hPa,"
-    "precipitation,snowfall,wind_speed_10m,wind_direction_10m,"
+    "precipitation,wind_speed_10m,wind_direction_10m,"
     "wind_speed_180m,wind_direction_180m,"
     "wind_speed_925hPa,wind_direction_925hPa,wind_speed_850hPa,"
     "wind_direction_850hPa,wind_speed_700hPa,wind_direction_700hPa,"
@@ -78,10 +77,18 @@ _OUTLOOK_PROFILE_FIELDS = tuple(
 OUTLOOK_HOURLY_FIELDS = list(dict.fromkeys(
     (*_BASE_OUTLOOK_HOURLY_FIELDS, *_OUTLOOK_PROFILE_FIELDS)
 ))
-OUTLOOK_BATCH_SIZE = 45
-OUTLOOK_RETRY_ATTEMPTS = 4
+OUTLOOK_BATCH_SIZE = 25
+OUTLOOK_RETRY_ATTEMPTS = 5
 OUTLOOK_CALLS_PER_MINUTE = 450.0
-OUTLOOK_FETCH_WINDOW_SECONDS = 120.0
+OUTLOOK_FETCH_WINDOW_SECONDS = max(
+    90.0,
+    math.ceil(
+        (OUTLOOK_GRID_POINT_COUNT * (len(OUTLOOK_HOURLY_FIELDS) / 10.0))
+        / OUTLOOK_CALLS_PER_MINUTE
+    )
+    * 60.0,
+)
+MAX_RETRY_SLEEP_SECONDS = 65.0
 OUTLOOK_PUBLISH_BATCH_SIZE = 25
 OUTLOOK_GRID_VERSION = "raw-icon-d2-v2"
 
@@ -233,27 +240,30 @@ def _outlook_grid_points() -> list[tuple[float, float]]:
     return points
 
 
+def _valid_outlook_point(point: Any) -> bool:
+    if not isinstance(point, dict):
+        return False
+    hourly = point.get("icon_d2")
+    if not isinstance(hourly, dict):
+        return False
+    times = hourly.get("time")
+    if not isinstance(times, list) or not times:
+        return False
+    if not isinstance(hourly.get("cin"), list) or len(hourly["cin"]) != len(times):
+        return False
+    if _finite_float(hourly.get("surface_elevation_m")) is None:
+        return False
+    for field in OUTLOOK_HOURLY_FIELDS:
+        values = hourly.get(field)
+        if not isinstance(values, list) or len(values) != len(times):
+            return False
+    return True
+
+
 def _valid_outlook_grid(grid: Any) -> bool:
     if not isinstance(grid, list) or len(grid) != OUTLOOK_GRID_POINT_COUNT:
         return False
-    for point in grid:
-        if not isinstance(point, dict):
-            return False
-        hourly = point.get("icon_d2")
-        if not isinstance(hourly, dict):
-            return False
-        times = hourly.get("time")
-        if not isinstance(times, list) or not times:
-            return False
-        if not isinstance(hourly.get("cin"), list) or len(hourly["cin"]) != len(times):
-            return False
-        if _finite_float(hourly.get("surface_elevation_m")) is None:
-            return False
-        for field in OUTLOOK_HOURLY_FIELDS:
-            values = hourly.get(field)
-            if not isinstance(values, list) or len(values) != len(times):
-                return False
-    return True
+    return all(_valid_outlook_point(point) for point in grid)
 
 
 def _fetch_openmeteo_batch(request_params: dict[str, Any]) -> list[dict[str, Any]]:
@@ -261,7 +271,7 @@ def _fetch_openmeteo_batch(request_params: dict[str, Any]) -> list[dict[str, Any
     for attempt in range(OUTLOOK_RETRY_ATTEMPTS):
         try:
             request = Request(url, headers={"Accept": "application/json"})
-            with urlopen(request, timeout=60) as response:
+            with urlopen(request, timeout=25) as response:
                 payload = json.loads(response.read().decode("utf-8"))
         except HTTPError as error:
             detail = error.read().decode("utf-8", errors="replace")
@@ -272,7 +282,11 @@ def _fetch_openmeteo_batch(request_params: dict[str, Any]) -> list[dict[str, Any
                 ) from error
             retry_after = error.headers.get("Retry-After")
             try:
-                delay = min(max(float(retry_after), 1.0), 3600.0) if retry_after else 5.0 * (2**attempt)
+                delay = (
+                    min(max(float(retry_after), 1.0), MAX_RETRY_SLEEP_SECONDS)
+                    if retry_after
+                    else min(10.0 * (2**attempt), MAX_RETRY_SLEEP_SECONDS)
+                )
             except (TypeError, ValueError):
                 try:
                     retry_at = parsedate_to_datetime(retry_after)
@@ -280,10 +294,10 @@ def _fetch_openmeteo_batch(request_params: dict[str, Any]) -> list[dict[str, Any
                         retry_at = retry_at.replace(tzinfo=timezone.utc)
                     delay = min(
                         max((retry_at - datetime.now(timezone.utc)).total_seconds(), 1.0),
-                        3600.0,
+                        MAX_RETRY_SLEEP_SECONDS,
                     )
                 except (TypeError, ValueError, OverflowError):
-                    delay = 5.0 * (2**attempt)
+                    delay = min(10.0 * (2**attempt), MAX_RETRY_SLEEP_SECONDS)
             LOG.warning(
                 "Open-Meteo returned HTTP %d for an outlook batch on attempt %d/%d; "
                 "retrying in %.1f seconds.",
@@ -296,7 +310,7 @@ def _fetch_openmeteo_batch(request_params: dict[str, Any]) -> list[dict[str, Any
         except (URLError, TimeoutError, OSError) as error:
             if attempt + 1 >= OUTLOOK_RETRY_ATTEMPTS:
                 raise PublisherError(f"Could not reach Open-Meteo: {error}") from error
-            delay = min(5.0 * (2**attempt), 60.0)
+            delay = min(10.0 * (2**attempt), MAX_RETRY_SLEEP_SECONDS)
             LOG.warning(
                 "Open-Meteo outlook request failed on attempt %d/%d; "
                 "retrying in %.1f seconds: %s",
@@ -323,18 +337,43 @@ def _fetch_openmeteo_batch(request_params: dict[str, Any]) -> list[dict[str, Any
     raise PublisherError("Open-Meteo outlook request failed after retries.")
 
 
-def _fetch_daily_outlook_grid() -> list[dict[str, Any]]:
+def _save_outlook_points_batch(
+    date_text: str,
+    start_index: int,
+    points_data: list[dict[str, Any]],
+) -> None:
+    for offset in range(0, len(points_data), OUTLOOK_PUBLISH_BATCH_SIZE):
+        chunk = points_data[offset : offset + OUTLOOK_PUBLISH_BATCH_SIZE]
+        rows = [
+            {
+                "forecast_date": date_text,
+                "point_index": start_index + offset + index,
+                "grid_payload": {
+                    **point_payload,
+                    "grid_version": OUTLOOK_GRID_VERSION,
+                },
+            }
+            for index, point_payload in enumerate(chunk)
+        ]
+        _upsert(
+            "daily_outlook_forecast_points",
+            "forecast_date,point_index",
+            rows,
+        )
+
+
+def _fetch_and_store_daily_outlook_grid(
+    date_text: str,
+    completed_indices: set[int],
+) -> None:
     points = _outlook_grid_points()
     batches = [
-        points[index : index + OUTLOOK_BATCH_SIZE]
-        for index in range(0, len(points), OUTLOOK_BATCH_SIZE)
+        (start_index, points[start_index : start_index + OUTLOOK_BATCH_SIZE])
+        for start_index in range(0, len(points), OUTLOOK_BATCH_SIZE)
     ]
     field_weight = len(OUTLOOK_HOURLY_FIELDS) / 10.0
     batch_weight = field_weight * OUTLOOK_BATCH_SIZE
-    total_weight = sum(
-        field_weight * len(batch)
-        for batch in batches
-    )
+    total_weight = sum(field_weight * len(batch) for _, batch in batches)
     batch_interval = OUTLOOK_FETCH_WINDOW_SECONDS / len(batches)
     if batch_weight > OUTLOOK_CALLS_PER_MINUTE:
         raise PublisherError(
@@ -344,10 +383,22 @@ def _fetch_daily_outlook_grid() -> list[dict[str, Any]]:
         raise PublisherError(
             "The daily outlook grid exceeds StormChase's conservative hourly Open-Meteo budget."
         )
-    last_batch_started_at: float | None = None
-    grid: list[dict[str, Any]] = []
 
-    for batch_index, batch in enumerate(batches):
+    last_batch_started_at: float | None = None
+    stored_count = len(completed_indices)
+
+    for batch_index, (start_index, batch) in enumerate(batches):
+        batch_indices = set(range(start_index, start_index + len(batch)))
+        if batch_indices.issubset(completed_indices):
+            LOG.info(
+                "Skipping already stored daily outlook batch %d/%d (%d/%d points).",
+                batch_index + 1,
+                len(batches),
+                stored_count,
+                len(points),
+            )
+            continue
+
         if last_batch_started_at is not None:
             wait_seconds = batch_interval - (
                 time.monotonic() - last_batch_started_at
@@ -379,6 +430,7 @@ def _fetch_daily_outlook_grid() -> list[dict[str, Any]]:
                 f"{len(batch)}-point outlook batch."
             )
 
+        batch_grid: list[dict[str, Any]] = []
         for point in payload:
             hourly = point.get("hourly")
             if not isinstance(hourly, dict):
@@ -407,19 +459,24 @@ def _fetch_daily_outlook_grid() -> list[dict[str, Any]]:
                 -abs(float(value)) if value is not None else None
                 for value in cin_values
             ]
-            grid.append({"icon_d2": hourly})
+            point_entry = {"icon_d2": hourly}
+            if not _valid_outlook_point(point_entry):
+                raise PublisherError("Open-Meteo returned an invalid daily outlook point.")
+            batch_grid.append(point_entry)
+
+        _save_outlook_points_batch(date_text, start_index, batch_grid)
+        newly_added = len(batch_indices - completed_indices)
+        completed_indices.update(batch_indices)
+        stored_count += newly_added
+
         LOG.info(
-            "Fetched daily outlook batch %d/%d (%d/%d points) in %.1f seconds.",
+            "Fetched and saved daily outlook batch %d/%d (%d/%d points) in %.1f seconds.",
             batch_index + 1,
             len(batches),
-            len(grid),
+            stored_count,
             len(points),
             time.monotonic() - batch_started_at,
         )
-
-    if not _valid_outlook_grid(grid):
-        raise PublisherError("Open-Meteo returned an incomplete daily outlook grid.")
-    return grid
 
 
 def publish_daily_outlook() -> None:
@@ -457,24 +514,26 @@ def publish_daily_outlook() -> None:
         isinstance(row, dict) for row in version_rows
     ):
         raise PublisherError("Supabase returned an invalid daily outlook version response.")
-    version_is_complete = [
-        row.get("point_index") for row in version_rows
-    ] == list(range(OUTLOOK_GRID_POINT_COUNT))
+    completed_indices = {
+        int(row["point_index"])
+        for row in version_rows
+        if isinstance(row.get("point_index"), int)
+        and 0 <= row["point_index"] < OUTLOOK_GRID_POINT_COUNT
+    }
+    version_is_complete = sorted(completed_indices) == list(range(OUTLOOK_GRID_POINT_COUNT))
     if points_are_complete and version_is_complete:
         LOG.info("Daily outlook for %s is already published; skipping Open-Meteo.", date_text)
         return
-    if existing_points:
+    if existing_points or completed_indices:
         LOG.warning(
-            "Stored daily outlook for %s has %d/%d points; refreshing it.",
+            "Stored daily outlook for %s has %d/%d current-version points; resuming missing batches.",
             date_text,
-            len(existing_points),
+            len(completed_indices),
             OUTLOOK_GRID_POINT_COUNT,
         )
 
     issued_at_datetime = datetime.now(timezone.utc)
     issued_at = _iso(issued_at_datetime)
-    LOG.info("Fetching the once-daily ICON-D2 outlook grid for %s.", date_text)
-    grid = _fetch_daily_outlook_grid()
     _upsert(
         "daily_outlook_forecasts",
         "forecast_date",
@@ -486,40 +545,13 @@ def publish_daily_outlook() -> None:
             }
         ],
     )
-    batch_count = (
-        len(grid) + OUTLOOK_PUBLISH_BATCH_SIZE - 1
-    ) // OUTLOOK_PUBLISH_BATCH_SIZE
+    LOG.info("Fetching the once-daily ICON-D2 outlook grid for %s.", date_text)
+    _fetch_and_store_daily_outlook_grid(date_text, completed_indices)
     LOG.info(
-        "Saving the %d-point daily outlook grid in %d Supabase batches.",
-        len(grid),
-        batch_count,
+        "Published the daily outlook grid for %s (%d points).",
+        date_text,
+        OUTLOOK_GRID_POINT_COUNT,
     )
-    for batch_start in range(0, len(grid), OUTLOOK_PUBLISH_BATCH_SIZE):
-        batch_end = min(batch_start + OUTLOOK_PUBLISH_BATCH_SIZE, len(grid))
-        rows = [
-            {
-                "forecast_date": date_text,
-                "point_index": point_index,
-                "grid_payload": {
-                    **grid[point_index],
-                    "grid_version": OUTLOOK_GRID_VERSION,
-                },
-            }
-            for point_index in range(batch_start, batch_end)
-        ]
-        _upsert(
-            "daily_outlook_forecast_points",
-            "forecast_date,point_index",
-            rows,
-        )
-        LOG.info(
-            "Saved daily outlook point batch %d/%d (%d/%d points).",
-            batch_start // OUTLOOK_PUBLISH_BATCH_SIZE + 1,
-            batch_count,
-            batch_end,
-            len(grid),
-        )
-    LOG.info("Published the daily outlook grid for %s (%d points).", date_text, len(grid))
 
 
 def _publish_snapshot(product: str, scope: str, observed_at: datetime, payload: dict[str, Any]) -> None:
