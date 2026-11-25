@@ -2,4 +2,5 @@ wetterdienst[radarplus]
 numpy
 scipy
 h5py
+pyproj
 websockets

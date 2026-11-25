@@ -683,6 +683,10 @@ class SupabaseClient:
         return rows[0] if rows else None
 
     def daily_outlook_grid(self, forecast_date: date) -> dict[str, Any] | None:
+        print(
+            f"[Outlook DB] Looking up daily forecast metadata for {forecast_date.isoformat()}...",
+            flush=True,
+        )
         rows = self._table_rows(
             "daily_outlook_forecasts",
             {
@@ -692,14 +696,34 @@ class SupabaseClient:
             },
         )
         if not rows:
+            print(
+                f"[Outlook DB] No daily forecast metadata for {forecast_date.isoformat()}; "
+                "the outlook will use the direct forecast source.",
+                flush=True,
+            )
             return None
+        print(
+            f"[Outlook DB] Found daily forecast metadata; reading "
+            f"{DAILY_OUTLOOK_GRID_POINT_COUNT} grid points in pages of "
+            f"{DAILY_OUTLOOK_GRID_PAGE_SIZE}...",
+            flush=True,
+        )
 
         row = rows[0]
         if row.get("forecast_date") != forecast_date.isoformat():
             raise SupabaseError("Daily outlook row has an unexpected forecast date.")
         point_rows: list[dict[str, Any]] = []
         offset = 0
+        page_count = math.ceil(
+            DAILY_OUTLOOK_GRID_POINT_COUNT / DAILY_OUTLOOK_GRID_PAGE_SIZE
+        )
         while offset < DAILY_OUTLOOK_GRID_POINT_COUNT:
+            page_number = offset // DAILY_OUTLOOK_GRID_PAGE_SIZE + 1
+            print(
+                f"[Outlook DB] Requesting page {page_number}/{page_count} "
+                f"(offset {offset})...",
+                flush=True,
+            )
             page_rows = self._table_rows(
                 "daily_outlook_forecast_points",
                 {
@@ -710,6 +734,12 @@ class SupabaseClient:
                     "offset": str(offset),
                 },
             )
+            print(
+                f"[Outlook DB] Page {page_number}/{page_count} returned "
+                f"{len(page_rows)} rows; {min(offset + len(page_rows), DAILY_OUTLOOK_GRID_POINT_COUNT)} "
+                f"of {DAILY_OUTLOOK_GRID_POINT_COUNT} collected.",
+                flush=True,
+            )
             if not page_rows:
                 break
             if len(page_rows) > DAILY_OUTLOOK_GRID_POINT_COUNT - offset:
@@ -719,6 +749,7 @@ class SupabaseClient:
             point_rows.extend(page_rows)
             offset += len(page_rows)
         if len(point_rows) == DAILY_OUTLOOK_GRID_POINT_COUNT:
+            print("[Outlook DB] Reconstructing and validating the 744-point grid...", flush=True)
             grid = []
             for expected_index, point_row in enumerate(point_rows):
                 payload = point_row.get("grid_payload")
@@ -731,12 +762,17 @@ class SupabaseClient:
                         "Daily outlook points must contain a complete ICON-D2 grid."
                     )
                 grid.append(payload)
+            print("[Outlook DB] Shared grid is complete.", flush=True)
         elif point_rows:
             raise SupabaseError(
                 f"Daily outlook contains {len(point_rows)} of "
                 f"{DAILY_OUTLOOK_GRID_POINT_COUNT} grid points."
             )
         else:
+            print(
+                "[Outlook DB] No point rows found; checking the legacy single-grid payload.",
+                flush=True,
+            )
             legacy_rows = self._table_rows(
                 "daily_outlook_forecasts",
                 {

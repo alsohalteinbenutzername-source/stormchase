@@ -1,4 +1,6 @@
-
+# cronjobs user and pass
+# sonahip113@dvdee.com
+# vPQ>~3v3+V..xRN
 
 
 LATITUDE = 50.04

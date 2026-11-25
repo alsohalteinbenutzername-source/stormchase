@@ -120,6 +120,15 @@ cell-motion wind projections continue to use live third-party requests. When
 configured, Supabase also supplies shared KONRAD3D tracking/prediction
 snapshots and authenticated community-report features.
 
+The separate general-weather publisher fetches Open-Meteo's seven-day daily
+forecast for the same 744-point Germany grid. It stores WMO weather codes and
+readable conditions, daily high/low temperatures, precipitation probability,
+rain likelihood, precipitation amounts and hours, wind, sunrise/sunset, and UV
+index in `general_weather_forecasts` and `general_weather_forecast_points`.
+Rain is marked likely when precipitation probability is at least 50% and the
+WMO code describes rain, drizzle, showers, or a thunderstorm. General
+precipitation likelihood is stored separately from rain likelihood.
+
 1. In the Supabase SQL editor, run
    [`supabase/001_stormchase_schema.sql`](./supabase/001_stormchase_schema.sql).
    It creates the tables, indexes, read policies, authenticated report policies,
@@ -139,6 +148,10 @@ snapshots and authenticated community-report features.
    Supabase request errors are shown in the outlook UI instead of silently
    switching data sources. The publisher should refresh the grid once per day;
    a database job retains only today's and yesterday's rows. Then run
+   [`supabase/006_general_weather_forecasts.sql`](./supabase/006_general_weather_forecasts.sql)
+   to create the shared general-weather tables and their read policies. The
+   general-weather workflow publishes its 744 locations in chunks and retains
+   today's and yesterday's forecasts. Then run
    [`supabase/004_anonymous_reporters.sql`](./supabase/004_anonymous_reporters.sql)
    to configure pseudonymous report identities and posting limits.
 2. In Supabase Auth, enable **Anonymous Sign-Ins**. The first time someone files
@@ -164,7 +177,9 @@ snapshots and authenticated community-report features.
    lightning data without fetching the daily outlook. The separate
    daily-outlook workflow refreshes the shared ICON-D2 grid shortly after
    midnight in Germany (using `--daily-outlook-only`) and can also be started
-   manually. GitHub Actions and scheduled workflows must be enabled in this
+   manually. The general-weather workflow runs every three hours (using
+   `--general-weather-only`) and can also be started manually. GitHub Actions
+   and scheduled workflows must be enabled in this
    repository's **Settings → Actions**.
 
    Supabase Cron can dispatch the live-data workflow every five minutes too.

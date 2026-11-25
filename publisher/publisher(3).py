@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+
 import argparse
 import asyncio
 from datetime import datetime, timedelta, timezone
@@ -91,6 +92,47 @@ OUTLOOK_FETCH_WINDOW_SECONDS = max(
 MAX_RETRY_SLEEP_SECONDS = 65.0
 OUTLOOK_PUBLISH_BATCH_SIZE = 25
 OUTLOOK_GRID_VERSION = "raw-icon-d2-v2"
+GENERAL_WEATHER_API_URL = "https://api.open-meteo.com/v1/forecast"
+GENERAL_WEATHER_BATCH_SIZE = 100
+GENERAL_WEATHER_DAYS = 7
+GENERAL_WEATHER_PUBLISH_BATCH_SIZE = 25
+GENERAL_WEATHER_DAILY_FIELDS = (
+    "weather_code,temperature_2m_max,temperature_2m_min,apparent_temperature_max,"
+    "precipitation_probability_max,precipitation_sum,rain_sum,precipitation_hours,"
+    "wind_speed_10m_max,wind_direction_10m_dominant,sunrise,sunset,uv_index_max"
+)
+WMO_WEATHER_DESCRIPTIONS = {
+    0: "Clear sky",
+    1: "Mainly clear",
+    2: "Partly cloudy",
+    3: "Overcast",
+    45: "Fog",
+    48: "Rime fog",
+    51: "Light drizzle",
+    53: "Moderate drizzle",
+    55: "Dense drizzle",
+    56: "Light freezing drizzle",
+    57: "Dense freezing drizzle",
+    61: "Slight rain",
+    63: "Moderate rain",
+    65: "Heavy rain",
+    66: "Light freezing rain",
+    67: "Heavy freezing rain",
+    71: "Light frozen precipitation",
+    73: "Moderate frozen precipitation",
+    75: "Heavy frozen precipitation",
+    77: "Ice grains",
+    80: "Slight rain showers",
+    81: "Moderate rain showers",
+    82: "Heavy rain showers",
+    85: "Light frozen showers",
+    86: "Heavy frozen showers",
+    95: "Thunderstorm",
+    96: "Thunderstorm with slight hail",
+    97: "Heavy thunderstorm",
+    99: "Heavy thunderstorm with hail",
+}
+WMO_RAIN_CODES = frozenset((51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 80, 81, 82, 95, 96, 97, 99))
 
 
 class PublisherError(RuntimeError):
@@ -266,8 +308,13 @@ def _valid_outlook_grid(grid: Any) -> bool:
     return all(_valid_outlook_point(point) for point in grid)
 
 
-def _fetch_openmeteo_batch(request_params: dict[str, Any]) -> list[dict[str, Any]]:
-    url = f"{OUTLOOK_API_URL}?{urlencode(request_params)}"
+def _fetch_openmeteo_batch(
+    request_params: dict[str, Any],
+    *,
+    api_url: str = OUTLOOK_API_URL,
+    dataset_name: str = "outlook",
+) -> list[dict[str, Any]]:
+    url = f"{api_url}?{urlencode(request_params)}"
     for attempt in range(OUTLOOK_RETRY_ATTEMPTS):
         try:
             request = Request(url, headers={"Accept": "application/json"})
@@ -299,9 +346,10 @@ def _fetch_openmeteo_batch(request_params: dict[str, Any]) -> list[dict[str, Any
                 except (TypeError, ValueError, OverflowError):
                     delay = min(10.0 * (2**attempt), MAX_RETRY_SLEEP_SECONDS)
             LOG.warning(
-                "Open-Meteo returned HTTP %d for an outlook batch on attempt %d/%d; "
+                "Open-Meteo returned HTTP %d for a %s batch on attempt %d/%d; "
                 "retrying in %.1f seconds.",
                 error.code,
+                dataset_name,
                 attempt + 1,
                 OUTLOOK_RETRY_ATTEMPTS,
                 delay,
@@ -312,8 +360,9 @@ def _fetch_openmeteo_batch(request_params: dict[str, Any]) -> list[dict[str, Any
                 raise PublisherError(f"Could not reach Open-Meteo: {error}") from error
             delay = min(10.0 * (2**attempt), MAX_RETRY_SLEEP_SECONDS)
             LOG.warning(
-                "Open-Meteo outlook request failed on attempt %d/%d; "
+                "Open-Meteo %s request failed on attempt %d/%d; "
                 "retrying in %.1f seconds: %s",
+                dataset_name,
                 attempt + 1,
                 OUTLOOK_RETRY_ATTEMPTS,
                 delay,
@@ -326,15 +375,15 @@ def _fetch_openmeteo_batch(request_params: dict[str, Any]) -> list[dict[str, Any
             if isinstance(payload, dict):
                 payload = [payload]
             if not isinstance(payload, list) or not all(isinstance(item, dict) for item in payload):
-                raise PublisherError("Open-Meteo returned an invalid outlook batch.")
+                raise PublisherError(f"Open-Meteo returned an invalid {dataset_name} batch.")
             if any(item.get("error") for item in payload):
                 reason = next(
                     (item.get("reason", "API error") for item in payload if item.get("error")),
                     "API error",
                 )
-                raise PublisherError(f"Open-Meteo outlook request failed: {reason}")
+                raise PublisherError(f"Open-Meteo {dataset_name} request failed: {reason}")
             return payload
-    raise PublisherError("Open-Meteo outlook request failed after retries.")
+    raise PublisherError(f"Open-Meteo {dataset_name} request failed after retries.")
 
 
 def _save_outlook_points_batch(
@@ -551,6 +600,184 @@ def publish_daily_outlook() -> None:
         "Published the daily outlook grid for %s (%d points).",
         date_text,
         OUTLOOK_GRID_POINT_COUNT,
+    )
+
+
+def _daily_weather_payload(point: dict[str, Any], point_index: int) -> dict[str, Any]:
+    daily = point.get("daily")
+    if not isinstance(daily, dict):
+        raise PublisherError(
+            f"Open-Meteo general-weather point {point_index} has no daily data."
+        )
+    times = daily.get("time")
+    if not isinstance(times, list) or len(times) != GENERAL_WEATHER_DAYS:
+        raise PublisherError(
+            f"Open-Meteo general-weather point {point_index} did not return "
+            f"{GENERAL_WEATHER_DAYS} forecast days."
+        )
+
+    daily_values: dict[str, list[Any]] = {}
+    for field in GENERAL_WEATHER_DAILY_FIELDS.split(","):
+        values = daily.get(field)
+        if not isinstance(values, list) or len(values) != len(times):
+            raise PublisherError(
+                f"Open-Meteo general-weather point {point_index} is missing daily "
+                f"data for {field}."
+            )
+        daily_values[field] = values
+
+    days = []
+    for index, forecast_day in enumerate(times):
+        raw_code = _finite_float(daily_values["weather_code"][index])
+        weather_code = int(raw_code) if raw_code is not None else None
+        rain_probability = _finite_float(
+            daily_values["precipitation_probability_max"][index]
+        )
+        if rain_probability is not None and not 0 <= rain_probability <= 100:
+            raise PublisherError("Open-Meteo returned an invalid precipitation probability.")
+
+        days.append(
+            {
+                "date": forecast_day,
+                "weather_code": weather_code,
+                "weather_description": WMO_WEATHER_DESCRIPTIONS.get(
+                    weather_code,
+                    f"Other WMO condition (code {weather_code})"
+                    if weather_code is not None
+                    else "Unavailable",
+                ),
+                "temperature_max_c": _finite_float(
+                    daily_values["temperature_2m_max"][index]
+                ),
+                "temperature_min_c": _finite_float(
+                    daily_values["temperature_2m_min"][index]
+                ),
+                "apparent_temperature_max_c": _finite_float(
+                    daily_values["apparent_temperature_max"][index]
+                ),
+                "precipitation_probability_max_percent": rain_probability,
+                "precipitation_likely": (
+                    rain_probability >= 50 if rain_probability is not None else None
+                ),
+                "rain_likely": (
+                    rain_probability >= 50 and weather_code in WMO_RAIN_CODES
+                    if rain_probability is not None and weather_code is not None
+                    else None
+                ),
+                "precipitation_sum_mm": _finite_float(
+                    daily_values["precipitation_sum"][index]
+                ),
+                "rain_sum_mm": _finite_float(daily_values["rain_sum"][index]),
+                "precipitation_hours": _finite_float(
+                    daily_values["precipitation_hours"][index]
+                ),
+                "wind_speed_max_kmh": _finite_float(
+                    daily_values["wind_speed_10m_max"][index]
+                ),
+                "wind_direction_dominant_degrees": _finite_float(
+                    daily_values["wind_direction_10m_dominant"][index]
+                ),
+                "sunrise": daily_values["sunrise"][index],
+                "sunset": daily_values["sunset"][index],
+                "uv_index_max": _finite_float(daily_values["uv_index_max"][index]),
+            }
+        )
+
+    return {
+        "latitude": _finite_float(point.get("latitude")),
+        "longitude": _finite_float(point.get("longitude")),
+        "days": days,
+    }
+
+
+def publish_general_weather() -> None:
+    forecast_date = datetime.now(OUTLOOK_TIMEZONE).date()
+    date_text = forecast_date.isoformat()
+    points = _outlook_grid_points()
+    issued_at = _iso(datetime.now(timezone.utc))
+    _upsert(
+        "general_weather_forecasts",
+        "forecast_date",
+        [{"forecast_date": date_text, "issued_at": issued_at}],
+    )
+
+    batches = [
+        (start_index, points[start_index : start_index + GENERAL_WEATHER_BATCH_SIZE])
+        for start_index in range(0, len(points), GENERAL_WEATHER_BATCH_SIZE)
+    ]
+    stored_count = 0
+    for batch_number, (start_index, batch) in enumerate(batches, start=1):
+        LOG.info(
+            "Fetching general-weather batch %d/%d (%d/%d locations).",
+            batch_number,
+            len(batches),
+            start_index + 1,
+            len(points),
+        )
+        request_params = {
+            "latitude": ",".join(f"{latitude:.3f}" for latitude, _ in batch),
+            "longitude": ",".join(f"{longitude:.3f}" for _, longitude in batch),
+            "daily": GENERAL_WEATHER_DAILY_FIELDS,
+            "forecast_days": GENERAL_WEATHER_DAYS,
+            "timezone": "Europe/Berlin",
+            "wind_speed_unit": "kmh",
+        }
+        payload = _fetch_openmeteo_batch(
+            request_params,
+            api_url=GENERAL_WEATHER_API_URL,
+            dataset_name="general-weather",
+        )
+        if len(payload) != len(batch):
+            raise PublisherError(
+                f"Open-Meteo returned {len(payload)} forecasts for a "
+                f"{len(batch)}-location general-weather batch."
+            )
+
+        rows = []
+        for index, point in enumerate(payload):
+            point_payload = _daily_weather_payload(point, start_index + index)
+            latitude, longitude = batch[index]
+            if (
+                point_payload["latitude"] is None
+                or point_payload["longitude"] is None
+                or abs(point_payload["latitude"] - latitude) > 0.01
+                or abs(point_payload["longitude"] - longitude) > 0.01
+            ):
+                raise PublisherError(
+                    "Open-Meteo returned a general-weather point for an unexpected location."
+                )
+            rows.append(
+                {
+                    "forecast_date": date_text,
+                    "point_index": start_index + index,
+                    "forecast_payload": point_payload,
+                }
+            )
+
+        for row_offset in range(0, len(rows), GENERAL_WEATHER_PUBLISH_BATCH_SIZE):
+            _upsert(
+                "general_weather_forecast_points",
+                "forecast_date,point_index",
+                rows[row_offset : row_offset + GENERAL_WEATHER_PUBLISH_BATCH_SIZE],
+            )
+        stored_count += len(rows)
+        LOG.info(
+            "Saved general-weather batch %d/%d (%d/%d locations).",
+            batch_number,
+            len(batches),
+            stored_count,
+            len(points),
+        )
+
+    if stored_count != OUTLOOK_GRID_POINT_COUNT:
+        raise PublisherError(
+            f"Published {stored_count} of {OUTLOOK_GRID_POINT_COUNT} general-weather points."
+        )
+    LOG.info(
+        "Published the %d-day general-weather forecast for %s (%d locations).",
+        GENERAL_WEATHER_DAYS,
+        date_text,
+        stored_count,
     )
 
 
@@ -994,6 +1221,11 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="Publish only the daily outlook grid.",
     )
+    modes.add_argument(
+        "--general-weather-only",
+        action="store_true",
+        help="Publish only the general-weather and precipitation-probability grid.",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -1004,6 +1236,8 @@ def main(argv: list[str] | None = None) -> None:
     failures: list[str] = []
     if args.daily_outlook_only:
         tasks = (("daily outlook", publish_daily_outlook),)
+    elif args.general_weather_only:
+        tasks = (("general weather", publish_general_weather),)
     else:
         tasks = (
             ("radar Storage retention", purge_expired_radar_objects),
