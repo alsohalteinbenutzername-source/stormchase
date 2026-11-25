@@ -9,7 +9,7 @@ from publisher.severe_parameters import (
     calculate_spc_composites,
     calculate_spc_effective_parameters,
 )
-from stormanalyzer import analyze_snowstorm, analyze_storm
+from stormanalyzer import analyze_storm
 
 
 GERMANY_TZ = ZoneInfo(
@@ -890,12 +890,6 @@ def calculate_environment(
                 1
             ),
 
-        "snowfall":
-            round(
-                float(hourly["snowfall"][i] or 0),
-                2
-            ),
-
         "wind_speed":
             round(
                 float(hourly["wind_speed_10m"][i] or 0),
@@ -1394,10 +1388,7 @@ def score_environment(
 
 
 
-def calculate_best_window(
-    hourly,
-    winter_mode=False
-):
+def calculate_best_window(hourly):
 
     times = hourly[
         "time"
@@ -1445,27 +1436,19 @@ def calculate_best_window(
             i
         )
 
-        if winter_mode:
-            analysis = analyze_snowstorm(
-                result["snowfall"],
-                result["precipitation"],
-                result["temperature"],
-                result["wind_speed"]
-            )
-        else:
-            analysis = analyze_storm(
-                result["cape"],
-                result["high_shear"],
-                result["low_shear"],
-                result["dewpoint"],
-                result["srh"],
-                result["cin"],
-                result["lcl"],
-                result["humidity"],
-                result["temperature"],
-                result["lapse"],
-                **_storm_feature_arguments(result),
-            )
+        analysis = analyze_storm(
+            result["cape"],
+            result["high_shear"],
+            result["low_shear"],
+            result["dewpoint"],
+            result["srh"],
+            result["cin"],
+            result["lcl"],
+            result["humidity"],
+            result["temperature"],
+            result["lapse"],
+            **_storm_feature_arguments(result),
+        )
 
         score = analysis["risk"]
 

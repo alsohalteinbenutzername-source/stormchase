@@ -11,7 +11,7 @@ from calculations import (
     calculate_manual_storm,
     calculate_storm_motion_features,
 )
-from stormanalyzer import analyze_snowstorm, analyze_storm
+from stormanalyzer import analyze_storm
 
 
 class CalculateManualStormTests(unittest.TestCase):
@@ -289,14 +289,6 @@ class CalculateManualStormTests(unittest.TestCase):
         self.assertLessEqual(analysis["hail"], 80)
         self.assertLessEqual(analysis["wind"], 80)
 
-    def test_doubles_snowstorm_risk_to_the_new_maximum(self) -> None:
-        analysis = analyze_snowstorm(10, 5, -5, 55)
-
-        self.assertEqual(analysis["risk"], 100)
-        self.assertEqual(analysis["wind"], 20)
-        self.assertNotIn("mcs", analysis)
-
-
 class CalculateBestDayWindowTests(unittest.TestCase):
     def setUp(self) -> None:
         self.now = datetime(2026, 11, 13, 17, 0, tzinfo=ZoneInfo("Europe/Berlin"))
@@ -326,7 +318,6 @@ class CalculateBestDayWindowTests(unittest.TestCase):
             "geopotential_height_700hPa": [3000, 3000, 3000, 3000],
             "geopotential_height_500hPa": [5500, 5500, 5500, 5500],
             "precipitation": [0, 0, 0, 0],
-            "snowfall": [0, 0, 0, 0],
             "wind_speed_10m": [10, 10, 10, 10],
             "wind_direction_10m": [180, 180, 180, 180],
             "wind_speed_180m": [12, 12, 12, 12],
