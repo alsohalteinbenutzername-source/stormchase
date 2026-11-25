@@ -314,7 +314,9 @@ def get_germany_grid_weather(locations):
     payload_by_model = {}
     for model, forecast_days in (("icon_d2", 2),):
         model_payload = []
-        for batch in batches:
+        for batch_index, batch in enumerate(batches, start=1):
+            first_point = (batch_index - 1) * OUTLOOK_BATCH_SIZE + 1
+            last_point = first_point + len(batch) - 1
             request_params = {
                 "latitude": ",".join(f"{latitude:.3f}" for latitude, _ in batch),
                 "longitude": ",".join(f"{longitude:.3f}" for _, longitude in batch),
@@ -325,18 +327,40 @@ def get_germany_grid_weather(locations):
                 "wind_speed_unit": "kmh",
             }
             url = "https://api.open-meteo.com/v1/dwd-icon"
-            if not _weather_response_cached(url, request_params):
+            is_cached = _weather_response_cached(url, request_params)
+            print(
+                f"[Outlook API] {model}: requesting grid points {first_point}–{last_point} "
+                f"of {len(locations)} ({batch_index}/{len(batches)})"
+                f"{' from local cache' if is_cached else ' from Open-Meteo'}...",
+                flush=True,
+            )
+            if not is_cached:
                 scheduled_at = request_started + network_request_index * batch_interval
                 wait_seconds = scheduled_at - time.monotonic()
                 if wait_seconds > 0:
                     time.sleep(wait_seconds)
-            response = _get_weather_response(
-                url,
-                request_params,
-                cache_expire_after=cache_expire_after,
-            )
+            batch_started = time.monotonic()
+            try:
+                response = _get_weather_response(
+                    url,
+                    request_params,
+                    cache_expire_after=cache_expire_after,
+                )
+            except Exception as error:
+                print(
+                    f"[Outlook API] {model}: batch {batch_index}/{len(batches)} failed: "
+                    f"{type(error).__name__}: {error}",
+                    flush=True,
+                )
+                raise
             if not getattr(response, "from_cache", False):
                 network_request_index += 1
+            print(
+                f"[Outlook API] {model}: batch {batch_index}/{len(batches)} complete "
+                f"in {time.monotonic() - batch_started:.1f}s "
+                f"({'cache' if getattr(response, 'from_cache', False) else 'network'}).",
+                flush=True,
+            )
             batch_payload = response.json()
             if isinstance(batch_payload, dict):
                 batch_payload = [batch_payload]

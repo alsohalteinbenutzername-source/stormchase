@@ -834,6 +834,7 @@ class StormRadarApp:
         self._storm_outlook_loading = False
         self._storm_outlook_error: str | None = None
         self._storm_outlook_loaded_at: datetime | None = None
+        self._outlook_use_local_feed = False
         self._outlook_day = 0
         self._outlook_metric = "Overall risk"
         self._outlook_location: tuple[float, float] | None = None
@@ -1087,6 +1088,14 @@ class StormRadarApp:
             state="disabled",
         )
         self.outlook_load_button.pack(side="left", padx=(8, 0))
+        self.outlook_source_button = ttk.Button(
+            map_toolbar,
+            text="Use local feed",
+            width=14,
+            command=self._toggle_outlook_source,
+            state="disabled",
+        )
+        self.outlook_source_button.pack(side="left", padx=(5, 0))
         ttk.Button(
             map_toolbar,
             text="Zoom +",
@@ -1288,7 +1297,6 @@ class StormRadarApp:
             ("temperature", "Temperature (°C)", "30"),
             ("dewpoint", "Dewpoint (°C)", "18"),
             ("humidity", "Humidity (%)", "70"),
-            ("snowfall", "Snowfall (cm/hour)", "0"),
             ("precipitation", "Precipitation (mm/hour)", "0"),
             ("wind_speed", "Surface wind (km/h)", "15"),
             ("srh", "Full-profile SRH (m²/s²)", "150"),
@@ -1325,7 +1333,7 @@ class StormRadarApp:
             style="Panel.TLabelframe",
             padding=6,
         )
-        advanced_box.grid(row=7, column=0, columnspan=4, sticky="ew", pady=(6, 0))
+        advanced_box.grid(row=6, column=0, columnspan=4, sticky="ew", pady=(6, 0))
         ttk.Label(
             advanced_box,
             text=(
@@ -1496,7 +1504,7 @@ class StormRadarApp:
             f"Threats: {threats}\n"
             f"Issued: {analysis['issued']}\n"
             f"Assessment:\n{criticism}\n"
-            "Snowfall, precipitation, and surface wind are shown as context; "
+            "Precipitation and surface wind are shown as context; "
             "the severe-thunderstorm score uses the other environmental inputs."
         )
 
@@ -3029,13 +3037,19 @@ class StormRadarApp:
         self._draw_map()
         self.loop.create_task(self._load_storm_outlook())
 
+    def _toggle_outlook_source(self) -> None:
+        if self._storm_outlook_loading:
+            return
+        self._outlook_use_local_feed = not self._outlook_use_local_feed
+        self._ensure_storm_outlook()
+
     async def _load_storm_outlook(self) -> None:
         try:
             outlook, issued_at = await self.loop.run_in_executor(
                 self.executor,
                 calculate_germany_outlook,
                 self.germany_outline,
-                self.supabase,
+                None if self._outlook_use_local_feed else self.supabase,
             )
         except Exception as error:
             self._storm_outlook_loading = False
@@ -3080,6 +3094,8 @@ class StormRadarApp:
             else "disabled"
         )
         self.outlook_load_button.configure(text=text, state=state)
+        source_text = "Use shared feed" if self._outlook_use_local_feed else "Use local feed"
+        self.outlook_source_button.configure(text=source_text, state=state)
 
     def _schedule_warning_refresh(self) -> None:
         if self._closed or self.map_mode != DWD_WARNING_MAP:
@@ -3531,7 +3547,7 @@ class StormRadarApp:
                 ("cape", "CAPE"), ("convective_inhibition", "CIN"),
                 ("temperature_2m", "Temp"), ("dew_point_2m", "Dewpoint"),
                 ("relative_humidity_2m", "Humidity"), ("precipitation", "Precip"),
-                ("snowfall", "Snow"), ("wind_speed_10m", "10 m wind"),
+                ("wind_speed_10m", "10 m wind"),
                 ("wind_direction_10m", "10 m direction"),
                 ("temperature_850hPa", "850 hPa temp"),
                 ("temperature_700hPa", "700 hPa temp"),
@@ -3559,7 +3575,6 @@ class StormRadarApp:
             ("dew_point_2m", "Dewpoint"),
             ("relative_humidity_2m", "Humidity"),
             ("precipitation", "Precip"),
-            ("snowfall", "Snow"),
             ("wind_speed_10m", "10 m wind"),
             ("wind_direction_10m", "10 m direction"),
             ("temperature_850hPa", "850 hPa temp"),
