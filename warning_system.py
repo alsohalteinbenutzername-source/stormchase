@@ -23,8 +23,8 @@ WARNING_LEVELS: dict[str, tuple[WarningLevel, ...]] = {
     ),
     "tornado": (
         WarningLevel(1, "BASE", "Tornado warning", "Radar-indicated or reliably reported tornado/developing tornado."),
-        WarningLevel(2, "CONSIDERABLE / PDS WORDING", "Considerable tornado damage threat", "Used when a tornado is occurring with high-confidence radar evidence and/or reliable visual confirmation; NWS warning text adds the particularly dangerous situation wording."),
-        WarningLevel(3, "CATASTROPHIC / TORNADO EMERGENCY CRITERIA", "Catastrophic tornado damage threat", "Exceedingly rare: severe threat to human life and catastrophic damage are imminent or ongoing, with reliable visual/radar evidence and NWS supervisor/team concurrence. StormChase cannot reproduce NWS operational authorization."),
+        WarningLevel(2, "CONSIDERABLE / PDS WORDING", "Considerable tornado damage threat", "Use only with credible evidence that a tornado capable of considerable damage is imminent or ongoing; NWS warning text may add the particularly dangerous situation wording."),
+        WarningLevel(3, "CATASTROPHIC / TORNADO EMERGENCY CRITERIA", "Catastrophic tornado damage threat", "Exceedingly rare: a severe threat to human life and catastrophic damage are occurring or imminent, with reliable confirmation of a violent tornado and NWS supervisor/team concurrence. StormChase cannot reproduce NWS operational authorization."),
     ),
     "hail": (
         WarningLevel(1, "BASE", "Severe hail", "NWS base severe-thunderstorm hail criterion.", "≥1.00 in / 25 mm"),
