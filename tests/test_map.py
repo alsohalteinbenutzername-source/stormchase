@@ -1,7 +1,13 @@
 import unittest
 
 from radar import GERMANY_EXTENT
-from ui import esri_bbox, fit_extent_to_aspect, load_germany_outline, zoom_axis_limits
+from ui import (
+    StormRadarApp,
+    esri_bbox,
+    fit_extent_to_aspect,
+    load_germany_outline,
+    zoom_axis_limits,
+)
 
 
 class GermanyOutlineTests(unittest.TestCase):
@@ -59,6 +65,26 @@ class ImageryExtentTests(unittest.TestCase):
     def test_rejects_non_positive_image_aspect_ratio(self) -> None:
         with self.assertRaisesRegex(ValueError, "aspect ratio must be positive"):
             fit_extent_to_aspect((5.0, 16.0, 47.0, 56.0), 0)
+
+
+class MapMeasurementTests(unittest.TestCase):
+    def test_zero_distance_for_identical_points(self) -> None:
+        self.assertAlmostEqual(
+            StormRadarApp._distance_km((50.0, 10.0), (50.0, 10.0)),
+            0.0,
+            places=8,
+        )
+
+    def test_one_degree_of_longitude_at_equator(self) -> None:
+        distance = StormRadarApp._distance_km((0.0, 0.0), (0.0, 1.0))
+
+        self.assertAlmostEqual(distance, 111.195, delta=0.01)
+
+    def test_longitude_distance_decreases_at_higher_latitudes(self) -> None:
+        equatorial = StormRadarApp._distance_km((0.0, 0.0), (0.0, 1.0))
+        at_fifty_degrees = StormRadarApp._distance_km((50.0, 0.0), (50.0, 1.0))
+
+        self.assertLess(at_fifty_degrees, equatorial)
 
 
 if __name__ == "__main__":
