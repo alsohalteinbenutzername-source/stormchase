@@ -3019,8 +3019,13 @@ class StormRadarApp:
     async def _load_weather_data(self) -> None:
         refresh_started = time_module.perf_counter()
         reports_future = None
+        warnings_future = None
         try:
             client = self.supabase
+            warnings_future = (
+                self.loop.run_in_executor(self.executor, client.active_community_warnings)
+                if client is not None else None
+            )
             _terminal_progress("Refresh", "Requesting the latest local DWD radar frame.")
             radar_future = self.loop.run_in_executor(
                 self.executor,
@@ -3183,9 +3188,60 @@ class StormRadarApp:
             else:
                 self._render_community_reports()
 
+            if warnings_future is not None:
+                warnings_result = await asyncio.gather(
+                    warnings_future,
+                    return_exceptions=True,
+                )
+                warnings_result = warnings_result[0]
+                if isinstance(warnings_result, BaseException):
+                    self._record_source_error("Community warnings", warnings_result)
+                    _terminal_progress(
+                        "Warnings",
+                        f"Community warning feed unavailable: {type(warnings_result).__name__}: {warnings_result}",
+                    )
+                else:
+                    self.active_community_warnings = tuple(warnings_result)
+                    self._record_source_success(
+                        "Community warnings",
+                        extra=f"{len(self.active_community_warnings)} active polygons",
+                    )
+                    for warning in self.active_community_warnings:
+                        try:
+                            warning_time = datetime.fromisoformat(
+                                str(warning.get("created_at", datetime.now(timezone.utc).isoformat())).replace("Z", "+00:00")
+                            )
+                            self.case_analysis.record_event(
+                                "community_warning",
+                                str(warning.get("id", "")),
+                                warning_time,
+                                f"{warning.get('headline', 'Community warning')} · "
+                                f"{warning.get('category', 'hazard')} level {warning.get('level', '?')}",
+                                source="StormChase community warning",
+                            )
+                        except (TypeError, ValueError):
+                            pass
+                    self._populate_admin_warning_list()
+            if storm_result is not None and not isinstance(storm_result, BaseException):
+                try:
+                    await self.loop.run_in_executor(
+                        self.executor,
+                        self.case_analysis.record_cells,
+                        self.storm_update.cells,
+                        self.storm_update.timestamp,
+                        self.cell_motion_winds,
+                    )
+                except Exception as error:
+                    _terminal_progress(
+                        "Case analysis",
+                        f"Local case history could not be saved: {type(error).__name__}: {error}",
+                    )
+
             self._record_session_snapshot()
             self._populate_cell_list()
             self._update_alert_status()
+            self._refresh_case_analysis_panel()
+            self._refresh_admin_controls()
             if wind_error is not None:
                 wind_status = (
                     f" · Wind projection unavailable: "
@@ -3356,6 +3412,7 @@ class StormRadarApp:
         now = datetime.now(timezone.utc)
         freshness_limits = {
             "DWD reflectivity": timedelta(minutes=12),
+            "Community warnings": timedelta(minutes=15),
             "KONRAD3D tracking": timedelta(minutes=12),
             "DWD velocity": timedelta(minutes=12),
             "DWD mesocyclone detections": timedelta(minutes=12),
@@ -4087,6 +4144,78 @@ class StormRadarApp:
                 zorder=2,
             )
 
+        if not outlook_mode:
+            for warning in self.active_community_warnings:
+                category = warning.get("category")
+                level = warning.get("level")
+                if category not in WARNING_COLORS:
+                    continue
+                try:
+                    vertices = warning.get("polygon")
+                    if not isinstance(vertices, list) or len(vertices) < 4:
+                        continue
+                    longitudes = [float(point[0]) for point in vertices]
+                    latitudes = [float(point[1]) for point in vertices]
+                    color = WARNING_COLORS[category][int(level) - 1]
+                except (TypeError, ValueError, IndexError, KeyError):
+                    continue
+                self.axes.fill(
+                    longitudes,
+                    latitudes,
+                    facecolor=color,
+                    edgecolor=color,
+                    alpha=0.16,
+                    linewidth=1.8,
+                    zorder=3,
+                )
+                self.axes.plot(
+                    longitudes,
+                    latitudes,
+                    color=color,
+                    linewidth=1.8,
+                    linestyle="-",
+                    alpha=0.95,
+                    zorder=3,
+                    label=(
+                        f"Community warning · {WARNING_CATEGORY_LABELS[category]} L{level}"
+                    ),
+                )
+                self.axes.text(
+                    longitudes[0],
+                    latitudes[0],
+                    f"UNOFFICIAL · {warning.get('headline', 'Community warning')}",
+                    color="white",
+                    fontsize=7,
+                    zorder=4,
+                    path_effects=[
+                        path_effects.withStroke(linewidth=2.4, foreground="#101820")
+                    ],
+                )
+            if self._warning_polygon_draft:
+                draft_lon = [point[0] for point in self._warning_polygon_draft]
+                draft_lat = [point[1] for point in self._warning_polygon_draft]
+                self.axes.plot(
+                    draft_lon,
+                    draft_lat,
+                    color="#ffffff",
+                    linewidth=2.0,
+                    linestyle="--",
+                    marker="o",
+                    markersize=4,
+                    label="Warning polygon draft",
+                    zorder=14,
+                )
+                if len(self._warning_polygon_draft) >= 3:
+                    self.axes.plot(
+                        [draft_lon[-1], draft_lon[0]],
+                        [draft_lat[-1], draft_lat[0]],
+                        color="#ffffff",
+                        linewidth=1.3,
+                        linestyle=":",
+                        alpha=0.8,
+                        zorder=14,
+                    )
+
         if outlook_mode:
             from matplotlib.patches import Polygon
             for outline in self.germany_outline:
@@ -4458,6 +4587,77 @@ class StormRadarApp:
                 label=f"{site.name} radar station",
                 zorder=8,
             )
+
+        if (
+            self.map_mode == LIVE_MAP
+            and self.radar_product == VELOCITY_RADAR
+            and self.velocity_radar_site is not None
+            and not radar_replay_active
+        ):
+            frame = self.velocity_radar_frame
+            site = self.velocity_radar_site
+            elevation = frame.elevation_angle_degrees if frame is not None else None
+            radar_latitude = (
+                frame.site_latitude
+                if frame is not None and frame.site_latitude is not None
+                else site.latitude
+            )
+            radar_longitude = (
+                frame.site_longitude
+                if frame is not None and frame.site_longitude is not None
+                else site.longitude
+            )
+            if elevation is not None:
+                for beam_height_km in (0.5, 1.0, 2.0, 3.0):
+                    try:
+                        radius_km = beam_height_contour_range_km(
+                            beam_height_km,
+                            elevation,
+                        )
+                    except ValueError:
+                        continue
+                    if radius_km > site.max_range_km:
+                        continue
+                    latitude_scale_km = 111.32
+                    longitude_scale_km = max(
+                        111.32 * abs(math.cos(math.radians(radar_latitude))),
+                        1.0,
+                    )
+                    ring = matplotlib.patches.Ellipse(
+                        (radar_longitude, radar_latitude),
+                        width=2.0 * radius_km / longitude_scale_km,
+                        height=2.0 * radius_km / latitude_scale_km,
+                        fill=False,
+                        edgecolor="#d6e7f0",
+                        linewidth=0.9,
+                        linestyle=(0, (4, 3)),
+                        alpha=0.72,
+                        zorder=8,
+                        label=(
+                            f"Beam centre +{beam_height_km:g} km "
+                            "(4/3-Earth approximation)"
+                            if beam_height_km == 0.5 else "_nolegend_"
+                        ),
+                    )
+                    self.axes.add_patch(ring)
+                    self.axes.text(
+                        radar_longitude,
+                        radar_latitude + radius_km / latitude_scale_km,
+                        f"{beam_height_km:g} km",
+                        color="#e7f2f7",
+                        fontsize=7,
+                        ha="center",
+                        va="bottom",
+                        zorder=9,
+                        path_effects=[
+                            path_effects.withStroke(linewidth=2.0, foreground="#101820")
+                        ],
+                    )
+            else:
+                _terminal_progress(
+                    "Radar",
+                    "Beam-height overlay unavailable: ODIM elevation-angle metadata is missing.",
+                )
 
         motion_legend_drawn = False
         for cell in self.storm_update.cells if live_observation_overlays else ():
