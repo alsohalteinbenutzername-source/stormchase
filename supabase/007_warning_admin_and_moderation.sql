@@ -36,6 +36,7 @@ create table if not exists public.storm_warnings (
     ),
     level smallint not null check (level between 1 and 3),
     level_tag text not null,
+    threshold text,
     headline text not null check (length(btrim(headline)) between 1 and 120),
     description text not null check (length(btrim(description)) between 1 and 2000),
     polygon jsonb not null check (
