@@ -22,9 +22,9 @@ WARNING_LEVELS: dict[str, tuple[WarningLevel, ...]] = {
         WarningLevel(3, "DESTRUCTIVE", "Destructive wind damage threat", "NWS destructive damage-threat tag.", "≥80 mph / 129 km/h"),
     ),
     "tornado": (
-        WarningLevel(1, "BASE", "Tornado warning", "Radar-indicated or reliably reported tornado/developing tornado."),
-        WarningLevel(2, "CONSIDERABLE / PDS WORDING", "Considerable tornado damage threat", "Use only with credible evidence that a tornado capable of considerable damage is imminent or ongoing; NWS warning text may add the particularly dangerous situation wording."),
-        WarningLevel(3, "CATASTROPHIC / TORNADO EMERGENCY CRITERIA", "Catastrophic tornado damage threat", "Exceedingly rare: a severe threat to human life and catastrophic damage are occurring or imminent, with reliable confirmation of a violent tornado and NWS supervisor/team concurrence. StormChase cannot reproduce NWS operational authorization."),
+        WarningLevel(1, "BASE", "Tornado warning", "A tornado is indicated by radar or supported by credible reports; the base damage-threat tag is the default tier."),
+        WarningLevel(2, "CONSIDERABLE", "Considerable tornado damage threat", "NWS impact-based tag for a strong, confirmed tornado. The PDS wording is a separate possible text qualifier, not the name of this tag."),
+        WarningLevel(3, "CATASTROPHIC", "Catastrophic tornado damage threat", "NWS impact-based tag for a strong, confirmed tornado impacting a populated area. A formal NWS Tornado Emergency is a separate product with additional criteria and operational authorization; StormChase cannot issue one."),
     ),
     "hail": (
         WarningLevel(1, "BASE", "Severe hail", "NWS base severe-thunderstorm hail criterion.", "≥1.00 in / 25 mm"),
@@ -33,7 +33,7 @@ WARNING_LEVELS: dict[str, tuple[WarningLevel, ...]] = {
     ),
     "heavy_rain": (
         WarningLevel(1, "DWD LEVEL 2", "Heavy rain · Markante Wetterwarnung", "DWD Starkregen: 15–25 mm in 1 h or 20–35 mm in 6 h.", "15–25 mm/1 h or 20–35 mm/6 h"),
-        WarningLevel(2, "DWD LEVEL 3", "Very heavy rain · Unwetterwarnung", "DWD heftiger Starkregen: >25–40 mm in 1 h or >35–60 mm in 6 h.", ">25–40 mm/1 h or >35–60 mm/6 h"),
+        WarningLevel(2, "DWD LEVEL 3", "Very heavy rain · Unwetterwarnung", "DWD heftiger Starkregen: 25–40 mm in 1 h or 35–60 mm in 6 h.", "25–40 mm/1 h or 35–60 mm/6 h"),
         WarningLevel(3, "DWD LEVEL 4", "Extreme heavy rain · Extremes Unwetter", "DWD extrem heftiger Starkregen: >40 mm in 1 h or >60 mm in 6 h.", ">40 mm/1 h or >60 mm/6 h"),
     ),
 }
@@ -140,7 +140,7 @@ def validate_warning_payload(
         raise ValueError("Description must contain 1–2000 characters.")
     if category == "tornado" and level == 3 and not catastrophic_confirmed:
         raise ValueError(
-            "The catastrophic tier requires confirmation of reliable evidence and the catastrophic-impact criteria."
+            "The catastrophic tier requires reliable confirmation of a strong tornado impacting a populated area. This is not an official NWS Tornado Emergency."
         )
     now = datetime.now(timezone.utc)
     expiry = expires_at.replace(tzinfo=timezone.utc) if expires_at.tzinfo is None else expires_at.astimezone(timezone.utc)
