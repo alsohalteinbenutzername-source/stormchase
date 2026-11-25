@@ -199,6 +199,55 @@ create trigger storm_report_moderation_trigger
     before update on public.storm_reports
     for each row execute function public.enforce_storm_report_moderation();
 
+create table if not exists public.storm_report_moderation_audit (
+    id bigint generated always as identity primary key,
+    report_id uuid not null references public.storm_reports(id) on delete cascade,
+    actor_id uuid,
+    previous_status text,
+    new_status text not null,
+    review_note text,
+    created_at timestamptz not null default now()
+);
+
+create index if not exists storm_report_moderation_audit_recent_idx
+    on public.storm_report_moderation_audit(created_at desc);
+
+alter table public.storm_report_moderation_audit enable row level security;
+drop policy if exists "Admins can read report moderation audit"
+    on public.storm_report_moderation_audit;
+create policy "Admins can read report moderation audit"
+    on public.storm_report_moderation_audit for select to authenticated
+    using (public.is_stormchase_admin());
+revoke all on public.storm_report_moderation_audit from anon, authenticated;
+grant select on public.storm_report_moderation_audit to authenticated;
+
+create or replace function public.audit_storm_report_moderation()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $
+begin
+    if new.verification_status is distinct from old.verification_status
+       or new.review_note is distinct from old.review_note then
+        insert into public.storm_report_moderation_audit (
+            report_id, actor_id, previous_status, new_status, review_note
+        )
+        values (
+            new.id, auth.uid(), old.verification_status,
+            new.verification_status, new.review_note
+        );
+    end if;
+    return new;
+end;
+$;
+
+revoke all on function public.audit_storm_report_moderation() from public, anon, authenticated;
+drop trigger if exists storm_report_moderation_audit_trigger on public.storm_reports;
+create trigger storm_report_moderation_audit_trigger
+    after update on public.storm_reports
+    for each row execute function public.audit_storm_report_moderation();
+
 -- Efficient shared read: the desktop polls only this small metadata table.
 create or replace function public.expire_stormchase_warnings()
 returns void
