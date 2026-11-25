@@ -1629,8 +1629,31 @@ class StormRadarApp:
     def _build_admin_tab(self) -> None:
         self.admin_tab.columnconfigure(0, weight=1)
         self.admin_tab.rowconfigure(0, weight=1)
-        outer = ttk.Frame(self.admin_tab, padding=8)
-        outer.grid(row=0, column=0, sticky="nsew")
+        canvas = tk.Canvas(
+            self.admin_tab,
+            bg=PANEL,
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(
+            self.admin_tab,
+            orient="vertical",
+            command=canvas.yview,
+        )
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        outer = ttk.Frame(canvas, padding=8)
+        canvas_window = canvas.create_window((0, 0), window=outer, anchor="nw")
+
+        def update_scroll_region(_event: Any = None) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def update_content_width(event: tk.Event[tk.Misc]) -> None:
+            canvas.itemconfigure(canvas_window, width=event.width)
+
+        outer.bind("<Configure>", update_scroll_region)
+        canvas.bind("<Configure>", update_content_width)
         outer.columnconfigure(0, weight=1)
         outer.rowconfigure(2, weight=1)
 
@@ -1895,6 +1918,11 @@ class StormRadarApp:
             )
         for widget in getattr(self, "admin_editor_widgets", ()):
             widget.configure(state="normal" if is_admin else "disabled")
+        if hasattr(self, "admin_category_combo"):
+            self.admin_category_combo.configure(state="readonly" if is_admin else "disabled")
+            self.admin_level_combo.configure(state="readonly" if is_admin else "disabled")
+        if hasattr(self, "admin_report_status_combo"):
+            self.admin_report_status_combo.configure(state="readonly" if is_admin else "disabled")
         for widget_name in (
             "admin_draw_button",
             "admin_clear_polygon_button",
@@ -1907,8 +1935,9 @@ class StormRadarApp:
             widget = getattr(self, widget_name, None)
             if widget is not None:
                 widget.configure(state="normal" if is_admin else "disabled")
-        if not is_admin:
+        if not is_admin and self._warning_drawing_enabled:
             self._warning_drawing_enabled = False
+            self._warning_polygon_draft.clear()
         self._populate_admin_warning_list()
         self._populate_admin_report_list()
 
