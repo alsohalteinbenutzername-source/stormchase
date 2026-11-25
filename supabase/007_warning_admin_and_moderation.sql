@@ -219,8 +219,11 @@ begin
     values (
         new.id,
         auth.uid(),
-        case when old.status = 'active' and new.status = 'cancelled'
-             then 'cancelled' else 'updated' end,
+        case
+            when old.status = 'active' and new.status = 'cancelled' then 'cancelled'
+            when old.status = 'active' and new.status = 'expired' then 'expired'
+            else 'updated'
+        end,
         to_jsonb(old),
         to_jsonb(new)
     );
