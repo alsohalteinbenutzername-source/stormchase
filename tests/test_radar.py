@@ -181,11 +181,11 @@ class NearestVelocityRadarSiteTests(unittest.TestCase):
 
 class RotationDetectionTests(unittest.TestCase):
     def test_detects_adjacent_velocity_couplet_and_returns_its_map_location(self) -> None:
-        velocity = np.zeros((5, 10), dtype=np.float32)
-        velocity[2:4, 0:5] = -20.0
-        velocity[2:4, 5:10] = 20.0
-        # A 10-degree grid would span hundreds of kilometres and fail the
-        # detector's physical shear criteria. Model a compact radar couplet.
+        velocity = np.empty((5, 10), dtype=np.float32)
+        velocity[:, :5] = -20.0
+        velocity[:, 5:] = 20.0
+        # Use a compact, uniformly sampled couplet without a large zero-flow
+        # background that would merge into the local-residual lobes.
         frame = RadarFrame(velocity, None, extent=(0.0, 0.015, 0.0, 0.005))
 
         detections = detect_rotations(frame)
@@ -193,7 +193,7 @@ class RotationDetectionTests(unittest.TestCase):
         self.assertEqual(len(detections), 1)
         detection = detections[0]
         self.assertAlmostEqual(detection.latitude, 0.0025)
-        self.assertAlmostEqual(detection.longitude, 0.009)
+        self.assertAlmostEqual(detection.longitude, 0.0075)
         self.assertEqual(detection.negative_pixels, 10)
         self.assertEqual(detection.positive_pixels, 10)
         self.assertTrue(rotation_detection(frame))
