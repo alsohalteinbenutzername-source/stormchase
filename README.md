@@ -120,14 +120,15 @@ cell-motion wind projections continue to use live third-party requests. When
 configured, Supabase also supplies shared KONRAD3D tracking/prediction
 snapshots and authenticated community-report features.
 
-The separate general-weather publisher fetches Open-Meteo's seven-day daily
-forecast for the same 744-point Germany grid. It stores WMO weather codes and
-readable conditions, daily high/low temperatures, precipitation probability,
-rain likelihood, precipitation amounts and hours, wind, sunrise/sunset, and UV
-index in `general_weather_forecasts` and `general_weather_forecast_points`.
-Rain is marked likely when precipitation probability is at least 50% and the
-WMO code describes rain, drizzle, showers, or a thunderstorm. General
-precipitation likelihood is stored separately from rain likelihood.
+The separate general-weather analysis loads today's 744-point ICON-D2
+environment from the daily outlook tables, fetches matching daily weather
+extras from Open-Meteo, and combines them with StormAnalyzer. It stores two
+days of WMO-coded conditions, precipitation and rain probabilities, amounts,
+temperatures, wind, sunrise/sunset, UV index, and analysis in
+`general_weather_forecasts` and `general_weather_forecast_points`. The analysis
+uses WMO conditions, precipitation probability, and the ICON-D2 CAPE, wind,
+temperature, humidity, and precipitation environment to estimate whether rain,
+frozen precipitation, or a thunderstorm signal is likely.
 
 1. In the Supabase SQL editor, run
    [`supabase/001_stormchase_schema.sql`](./supabase/001_stormchase_schema.sql).
@@ -177,9 +178,30 @@ precipitation likelihood is stored separately from rain likelihood.
    lightning data without fetching the daily outlook. The separate
    daily-outlook workflow refreshes the shared ICON-D2 grid shortly after
    midnight in Germany (using `--daily-outlook-only`) and can also be started
-   manually. The general-weather workflow runs every three hours (using
-   `--general-weather-only`) and can also be started manually. GitHub Actions
-   and scheduled workflows must be enabled in this
+   manually. The general-weather workflow uses `workflow_dispatch` and can be
+   started manually or by cron-job.org. To configure cron-job.org, create a
+   fine-grained GitHub token limited to this repository with **Actions: write**
+   permission. Configure a POST job to
+   `https://api.github.com/repos/OWNER/REPO/actions/workflows/general-weather.yml/dispatches`
+   with these headers and body:
+
+   ```text
+   Accept: application/vnd.github+json
+   Authorization: Bearer YOUR_FINE_GRAINED_TOKEN
+   X-GitHub-Api-Version: 2022-11-28
+   Content-Type: application/json
+   ```
+
+   ```json
+   {"ref":"main"}
+   ```
+
+   Set the cron-job.org timezone to `Europe/Berlin` and choose the interval you
+   want (for example, every three hours, starting at 00:30 so the daily outlook
+   has time to publish first). Replace `OWNER/REPO` and `main` with
+   your GitHub owner, repository, and default branch. Keep the token in
+   cron-job.org's secure header settings; do not put it in the workflow file.
+   GitHub Actions and scheduled workflows must be enabled in this
    repository's **Settings → Actions**.
 
    Supabase Cron can dispatch the live-data workflow every five minutes too.

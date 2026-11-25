@@ -153,8 +153,14 @@ def calculate_germany_outlook(
     points = germany_grid_points(outlines)
     now = datetime.now(ZoneInfo("Europe/Berlin"))
     cached_outlook = None
+    general_weather_grid = None
     if supabase is not None:
         cached_outlook = supabase.daily_outlook_grid(now.date())
+        if cached_outlook is not None:
+            try:
+                general_weather_grid = supabase.daily_general_weather_grid(now.date())
+            except SupabaseError as error:
+                print(f"WARNING: Shared general-weather analysis is unavailable: {error}")
 
     if cached_outlook is None:
         weather = get_germany_grid_weather(points)
@@ -218,7 +224,7 @@ def calculate_germany_outlook(
     validate_grid_profiles(weather)
 
     outlook = []
-    for (latitude, longitude), location in zip(points, weather):
+    for point_index, ((latitude, longitude), location) in enumerate(zip(points, weather)):
         best_by_day: dict[int, dict[str, Any]] = {}
         hourly = location.get("icon_d2")
         for day in range(2):
@@ -233,6 +239,20 @@ def calculate_germany_outlook(
                     "latitude": latitude,
                     "longitude": longitude,
                 }
+                if general_weather_grid is not None and point_index < len(general_weather_grid):
+                    daily_payload = general_weather_grid[point_index]
+                    target_date = (now.date() + timedelta(days=day)).isoformat()
+                    general_day = next(
+                        (
+                            forecast
+                            for forecast in daily_payload.get("days", [])
+                            if isinstance(forecast, dict)
+                            and forecast.get("date") == target_date
+                        ),
+                        None,
+                    )
+                    if general_day is not None:
+                        best_by_day[day]["general_weather"] = general_day
         outlook.extend({**entry, "day": day} for day, entry in best_by_day.items())
     return outlook, issued_at
 
@@ -1526,6 +1546,27 @@ class StormRadarApp:
         environment = entry["environment"]
         threats = ", ".join(entry["threats"]) or "No specific severe-weather threats indicated"
         criticism = "\n".join(entry["criticism"]) or "No additional assessment notes."
+        general_weather_text = ""
+        general_weather = entry.get("general_weather")
+        analysis = general_weather.get("analysis") if isinstance(general_weather, dict) else None
+        if isinstance(analysis, dict):
+            probability = analysis.get("precipitation_probability_percent")
+            probability_text = (
+                f"{probability:.0f}% precipitation chance"
+                if isinstance(probability, (int, float))
+                else "precipitation chance unavailable"
+            )
+            rain_text = "Rain likely" if analysis.get("rain_likely") else "Rain not indicated"
+            frozen_text = (
+                " · Frozen precipitation likely"
+                if analysis.get("frozen_precipitation_likely")
+                else ""
+            )
+            general_weather_text = (
+                f"General weather: {analysis.get('headline', analysis.get('condition', 'Unavailable'))} · "
+                f"{analysis.get('condition', 'Unavailable')} · {probability_text} · {rain_text}"
+                f"{frozen_text}\n"
+            )
         self.outlook_calculation_text.set(
             f"Day {self._outlook_day + 1} · nearest forecast grid point "
             f"{entry['latitude']:.2f}° N, {entry['longitude']:.2f}° E · {entry['time']}\n"
@@ -1538,6 +1579,7 @@ class StormRadarApp:
             f"Full-profile SRH {environment['srh']} m²/s² · "
             f"Deep shear {environment['high_shear']} kt · "
             f"Low-level shear {environment['low_shear']} kt\n"
+            f"{general_weather_text}"
             f"Near-surface: 0–1 km SRH {environment['srh_0_1km']:.0f} · "
             f"0–3 km SRH {environment['srh_0_3km']:.0f} · "
             f"efficiency {environment['srh_efficiency']:.2f} · "

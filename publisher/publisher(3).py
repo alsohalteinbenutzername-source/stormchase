@@ -11,13 +11,18 @@ import json
 import logging
 import math
 import os
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
+import sys
 import time
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import websockets
 from wetterdienst.provider.dwd.radar import (
@@ -37,6 +42,7 @@ from radar import (
 )
 from tracking import fetch_latest_storm_cells
 from severe_parameters import PRESSURE_LEVEL_HOURLY_FIELDS
+from stormanalyzer import analyze_general_weather
 
 
 LOG = logging.getLogger("stormchase-publisher")
@@ -94,45 +100,13 @@ OUTLOOK_PUBLISH_BATCH_SIZE = 25
 OUTLOOK_GRID_VERSION = "raw-icon-d2-v2"
 GENERAL_WEATHER_API_URL = "https://api.open-meteo.com/v1/forecast"
 GENERAL_WEATHER_BATCH_SIZE = 100
-GENERAL_WEATHER_DAYS = 7
+GENERAL_WEATHER_DAYS = 2
 GENERAL_WEATHER_PUBLISH_BATCH_SIZE = 25
 GENERAL_WEATHER_DAILY_FIELDS = (
     "weather_code,temperature_2m_max,temperature_2m_min,apparent_temperature_max,"
     "precipitation_probability_max,precipitation_sum,rain_sum,precipitation_hours,"
     "wind_speed_10m_max,wind_direction_10m_dominant,sunrise,sunset,uv_index_max"
 )
-WMO_WEATHER_DESCRIPTIONS = {
-    0: "Clear sky",
-    1: "Mainly clear",
-    2: "Partly cloudy",
-    3: "Overcast",
-    45: "Fog",
-    48: "Rime fog",
-    51: "Light drizzle",
-    53: "Moderate drizzle",
-    55: "Dense drizzle",
-    56: "Light freezing drizzle",
-    57: "Dense freezing drizzle",
-    61: "Slight rain",
-    63: "Moderate rain",
-    65: "Heavy rain",
-    66: "Light freezing rain",
-    67: "Heavy freezing rain",
-    71: "Light frozen precipitation",
-    73: "Moderate frozen precipitation",
-    75: "Heavy frozen precipitation",
-    77: "Ice grains",
-    80: "Slight rain showers",
-    81: "Moderate rain showers",
-    82: "Heavy rain showers",
-    85: "Light frozen showers",
-    86: "Heavy frozen showers",
-    95: "Thunderstorm",
-    96: "Thunderstorm with slight hail",
-    97: "Heavy thunderstorm",
-    99: "Heavy thunderstorm with hail",
-}
-WMO_RAIN_CODES = frozenset((51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 80, 81, 82, 95, 96, 97, 99))
 
 
 class PublisherError(RuntimeError):
@@ -640,11 +614,10 @@ def _daily_weather_payload(point: dict[str, Any], point_index: int) -> dict[str,
             {
                 "date": forecast_day,
                 "weather_code": weather_code,
-                "weather_description": WMO_WEATHER_DESCRIPTIONS.get(
-                    weather_code,
-                    f"Other WMO condition (code {weather_code})"
+                "weather_description": (
+                    f"WMO condition {weather_code}"
                     if weather_code is not None
-                    else "Unavailable",
+                    else "Unavailable"
                 ),
                 "temperature_max_c": _finite_float(
                     daily_values["temperature_2m_max"][index]
@@ -658,11 +631,6 @@ def _daily_weather_payload(point: dict[str, Any], point_index: int) -> dict[str,
                 "precipitation_probability_max_percent": rain_probability,
                 "precipitation_likely": (
                     rain_probability >= 50 if rain_probability is not None else None
-                ),
-                "rain_likely": (
-                    rain_probability >= 50 and weather_code in WMO_RAIN_CODES
-                    if rain_probability is not None and weather_code is not None
-                    else None
                 ),
                 "precipitation_sum_mm": _finite_float(
                     daily_values["precipitation_sum"][index]
@@ -690,10 +658,109 @@ def _daily_weather_payload(point: dict[str, Any], point_index: int) -> dict[str,
     }
 
 
+def _summarize_outlook_environment(
+    hourly: dict[str, Any],
+    forecast_date: str,
+) -> dict[str, float | None]:
+    times = hourly.get("time")
+    if not isinstance(times, list):
+        raise PublisherError("The shared daily outlook has no hourly timestamps.")
+    indices = [
+        index
+        for index, timestamp in enumerate(times)
+        if isinstance(timestamp, str) and timestamp[:10] == forecast_date
+    ]
+    if not indices:
+        raise PublisherError(
+            f"The shared outlook has no ICON-D2 hours for {forecast_date}."
+        )
+
+    def values_for(field: str) -> list[float]:
+        values = hourly.get(field)
+        if not isinstance(values, list) or len(values) != len(times):
+            raise PublisherError(f"The shared outlook is missing hourly {field} data.")
+        return [
+            numeric
+            for index in indices
+            if (numeric := _finite_float(values[index])) is not None
+        ]
+
+    cape = values_for("cape")
+    cin = values_for("cin")
+    temperatures = values_for("temperature_2m")
+    precipitation = values_for("precipitation")
+    wind = values_for("wind_speed_10m")
+    humidity = values_for("relative_humidity_2m")
+    return {
+        "cape_max_jkg": max(cape) if cape else None,
+        "cin_min_jkg": min(cin) if cin else None,
+        "temperature_min_c": min(temperatures) if temperatures else None,
+        "temperature_max_c": max(temperatures) if temperatures else None,
+        "precipitation_sum_mm": sum(precipitation) if precipitation else None,
+        "precipitation_hours": sum(value >= 0.1 for value in precipitation),
+        "wind_speed_max_kmh": max(wind) if wind else None,
+        "relative_humidity_mean_percent": (
+            sum(humidity) / len(humidity) if humidity else None
+        ),
+    }
+
+
+def _load_shared_outlook_grid(date_text: str) -> list[dict[str, Any]]:
+    metadata = _request(
+        "GET",
+        "/rest/v1/daily_outlook_forecasts",
+        query={
+            "select": "forecast_date,issued_at",
+            "forecast_date": f"eq.{date_text}",
+            "limit": "1",
+        },
+    )
+    if not isinstance(metadata, list) or not metadata:
+        raise PublisherError(
+            f"No shared ICON-D2 outlook metadata is available for {date_text}."
+        )
+
+    rows: list[dict[str, Any]] = []
+    page_size = 100
+    for offset in range(0, OUTLOOK_GRID_POINT_COUNT, page_size):
+        page = _request(
+            "GET",
+            "/rest/v1/daily_outlook_forecast_points",
+            query={
+                "select": "point_index,grid_payload",
+                "forecast_date": f"eq.{date_text}",
+                "order": "point_index.asc",
+                "limit": str(page_size),
+                "offset": str(offset),
+            },
+        )
+        if not isinstance(page, list) or not all(isinstance(row, dict) for row in page):
+            raise PublisherError("Supabase returned invalid shared outlook grid points.")
+        rows.extend(page)
+
+    if len(rows) != OUTLOOK_GRID_POINT_COUNT:
+        raise PublisherError(
+            f"Shared ICON-D2 outlook has {len(rows)}/{OUTLOOK_GRID_POINT_COUNT} points."
+        )
+    grid = []
+    for expected_index, row in enumerate(rows):
+        payload = row.get("grid_payload")
+        hourly = payload.get("icon_d2") if isinstance(payload, dict) else None
+        if row.get("point_index") != expected_index or not isinstance(hourly, dict):
+            raise PublisherError(
+                "Shared ICON-D2 outlook points are missing, out of order, or invalid."
+            )
+        grid.append(hourly)
+    LOG.info("Loaded all %d ICON-D2 environment points from Supabase.", len(grid))
+    return grid
+
+
 def publish_general_weather() -> None:
     forecast_date = datetime.now(OUTLOOK_TIMEZONE).date()
     date_text = forecast_date.isoformat()
     points = _outlook_grid_points()
+    LOG.info("Loading the existing ICON-D2 environment from Supabase before enrichment.")
+    outlook_grid = _load_shared_outlook_grid(date_text)
     issued_at = _iso(datetime.now(timezone.utc))
     _upsert(
         "general_weather_forecasts",
@@ -746,6 +813,16 @@ def publish_general_weather() -> None:
                 raise PublisherError(
                     "Open-Meteo returned a general-weather point for an unexpected location."
                 )
+            outlook_hourly = outlook_grid[start_index + index]
+            for day in point_payload["days"]:
+                environment = _summarize_outlook_environment(
+                    outlook_hourly,
+                    day["date"],
+                )
+                analysis = analyze_general_weather(environment, day)
+                day["weather_description"] = analysis["condition"]
+                day["environment"] = environment
+                day["analysis"] = analysis
             rows.append(
                 {
                     "forecast_date": date_text,

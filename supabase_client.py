@@ -29,6 +29,8 @@ from tracking import StormCell, StormUpdate
 RADAR_BUCKET = "stormchase-radar"
 DAILY_OUTLOOK_GRID_POINT_COUNT = 744
 DAILY_OUTLOOK_GRID_PAGE_SIZE = 100
+DAILY_GENERAL_WEATHER_GRID_POINT_COUNT = 744
+DAILY_GENERAL_WEATHER_GRID_PAGE_SIZE = 100
 KEYRING_SERVICE = "StormChase Supabase"
 USERNAME_PATTERN = re.compile(r"[a-z0-9_]{3,24}\Z")
 
@@ -794,6 +796,71 @@ class SupabaseClient:
             "issued_at": _parse_datetime(row.get("issued_at"), "daily outlook"),
             "grid": grid,
         }
+
+    def daily_general_weather_grid(self, forecast_date: date) -> list[dict[str, Any]] | None:
+        date_text = forecast_date.isoformat()
+        metadata = self._table_rows(
+            "general_weather_forecasts",
+            {
+                "select": "forecast_date,issued_at",
+                "forecast_date": f"eq.{date_text}",
+                "limit": "1",
+            },
+        )
+        if not metadata:
+            return None
+
+        point_rows: list[dict[str, Any]] = []
+        page_count = math.ceil(
+            DAILY_GENERAL_WEATHER_GRID_POINT_COUNT
+            / DAILY_GENERAL_WEATHER_GRID_PAGE_SIZE
+        )
+        for page_number in range(page_count):
+            offset = page_number * DAILY_GENERAL_WEATHER_GRID_PAGE_SIZE
+            print(
+                f"[Weather DB] Requesting page {page_number + 1}/{page_count}...",
+                flush=True,
+            )
+            page_rows = self._table_rows(
+                "general_weather_forecast_points",
+                {
+                    "select": "point_index,forecast_payload",
+                    "forecast_date": f"eq.{date_text}",
+                    "order": "point_index.asc",
+                    "limit": str(DAILY_GENERAL_WEATHER_GRID_PAGE_SIZE),
+                    "offset": str(offset),
+                },
+            )
+            point_rows.extend(page_rows)
+            print(
+                f"[Weather DB] Page {page_number + 1}/{page_count} returned "
+                f"{len(page_rows)} points ({len(point_rows)}/"
+                f"{DAILY_GENERAL_WEATHER_GRID_POINT_COUNT}).",
+                flush=True,
+            )
+            if not page_rows:
+                break
+
+        if not point_rows:
+            return None
+        if len(point_rows) != DAILY_GENERAL_WEATHER_GRID_POINT_COUNT:
+            raise SupabaseError(
+                f"General-weather grid contains {len(point_rows)} of "
+                f"{DAILY_GENERAL_WEATHER_GRID_POINT_COUNT} points."
+            )
+        grid = []
+        for expected_index, row in enumerate(point_rows):
+            payload = row.get("forecast_payload")
+            if (
+                row.get("point_index") != expected_index
+                or not isinstance(payload, dict)
+                or not isinstance(payload.get("days"), list)
+            ):
+                raise SupabaseError(
+                    "General-weather points must contain an ordered daily forecast grid."
+                )
+            grid.append(payload)
+        return grid
 
     def latest_rain_cells(self) -> tuple[RainCell, ...] | None:
         snapshot = self.latest_snapshot("rain_cells")

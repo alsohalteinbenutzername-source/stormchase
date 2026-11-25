@@ -4,6 +4,40 @@ import math
 RISK_SCORE_SCALE = 78.95
 RISK_SCORE_SHAPE = 2.18
 TORNADO_RISK_WEIGHT_EXPONENT = 0.78
+WMO_WEATHER_DESCRIPTIONS = {
+    0: "Clear sky",
+    1: "Mainly clear",
+    2: "Partly cloudy",
+    3: "Overcast",
+    45: "Fog",
+    48: "Rime fog",
+    51: "Light drizzle",
+    53: "Moderate drizzle",
+    55: "Dense drizzle",
+    56: "Light freezing drizzle",
+    57: "Dense freezing drizzle",
+    61: "Slight rain",
+    63: "Moderate rain",
+    65: "Heavy rain",
+    66: "Light freezing rain",
+    67: "Heavy freezing rain",
+    71: "Light frozen precipitation",
+    73: "Moderate frozen precipitation",
+    75: "Heavy frozen precipitation",
+    77: "Ice grains",
+    80: "Slight rain showers",
+    81: "Moderate rain showers",
+    82: "Heavy rain showers",
+    85: "Light frozen showers",
+    86: "Heavy frozen showers",
+    95: "Thunderstorm",
+    96: "Thunderstorm with slight hail",
+    97: "Heavy thunderstorm",
+    99: "Heavy thunderstorm with hail",
+}
+_RAIN_CODES = frozenset((51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 80, 81, 82, 95, 96, 97, 99))
+_FROZEN_PRECIPITATION_CODES = frozenset((71, 73, 75, 77, 85, 86))
+_THUNDERSTORM_CODES = frozenset((95, 96, 97, 99))
 
 
 def _finite_score_value(value):
@@ -12,6 +46,127 @@ def _finite_score_value(value):
     except (TypeError, ValueError):
         return None
     return result if math.isfinite(result) else None
+
+
+def analyze_general_weather(environment, weather):
+    """Combine shared ICON-D2 environment with daily WMO weather guidance."""
+    environment = environment if isinstance(environment, dict) else {}
+    weather = weather if isinstance(weather, dict) else {}
+    try:
+        raw_code = weather.get("weather_code")
+        weather_code = int(raw_code) if raw_code is not None else None
+    except (TypeError, ValueError, OverflowError):
+        weather_code = None
+
+    probability = _finite_score_value(
+        weather.get("precipitation_probability_max_percent")
+    )
+    precipitation_sum = _finite_score_value(weather.get("precipitation_sum_mm"))
+    rain_sum = _finite_score_value(weather.get("rain_sum_mm"))
+    cape = _finite_score_value(environment.get("cape_max_jkg"))
+    cin = _finite_score_value(environment.get("cin_min_jkg"))
+    surface_wind = _finite_score_value(environment.get("wind_speed_max_kmh"))
+    icon_precipitation = _finite_score_value(
+        environment.get("precipitation_sum_mm")
+    )
+    max_temperature = _finite_score_value(environment.get("temperature_max_c"))
+    mean_humidity = _finite_score_value(
+        environment.get("relative_humidity_mean_percent")
+    )
+    condition = WMO_WEATHER_DESCRIPTIONS.get(
+        weather_code,
+        f"Other WMO condition (code {weather_code})"
+        if weather_code is not None
+        else "Condition unavailable",
+    )
+
+    measurable_precipitation = max(
+        (value for value in (precipitation_sum, icon_precipitation) if value is not None),
+        default=None,
+    )
+    precipitation_likely = (
+        (probability is not None and probability >= 50.0)
+        or (
+            measurable_precipitation is not None
+            and measurable_precipitation >= 1.0
+        )
+        if probability is not None or measurable_precipitation is not None
+        else None
+    )
+    rain_likely = (
+        weather_code in _RAIN_CODES
+        and (
+            probability is None
+            or probability >= 40.0
+            or (rain_sum is not None and rain_sum >= 1.0)
+            or (icon_precipitation is not None and icon_precipitation >= 1.0)
+        )
+        if weather_code is not None
+        else False
+    )
+    frozen_precipitation_likely = (
+        weather_code in _FROZEN_PRECIPITATION_CODES
+        and (
+            probability is None
+            or probability >= 40.0
+            or (measurable_precipitation is not None and measurable_precipitation >= 1.0)
+        )
+        if weather_code is not None
+        else False
+    )
+    if (
+        not frozen_precipitation_likely
+        and max_temperature is not None
+        and max_temperature <= 0.0
+        and precipitation_likely
+    ):
+        frozen_precipitation_likely = True
+    convective_environment_supports_storms = (
+        cape is not None
+        and cape >= 1000.0
+        and (cin is None or cin >= -200.0)
+        and probability is not None
+        and probability >= 50.0
+    )
+    thunderstorm_signal = (
+        weather_code in _THUNDERSTORM_CODES
+        or convective_environment_supports_storms
+    )
+    strong_wind_signal = surface_wind is not None and surface_wind >= 60.0
+
+    if thunderstorm_signal:
+        headline = "Thunderstorm signal"
+    elif frozen_precipitation_likely:
+        headline = "Frozen precipitation likely"
+    elif rain_likely:
+        headline = "Rain likely"
+    elif precipitation_likely:
+        headline = "Precipitation likely"
+    elif strong_wind_signal:
+        headline = "Strong wind signal"
+    elif probability is not None:
+        headline = "Precipitation not likely"
+    else:
+        headline = condition
+
+    return {
+        "headline": headline,
+        "condition": condition,
+        "weather_code": weather_code,
+        "precipitation_probability_percent": probability,
+        "precipitation_likely": precipitation_likely,
+        "rain_likely": rain_likely,
+        "frozen_precipitation_likely": frozen_precipitation_likely,
+        "thunderstorm_signal": thunderstorm_signal,
+        "strong_wind_signal": strong_wind_signal,
+        "rain_sum_mm": rain_sum,
+        "precipitation_sum_mm": measurable_precipitation,
+        "cape_max_jkg": cape,
+        "cin_min_jkg": cin,
+        "surface_wind_max_kmh": surface_wind,
+        "temperature_max_c": max_temperature,
+        "relative_humidity_mean_percent": mean_humidity,
+    }
 
 
 def _unit_interval(value):
