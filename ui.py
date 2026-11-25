@@ -29,6 +29,14 @@ import numpy as np
 from PIL import Image, ImageDraw
 import customtkinter as ctk
 
+from case_analysis import CaseAnalysisStore
+from warning_system import (
+    WARNING_CATEGORY_LABELS,
+    WARNING_COLORS,
+    WARNING_LEVELS,
+    beam_height_contour_range_km,
+    validate_warning_payload,
+)
 from loctrack import (
     LocationFix,
     create_geolocator,
@@ -975,6 +983,13 @@ class StormRadarApp:
             self.supabase_configuration_error = str(error)
         self.auth_user: AuthUser | None = None
         self.community_reports: tuple[dict[str, Any], ...] = ()
+        self.active_community_warnings: tuple[dict[str, Any], ...] = ()
+        self._is_stormchase_admin = False
+        self._warning_polygon_draft: list[list[float]] = []
+        self._warning_drawing_enabled = False
+        self._admin_warning_rows: tuple[dict[str, Any], ...] = ()
+        self._admin_report_rows: tuple[dict[str, Any], ...] = ()
+        self.case_analysis = CaseAnalysisStore()
         self._geolocator: Any | None = None
         self._location_event_token: Any | None = None
         self._location_changed_handler: Any | None = None
@@ -1511,6 +1526,32 @@ class StormRadarApp:
         community_tab.rowconfigure(0, weight=1)
         self.report_notebook.add(details_tab, text="Details")
         self.report_notebook.add(community_tab, text="Community")
+        self.case_analysis_tab = ttk.Frame(self.report_notebook)
+        self.case_analysis_tab.columnconfigure(0, weight=1)
+        self.case_analysis_tab.rowconfigure(0, weight=1)
+        self.report_notebook.add(self.case_analysis_tab, text="Case analysis")
+        self.case_analysis_text = tk.Text(
+            self.case_analysis_tab,
+            height=5,
+            wrap="word",
+            state="disabled",
+            bg="#111b22",
+            fg=FOREGROUND,
+            relief="flat",
+            highlightthickness=0,
+            font=("Consolas", 8),
+        )
+        self.case_analysis_text.grid(row=0, column=0, sticky="nsew")
+        case_scrollbar = ttk.Scrollbar(
+            self.case_analysis_tab,
+            orient="vertical",
+            command=self.case_analysis_text.yview,
+        )
+        case_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.case_analysis_text.configure(yscrollcommand=case_scrollbar.set)
+        self.admin_tab = ttk.Frame(self.report_notebook)
+        self.report_notebook.add(self.admin_tab, text="Admin")
+        self._build_admin_tab()
         self.diagnostics_tab = ttk.Frame(self.report_notebook)
         self.diagnostics_tab.columnconfigure(0, weight=1)
         self.diagnostics_tab.rowconfigure(0, weight=1)
@@ -1537,6 +1578,8 @@ class StormRadarApp:
         self.outlook_analysis_tab = ttk.Frame(self.report_notebook)
         self.report_notebook.add(self.outlook_analysis_tab, text="Outlook analysis")
         self._build_outlook_analysis_tab()
+        self._refresh_case_analysis_panel()
+        self._refresh_admin_controls()
         self.report_text = tk.Text(
             details_tab,
             height=4,
@@ -1580,6 +1623,622 @@ class StormRadarApp:
         self.warning_detail.trace_add("write", self._render_click_reports)
         self._draw_map()
         self._refresh_diagnostics()
+
+
+
+    def _build_admin_tab(self) -> None:
+        self.admin_tab.columnconfigure(0, weight=1)
+        self.admin_tab.rowconfigure(0, weight=1)
+        outer = ttk.Frame(self.admin_tab, padding=8)
+        outer.grid(row=0, column=0, sticky="nsew")
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(2, weight=1)
+
+        self.admin_status = tk.StringVar(value="Checking administrator authorization…")
+        ttk.Label(
+            outer,
+            textvariable=self.admin_status,
+            style="Status.TLabel",
+            wraplength=800,
+        ).grid(row=0, column=0, sticky="ew", pady=(0, 4))
+        ttk.Label(
+            outer,
+            text=(
+                "UNOFFICIAL COMMUNITY WARNINGS. These polygons are created by StormChase "
+                "administrators and are not DWD/NWS warnings. Always check WarnWetter, "
+                "official warning channels and local authorities."
+            ),
+            wraplength=800,
+            justify="left",
+        ).grid(row=1, column=0, sticky="ew", pady=(0, 8))
+
+        warning_frame = ttk.LabelFrame(
+            outer,
+            text="Issue a polygon warning",
+            style="Panel.TLabelframe",
+            padding=8,
+        )
+        warning_frame.grid(row=2, column=0, sticky="nsew", pady=(0, 8))
+        warning_frame.columnconfigure(1, weight=1)
+
+        self.admin_category_var = tk.StringVar(value="Damaging wind")
+        self.admin_level_var = tk.StringVar(value="1")
+        self.admin_headline_var = tk.StringVar()
+        self.admin_expiry_var = tk.StringVar(value="3")
+        self.admin_catastrophic_var = tk.BooleanVar(value=False)
+        self.admin_level_info = tk.StringVar()
+        self.admin_polygon_status = tk.StringVar(value="No polygon drawn.")
+        self.admin_description = tk.Text(
+            warning_frame,
+            height=3,
+            wrap="word",
+            bg="#111b22",
+            fg=FOREGROUND,
+            insertbackground=FOREGROUND,
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground="#34454d",
+        )
+
+        ttk.Label(warning_frame, text="Hazard").grid(row=0, column=0, sticky="w", padx=4, pady=3)
+        self.admin_category_combo = ttk.Combobox(
+            warning_frame,
+            textvariable=self.admin_category_var,
+            values=tuple(WARNING_CATEGORY_LABELS.values()),
+            state="readonly",
+            width=22,
+        )
+        self.admin_category_combo.grid(row=0, column=1, sticky="ew", padx=4, pady=3)
+        self.admin_category_combo.bind("<<ComboboxSelected>>", self._update_warning_level_description)
+
+        ttk.Label(warning_frame, text="Level").grid(row=1, column=0, sticky="w", padx=4, pady=3)
+        self.admin_level_combo = ttk.Combobox(
+            warning_frame,
+            textvariable=self.admin_level_var,
+            values=("1", "2", "3"),
+            state="readonly",
+            width=8,
+        )
+        self.admin_level_combo.grid(row=1, column=1, sticky="w", padx=4, pady=3)
+        self.admin_level_combo.bind("<<ComboboxSelected>>", self._update_warning_level_description)
+
+        ttk.Label(
+            warning_frame,
+            textvariable=self.admin_level_info,
+            wraplength=760,
+            justify="left",
+        ).grid(row=2, column=0, columnspan=2, sticky="ew", padx=4, pady=(0, 4))
+
+        ttk.Label(warning_frame, text="Headline").grid(row=3, column=0, sticky="w", padx=4, pady=3)
+        self.admin_headline_entry = ttk.Entry(warning_frame, textvariable=self.admin_headline_var)
+        self.admin_headline_entry.grid(row=3, column=1, sticky="ew", padx=4, pady=3)
+
+        ttk.Label(warning_frame, text="Details / evidence").grid(row=4, column=0, sticky="nw", padx=4, pady=3)
+        self.admin_description.grid(row=4, column=1, sticky="ew", padx=4, pady=3)
+
+        expiry_frame = ttk.Frame(warning_frame)
+        expiry_frame.grid(row=5, column=1, sticky="w", padx=4, pady=3)
+        ttk.Label(warning_frame, text="Valid for").grid(row=5, column=0, sticky="w", padx=4, pady=3)
+        self.admin_expiry_spin = ttk.Spinbox(
+            expiry_frame,
+            from_=1,
+            to=72,
+            width=5,
+            textvariable=self.admin_expiry_var,
+        )
+        self.admin_expiry_spin.pack(side="left")
+        ttk.Label(expiry_frame, text="hours (maximum 72)").pack(side="left", padx=5)
+
+        self.admin_catastrophic_check = ttk.Checkbutton(
+            warning_frame,
+            text="I have reliable confirmation and meet the NWS catastrophic / Tornado Emergency criteria",
+            variable=self.admin_catastrophic_var,
+        )
+        self.admin_catastrophic_check.grid(row=6, column=0, columnspan=2, sticky="w", padx=4, pady=3)
+
+        polygon_actions = ttk.Frame(warning_frame)
+        polygon_actions.grid(row=7, column=0, columnspan=2, sticky="ew", padx=4, pady=4)
+        self.admin_draw_button = AppButton(
+            polygon_actions,
+            text="Draw polygon on map",
+            command=self._begin_warning_polygon,
+            width=150,
+        )
+        self.admin_draw_button.pack(side="left", padx=(0, 6))
+        self.admin_clear_polygon_button = AppButton(
+            polygon_actions,
+            text="Clear draft",
+            command=self._cancel_warning_polygon,
+            width=100,
+        )
+        self.admin_clear_polygon_button.pack(side="left", padx=(0, 6))
+        self.admin_publish_button = AppButton(
+            polygon_actions,
+            text="Publish warning",
+            command=self._publish_admin_warning,
+            width=130,
+        )
+        self.admin_publish_button.pack(side="left")
+        ttk.Label(
+            warning_frame,
+            textvariable=self.admin_polygon_status,
+            wraplength=760,
+        ).grid(row=8, column=0, columnspan=2, sticky="ew", padx=4, pady=(0, 3))
+
+        active_frame = ttk.LabelFrame(
+            outer,
+            text="Active community warnings",
+            style="Panel.TLabelframe",
+            padding=6,
+        )
+        active_frame.grid(row=3, column=0, sticky="nsew", pady=(0, 8))
+        active_frame.columnconfigure(0, weight=1)
+        active_frame.rowconfigure(0, weight=1)
+        self.admin_warning_list = tk.Listbox(
+            active_frame,
+            height=4,
+            bg="#111b22",
+            fg=FOREGROUND,
+            selectbackground="#31564d",
+            relief="flat",
+            highlightthickness=0,
+            font=("Consolas", 8),
+        )
+        self.admin_warning_list.grid(row=0, column=0, sticky="nsew")
+        active_scroll = ttk.Scrollbar(active_frame, orient="vertical", command=self.admin_warning_list.yview)
+        active_scroll.grid(row=0, column=1, sticky="ns")
+        self.admin_warning_list.configure(yscrollcommand=active_scroll.set)
+        self.admin_cancel_button = AppButton(
+            active_frame,
+            text="Cancel selected warning",
+            command=self._cancel_selected_community_warning,
+            width=170,
+        )
+        self.admin_cancel_button.grid(row=1, column=0, sticky="w", pady=(5, 0))
+
+        review_frame = ttk.LabelFrame(
+            outer,
+            text="Community report review",
+            style="Panel.TLabelframe",
+            padding=6,
+        )
+        review_frame.grid(row=4, column=0, sticky="nsew")
+        review_frame.columnconfigure(0, weight=1)
+        self.admin_report_list = tk.Listbox(
+            review_frame,
+            height=4,
+            bg="#111b22",
+            fg=FOREGROUND,
+            selectbackground="#31564d",
+            relief="flat",
+            highlightthickness=0,
+            font=("Consolas", 8),
+        )
+        self.admin_report_list.grid(row=0, column=0, sticky="ew")
+        review_scroll = ttk.Scrollbar(review_frame, orient="vertical", command=self.admin_report_list.yview)
+        review_scroll.grid(row=0, column=1, sticky="ns")
+        self.admin_report_list.configure(yscrollcommand=review_scroll.set)
+        self.admin_report_status_var = tk.StringVar(value="unverified")
+        self.admin_review_note_var = tk.StringVar()
+        review_controls = ttk.Frame(review_frame)
+        review_controls.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(5, 0))
+        self.admin_report_status_combo = ttk.Combobox(
+            review_controls,
+            textvariable=self.admin_report_status_var,
+            values=("unverified", "under_review", "corroborated", "rejected"),
+            state="readonly",
+            width=17,
+        )
+        self.admin_report_status_combo.pack(side="left", padx=(0, 5))
+        self.admin_review_note_entry = ttk.Entry(
+            review_controls,
+            textvariable=self.admin_review_note_var,
+            width=32,
+        )
+        self.admin_review_note_entry.pack(side="left", fill="x", expand=True, padx=(0, 5))
+        self.admin_moderate_button = AppButton(
+            review_controls,
+            text="Save review",
+            command=self._moderate_selected_report,
+            width=110,
+        )
+        self.admin_moderate_button.pack(side="left")
+        self.admin_editor_widgets = [
+            self.admin_category_combo,
+            self.admin_level_combo,
+            self.admin_headline_entry,
+            self.admin_description,
+            self.admin_expiry_spin,
+            self.admin_catastrophic_check,
+        ]
+        self._update_warning_level_description()
+        self._refresh_admin_controls()
+        self._populate_admin_warning_list()
+        self._populate_admin_report_list()
+
+    def _update_warning_level_description(self, *_args: Any) -> None:
+        if not hasattr(self, "admin_level_info"):
+            return
+        category = next(
+            (
+                key for key, label in WARNING_CATEGORY_LABELS.items()
+                if label == self.admin_category_var.get()
+            ),
+            "damaging_wind",
+        )
+        try:
+            level = int(self.admin_level_var.get())
+            tier = WARNING_LEVELS[category][level - 1]
+        except (ValueError, IndexError):
+            self.admin_level_info.set("Choose a valid hazard level.")
+            return
+        threshold = f" · {tier.threshold}" if tier.threshold else ""
+        self.admin_level_info.set(
+            f"{tier.tag} · {tier.title}{threshold}\n{tier.description}"
+        )
+
+    def _refresh_admin_controls(self) -> None:
+        if not hasattr(self, "admin_status"):
+            return
+        is_admin = bool(self._is_stormchase_admin and self.auth_user is not None)
+        if is_admin:
+            self.admin_status.set(
+                f"Administrator authorization active · {self.auth_user.username or 'authenticated account'}"
+            )
+        elif self.auth_user is None:
+            self.admin_status.set(
+                "Not authorized: restore/set a report identity, then have the project owner grant admin membership."
+            )
+        else:
+            self.admin_status.set(
+                "This account is not an administrator. Membership is granted in Supabase by the project owner."
+            )
+        for widget in getattr(self, "admin_editor_widgets", ()):
+            widget.configure(state="normal" if is_admin else "disabled")
+        for widget_name in (
+            "admin_draw_button",
+            "admin_clear_polygon_button",
+            "admin_publish_button",
+            "admin_cancel_button",
+            "admin_report_status_combo",
+            "admin_review_note_entry",
+            "admin_moderate_button",
+        ):
+            widget = getattr(self, widget_name, None)
+            if widget is not None:
+                widget.configure(state="normal" if is_admin else "disabled")
+        if not is_admin:
+            self._warning_drawing_enabled = False
+        self._populate_admin_warning_list()
+        self._populate_admin_report_list()
+
+    def _populate_admin_warning_list(self) -> None:
+        if not hasattr(self, "admin_warning_list"):
+            return
+        self._admin_warning_rows = tuple(self.active_community_warnings)
+        self.admin_warning_list.delete(0, tk.END)
+        for warning in self._admin_warning_rows:
+            category = WARNING_CATEGORY_LABELS.get(warning.get("category"), "Warning")
+            level = warning.get("level", "?")
+            headline = warning.get("headline", "Untitled warning")
+            expires = warning.get("expires_at", "expiry unavailable")
+            self.admin_warning_list.insert(
+                tk.END,
+                f"L{level} {category} · {headline} · expires {expires}",
+            )
+
+    def _populate_admin_report_list(self) -> None:
+        if not hasattr(self, "admin_report_list"):
+            return
+        self._admin_report_rows = tuple(self.community_reports)
+        self.admin_report_list.delete(0, tk.END)
+        for report in self._admin_report_rows:
+            status = report.get("verification_status", "unverified")
+            self.admin_report_list.insert(
+                tk.END,
+                f"{status.upper():13} · {report.get('reporter_username', 'unknown')} · "
+                f"{report.get('cell_id', 'unknown cell')} · {report.get('created_at', '')}",
+            )
+
+    def _begin_warning_polygon(self) -> None:
+        if not self._is_stormchase_admin:
+            messagebox.showerror("Admin only", "This account cannot issue community warnings.", parent=self.root)
+            return
+        if self.map_mode == STORMANALYZER_MAP:
+            messagebox.showinfo(
+                "Switch map mode",
+                "Switch to the Live map or DWD warning map before drawing a warning polygon.",
+                parent=self.root,
+            )
+            return
+        self._warning_polygon_draft.clear()
+        self._warning_drawing_enabled = True
+        self.admin_polygon_status.set("Polygon drawing active: click at least 3 map vertices, then publish.")
+        self.status.set("Community warning polygon drawing active.")
+        self._draw_map()
+
+    def _cancel_warning_polygon(self) -> None:
+        self._warning_drawing_enabled = False
+        self._warning_polygon_draft.clear()
+        if hasattr(self, "admin_polygon_status"):
+            self.admin_polygon_status.set("Polygon draft cleared.")
+        self._draw_map()
+
+    def _publish_admin_warning(self) -> None:
+        if not self._is_stormchase_admin or self.supabase is None:
+            messagebox.showerror("Admin only", "A database-authorized administrator account is required.", parent=self.root)
+            return
+        category = next(
+            (
+                key for key, label in WARNING_CATEGORY_LABELS.items()
+                if label == self.admin_category_var.get()
+            ),
+            "",
+        )
+        try:
+            level = int(self.admin_level_var.get())
+            hours = int(self.admin_expiry_var.get())
+            if not 1 <= hours <= 72:
+                raise ValueError("Warning duration must be between 1 and 72 hours.")
+            expires_at = datetime.now(timezone.utc) + timedelta(hours=hours)
+            description = self.admin_description.get("1.0", "end-1c").strip()
+            validate_warning_payload(
+                category,
+                level,
+                self._warning_polygon_draft,
+                self.admin_headline_var.get(),
+                description,
+                expires_at,
+                catastrophic_confirmed=self.admin_catastrophic_var.get(),
+            )
+        except (ValueError, TypeError) as error:
+            messagebox.showerror("Invalid warning", str(error), parent=self.root)
+            return
+        tier = WARNING_LEVELS[category][level - 1]
+        confirmed = messagebox.askyesno(
+            "Publish unofficial warning?",
+            f"{tier.title}\n\n{self.admin_headline_var.get().strip()}\n\n"
+            f"This is an unofficial StormChase community warning, not a DWD/NWS warning. "
+            f"It will remain active for {hours} hours. Publish?",
+            parent=self.root,
+        )
+        if not confirmed:
+            return
+        self.admin_publish_button.configure(state="disabled")
+        self.loop.create_task(
+            self._issue_community_warning_task(
+                category,
+                level,
+                [point[:] for point in self._warning_polygon_draft],
+                self.admin_headline_var.get().strip(),
+                description,
+                expires_at,
+                self.admin_catastrophic_var.get(),
+            )
+        )
+
+    async def _issue_community_warning_task(
+        self,
+        category: str,
+        level: int,
+        polygon: list[list[float]],
+        headline: str,
+        description: str,
+        expires_at: datetime,
+        catastrophic_confirmed: bool,
+    ) -> None:
+        client = self.supabase
+        try:
+            if client is None:
+                raise SupabaseError("Supabase is not configured.")
+            await self.loop.run_in_executor(
+                self.executor,
+                lambda: client.issue_community_warning(
+                    category, level, polygon, headline, description, expires_at,
+                    catastrophic_confirmed=catastrophic_confirmed,
+                ),
+            )
+            self.active_community_warnings = await self.loop.run_in_executor(
+                self.executor, client.active_community_warnings
+            )
+        except Exception as error:
+            self.status.set(f"Warning was not published: {type(error).__name__}: {error}")
+            messagebox.showerror("Warning not published", str(error), parent=self.root)
+        else:
+            self._warning_drawing_enabled = False
+            self._warning_polygon_draft.clear()
+            self.admin_headline_var.set("")
+            self.admin_description.delete("1.0", tk.END)
+            self.admin_catastrophic_var.set(False)
+            self.admin_polygon_status.set("Warning published to the shared community feed.")
+            self.status.set("Unofficial community warning published.")
+            self._populate_admin_warning_list()
+            self._draw_map()
+            self._refresh_case_analysis_panel()
+        finally:
+            if hasattr(self, "admin_publish_button"):
+                self.admin_publish_button.configure(
+                    state="normal" if self._is_stormchase_admin else "disabled"
+                )
+
+    def _cancel_selected_community_warning(self) -> None:
+        if not self._is_stormchase_admin or self.supabase is None:
+            return
+        selected = self.admin_warning_list.curselection()
+        if not selected or selected[0] >= len(self._admin_warning_rows):
+            return
+        warning = self._admin_warning_rows[selected[0]]
+        if not messagebox.askyesno(
+            "Cancel community warning",
+            f"Cancel '{warning.get('headline', 'warning')}'?",
+            parent=self.root,
+        ):
+            return
+        self.loop.create_task(self._cancel_community_warning_task(str(warning["id"])))
+
+    async def _cancel_community_warning_task(self, warning_id: str) -> None:
+        client = self.supabase
+        try:
+            if client is None:
+                raise SupabaseError("Supabase is not configured.")
+            await self.loop.run_in_executor(
+                self.executor, client.cancel_community_warning, warning_id
+            )
+            self.active_community_warnings = await self.loop.run_in_executor(
+                self.executor, client.active_community_warnings
+            )
+        except Exception as error:
+            messagebox.showerror("Could not cancel warning", str(error), parent=self.root)
+        else:
+            self._populate_admin_warning_list()
+            self._draw_map()
+            self.status.set("Community warning cancelled.")
+
+    def _moderate_selected_report(self) -> None:
+        if not self._is_stormchase_admin or self.supabase is None:
+            return
+        selected = self.admin_report_list.curselection()
+        if not selected or selected[0] >= len(self._admin_report_rows):
+            messagebox.showinfo("Select a report", "Choose a community report first.", parent=self.root)
+            return
+        report = self._admin_report_rows[selected[0]]
+        self.loop.create_task(
+            self._moderate_report_task(
+                str(report["id"]),
+                self.admin_report_status_var.get(),
+                self.admin_review_note_var.get(),
+            )
+        )
+
+    async def _moderate_report_task(
+        self,
+        report_id: str,
+        status: str,
+        note: str,
+    ) -> None:
+        client = self.supabase
+        try:
+            if client is None:
+                raise SupabaseError("Supabase is not configured.")
+            await self.loop.run_in_executor(
+                self.executor, client.moderate_storm_report, report_id, status, note
+            )
+            self.community_reports = await self.loop.run_in_executor(
+                self.executor, client.recent_reports
+            )
+        except Exception as error:
+            messagebox.showerror("Report review failed", str(error), parent=self.root)
+        else:
+            self._render_community_reports()
+            self.status.set(f"Community report marked {status}.")
+
+    def _refresh_case_analysis_panel(self) -> None:
+        if not hasattr(self, "case_analysis_text"):
+            return
+        lines = [
+            "LOCAL CASE ANALYSIS",
+            "Cell history, forecast verification and historical comparisons are stored locally in SQLite.",
+            "No additional weather API requests are made by this panel.",
+            "",
+        ]
+        cell = self.selected_cell
+        if isinstance(cell, StormCell):
+            stats = self.case_analysis.case_statistics(cell.identifier)
+            history = self.case_analysis.history(cell.identifier, limit=24)
+            lines.append(f"SELECTED CELL · {cell.identifier}")
+            if stats:
+                lines.extend(
+                    (
+                        f"Case age: {stats['duration_minutes']:.0f} min",
+                        f"Observations: {stats['observation_count']}",
+                        f"Maximum observed reflectivity: {stats['max_reflectivity_dbz'] if stats['max_reflectivity_dbz'] is not None else 'n/a'} dBZ",
+                        f"Accumulated track length: {stats['path_length_km']:.1f} km",
+                    )
+                )
+            if history:
+                lines.append("EVOLUTION (oldest → newest)")
+                for item in history[-12:]:
+                    reflectivity = (
+                        f"{item['reflectivity_dbz']:.1f} dBZ"
+                        if item["reflectivity_dbz"] is not None else "dBZ n/a"
+                    )
+                    lines.append(
+                        f"{item['observed_at']} · {item['latitude']:.3f}, "
+                        f"{item['longitude']:.3f} · {reflectivity}"
+                    )
+                if len(history) >= 2:
+                    first, latest = history[0], history[-1]
+                    minutes = max(
+                        1.0,
+                        (
+                            datetime.fromisoformat(latest["observed_at"])
+                            - datetime.fromisoformat(first["observed_at"])
+                        ).total_seconds() / 60.0,
+                    )
+                    distance = self._distance_km(
+                        (first["latitude"], first["longitude"]),
+                        (latest["latitude"], latest["longitude"]),
+                    )
+                    lines.append(
+                        f"Retained displacement: {distance:.1f} km · "
+                        f"mean speed {distance / (minutes / 60.0):.1f} km/h"
+                    )
+            comparisons = self.case_analysis.compare_cases(cell.identifier)
+            if comparisons:
+                lines.extend(("", "SIMILAR LOCAL CASES (not a forecast or analogue probability)"))
+                for item in comparisons:
+                    lines.append(
+                        f"{item['cell_id']} · score {item['similarity_score']:.2f} · "
+                        f"{item['max_reflectivity_dbz']:.1f} dBZ · "
+                        f"{item['path_length_km']:.1f} km path"
+                    )
+        elif isinstance(cell, RainCell):
+            lines.extend(
+                (
+                    f"SELECTED RAIN ECHO · {cell.identifier}",
+                    f"Maximum reflectivity: {cell.max_reflectivity_dbz:.1f} dBZ",
+                    f"Area: {cell.area_pixels} radar pixels",
+                    f"Track points retained: {len(cell.track)}",
+                    "Rain echoes are a 20–30 dBZ reflectivity grouping, not a precipitation-rate product.",
+                )
+            )
+        else:
+            lines.append("Select a KONRAD3D cell to inspect its local evolution and compare historical cases.")
+
+        skill = self.case_analysis.forecast_skill()
+        lines.extend(("", "FORECAST VERIFICATION"))
+        if not skill:
+            lines.append("No matched forecast/observation pairs have been verified yet.")
+        else:
+            for item in skill:
+                lines.append(
+                    f"{item['model']} · +{item['lead_minutes']} min · "
+                    f"n={item['samples']} · mean position error "
+                    f"{item['mean_position_error_km']:.1f} km · "
+                    f"heading error {item['mean_heading_error_degrees']:.0f}° · "
+                    f"speed error {item['mean_speed_error_kmh']:.1f} km/h"
+                )
+
+        lines.extend(("", "STORM EVENT TIMELINE"))
+        timeline = self.case_analysis.timeline(30)
+        if not timeline:
+            lines.append("No local storm events recorded yet.")
+        else:
+            for event in timeline:
+                location = (
+                    f" · {event['latitude']:.3f}, {event['longitude']:.3f}"
+                    if event["latitude"] is not None and event["longitude"] is not None
+                    else ""
+                )
+                lines.append(
+                    f"{event['event_time']} · {event['event_type']} · "
+                    f"{event['summary']}{location} [{event['source']}]"
+                )
+
+        self.case_analysis_text.configure(state="normal")
+        self.case_analysis_text.delete("1.0", tk.END)
+        self.case_analysis_text.insert("1.0", "\n".join(lines))
+        self.case_analysis_text.configure(state="disabled")
 
     def _build_outlook_analysis_tab(self) -> None:
         self.outlook_analysis_tab.columnconfigure(0, weight=1)
