@@ -1038,6 +1038,19 @@ class StormRadarApp:
         self._map_draw_started_at: float | None = None
         self._map_draw_label: str | None = None
         self._last_map_progress_at = 0.0
+        self._session_started_at = datetime.now(timezone.utc)
+        self._session_storm_ids: set[str] = set()
+        self._session_rain_ids: set[str] = set()
+        self._session_lightning_ids: set[str] = set()
+        self._session_peak_storm_cells = 0
+        self._session_peak_rain_echoes = 0
+        self._session_refresh_cycles = 0
+        self._source_last_success_at: dict[str, datetime] = {}
+        self._source_observed_at: dict[str, datetime] = {}
+        self._source_errors: dict[str, str] = {}
+        self._source_extra: dict[str, str] = {}
+        self._measurement_enabled = False
+        self._measurement_points: list[tuple[float, float]] = []
 
         self._build_ui()
         self.lightning_status.set("Blitzortung lightning: connecting")
@@ -1202,6 +1215,7 @@ class StormRadarApp:
         self.auth_status = tk.StringVar(value="Set a report username")
         self.latitude_input = tk.StringVar()
         self.longitude_input = tk.StringVar()
+        self.measure_status = tk.StringVar(value="Click two map points to measure distance")
 
         header = ctk.CTkFrame(
             self.root,
@@ -1317,6 +1331,13 @@ class StormRadarApp:
             state="disabled",
         )
         self.file_report_button_widget.pack(fill="x", pady=(4, 0))
+        self.copy_cell_button = AppButton(
+            sidebar_content,
+            text="Copy cell summary",
+            command=self.copy_selected_cell_summary,
+            state="disabled",
+        )
+        self.copy_cell_button.pack(fill="x", pady=(6, 0))
 
         map_panel = ctk.CTkFrame(
             body,
@@ -1423,6 +1444,18 @@ class StormRadarApp:
             text="RADAR REPLAY",
             style="Status.TLabel",
         ).pack(side="left", padx=(4, 10))
+        self.measure_button = AppButton(
+            replay_controls,
+            text="Measure distance",
+            width=132,
+            command=self._toggle_measurement,
+        )
+        self.measure_button.pack(side="left", padx=(0, 8))
+        ttk.Label(
+            replay_controls,
+            textvariable=self.measure_status,
+            style="Status.TLabel",
+        ).pack(side="left", padx=(0, 8))
         self.radar_replay_slider = ctk.CTkSlider(
             replay_controls,
             from_=0,
@@ -1477,6 +1510,29 @@ class StormRadarApp:
         community_tab.rowconfigure(0, weight=1)
         self.report_notebook.add(details_tab, text="Details")
         self.report_notebook.add(community_tab, text="Community")
+        self.diagnostics_tab = ttk.Frame(self.report_notebook)
+        self.diagnostics_tab.columnconfigure(0, weight=1)
+        self.diagnostics_tab.rowconfigure(0, weight=1)
+        self.report_notebook.add(self.diagnostics_tab, text="Data status")
+        self.diagnostics_text = tk.Text(
+            self.diagnostics_tab,
+            height=5,
+            wrap="word",
+            state="disabled",
+            bg="#111b22",
+            fg=FOREGROUND,
+            relief="flat",
+            highlightthickness=0,
+            font=("Consolas", 8),
+        )
+        self.diagnostics_text.grid(row=0, column=0, sticky="nsew")
+        diagnostics_scrollbar = ttk.Scrollbar(
+            self.diagnostics_tab,
+            orient="vertical",
+            command=self.diagnostics_text.yview,
+        )
+        diagnostics_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.diagnostics_text.configure(yscrollcommand=diagnostics_scrollbar.set)
         self.outlook_analysis_tab = ttk.Frame(self.report_notebook)
         self.report_notebook.add(self.outlook_analysis_tab, text="Outlook analysis")
         self._build_outlook_analysis_tab()
@@ -1522,6 +1578,7 @@ class StormRadarApp:
         self.weather_detail.trace_add("write", self._render_click_reports)
         self.warning_detail.trace_add("write", self._render_click_reports)
         self._draw_map()
+        self._refresh_diagnostics()
 
     def _build_outlook_analysis_tab(self) -> None:
         self.outlook_analysis_tab.columnconfigure(0, weight=1)
@@ -2360,14 +2417,24 @@ class StormRadarApp:
             wind_error: Exception | None = None
 
             if isinstance(radar_result, BaseException):
+                self._record_source_error("DWD reflectivity", radar_result)
                 errors.append(radar_result)
                 _terminal_progress(
                     "Refresh",
                     f"Radar request failed: {type(radar_result).__name__}: {radar_result}",
                 )
-            elif radar_result is not None:
+            elif radar_result is None:
+                self._record_source_error(
+                    "DWD reflectivity",
+                    "No latest radar frame was returned",
+                )
+            else:
                 radar_frame = radar_result
                 self.radar_frame = radar_frame
+                self._record_source_success(
+                    "DWD reflectivity",
+                    observed_at=radar_frame.timestamp,
+                )
                 _terminal_progress(
                     "Refresh",
                     f"Radar frame received at {self._format_time(radar_frame.timestamp)}; detecting rain echoes.",
@@ -2395,6 +2462,7 @@ class StormRadarApp:
                     )
 
             if isinstance(storm_result, BaseException):
+                self._record_source_error("KONRAD3D tracking", storm_result)
                 errors.append(storm_result)
                 _terminal_progress(
                     "Refresh",
@@ -2402,6 +2470,11 @@ class StormRadarApp:
                 )
             elif storm_result is not None:
                 self.storm_update = storm_result
+                self._record_source_success(
+                    "KONRAD3D tracking",
+                    observed_at=storm_result.timestamp,
+                    extra=f"{len(storm_result.cells)} active cells",
+                )
                 self._remember_tracks(storm_result.cells)
                 try:
                     cells_without_forecast = tuple(
@@ -2433,10 +2506,15 @@ class StormRadarApp:
                 )
                 reports_result = reports_result[0]
                 if isinstance(reports_result, BaseException):
+                    self._record_source_error("Supabase reports", reports_result)
                     errors.append(reports_result)
                     self._sync_auth_state()
                 else:
                     self.community_reports = reports_result
+                    self._record_source_success(
+                        "Supabase reports",
+                        extra=f"{len(reports_result)} reports",
+                    )
                     self._render_community_reports()
                     _terminal_progress(
                         "Refresh",
@@ -2445,6 +2523,7 @@ class StormRadarApp:
             else:
                 self._render_community_reports()
 
+            self._record_session_snapshot()
             self._populate_cell_list()
             self._update_alert_status()
             if wind_error is not None:
@@ -2551,6 +2630,203 @@ class StormRadarApp:
             ):
                 self.root.after(0, self.refresh_data)
 
+    def _record_source_success(
+        self,
+        name: str,
+        observed_at: datetime | None = None,
+        extra: str | None = None,
+        *,
+        refresh: bool = True,
+    ) -> None:
+        self._source_last_success_at[name] = datetime.now(timezone.utc)
+        if observed_at is not None:
+            if observed_at.tzinfo is None:
+                observed_at = observed_at.replace(tzinfo=timezone.utc)
+            self._source_observed_at[name] = observed_at.astimezone(timezone.utc)
+        self._source_errors.pop(name, None)
+        self._source_extra[name] = extra or ""
+        if refresh:
+            self._refresh_diagnostics()
+
+    def _record_source_error(self, name: str, error: BaseException | str) -> None:
+        if isinstance(error, BaseException):
+            detail = f"{type(error).__name__}: {error}"
+        else:
+            detail = str(error)
+        self._source_errors[name] = detail
+        self._refresh_diagnostics()
+
+    @staticmethod
+    def _format_age(value: datetime, now: datetime) -> str:
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        seconds = max(0, int((now - value.astimezone(timezone.utc)).total_seconds()))
+        if seconds < 60:
+            return f"{seconds}s ago"
+        minutes = seconds // 60
+        if minutes < 60:
+            return f"{minutes}m ago"
+        hours = minutes // 60
+        if hours < 48:
+            return f"{hours}h {minutes % 60}m ago"
+        return f"{hours // 24}d {hours % 24}h ago"
+
+    def _record_session_snapshot(self) -> None:
+        self._session_storm_ids.update(
+            str(cell.identifier) for cell in self.storm_update.cells
+        )
+        self._session_rain_ids.update(
+            str(cell.identifier) for cell in self.rain_cells
+        )
+        self._session_peak_storm_cells = max(
+            self._session_peak_storm_cells,
+            len(self.storm_update.cells),
+        )
+        self._session_peak_rain_echoes = max(
+            self._session_peak_rain_echoes,
+            len(self.rain_cells),
+        )
+        self._session_refresh_cycles += 1
+        self._refresh_diagnostics()
+
+    def _refresh_diagnostics(self) -> None:
+        if not hasattr(self, "diagnostics_text"):
+            return
+
+        now = datetime.now(timezone.utc)
+        freshness_limits = {
+            "DWD reflectivity": timedelta(minutes=12),
+            "KONRAD3D tracking": timedelta(minutes=12),
+            "DWD velocity": timedelta(minutes=12),
+            "DWD mesocyclone detections": timedelta(minutes=12),
+            "Blitzortung lightning": timedelta(minutes=15),
+            "ICON-D2 outlook": timedelta(hours=30),
+            "Supabase reports": None,
+        }
+        lines = ["DATA SOURCES"]
+        stale_core_sources: list[str] = []
+        core_names = ("DWD reflectivity", "KONRAD3D tracking")
+
+        for name, stale_after in freshness_limits.items():
+            observed_at = self._source_observed_at.get(name)
+            received_at = self._source_last_success_at.get(name)
+            reference_time = observed_at or received_at
+            error = self._source_errors.get(name)
+            extra = self._source_extra.get(name, "")
+
+            if reference_time is None:
+                state = "unavailable" if error else "not received yet"
+            else:
+                age_text = self._format_age(reference_time, now)
+                age_seconds = max(
+                    0,
+                    (now - reference_time.astimezone(timezone.utc)).total_seconds(),
+                )
+                if stale_after is not None and age_seconds > stale_after.total_seconds():
+                    state = f"STALE / cached · {age_text}"
+                    if name in core_names:
+                        stale_core_sources.append(name)
+                elif stale_after is None:
+                    state = f"loaded · {age_text}"
+                else:
+                    state = f"fresh · {age_text}"
+
+            if name in core_names and reference_time is None:
+                stale_core_sources.append(name)
+            if extra:
+                state += f" · {extra}"
+            if error:
+                state += f" · last attempt failed: {error}"
+            lines.append(f"{name}: {state}")
+
+        if not stale_core_sources:
+            core_state = "Core observations are within the 12-minute freshness window."
+        elif all(
+            self._source_observed_at.get(name) is None
+            for name in core_names
+        ):
+            core_state = "No core observations have been loaded yet."
+        else:
+            core_state = (
+                "Showing the last successful core observations where available; "
+                "one or more feeds are stale or unavailable."
+            )
+
+        elapsed = max(
+            0,
+            int((now - self._session_started_at).total_seconds()),
+        )
+        hours, remainder = divmod(elapsed, 3600)
+        minutes = remainder // 60
+        lines.extend(
+            (
+                "",
+                "DATA MODE",
+                core_state,
+                "A stale timestamp means old/cached observations; it does not by itself prove a network outage.",
+                "",
+                "THIS SESSION",
+                f"Runtime: {hours}h {minutes}m",
+                f"Refresh cycles completed: {self._session_refresh_cycles}",
+                f"Unique KONRAD3D cells seen: {len(self._session_storm_ids)}",
+                f"Unique rain echoes seen: {len(self._session_rain_ids)}",
+                f"Unique lightning strokes received: {len(self._session_lightning_ids)}",
+                f"Peak simultaneous cells / rain echoes: {self._session_peak_storm_cells} / {self._session_peak_rain_echoes}",
+            )
+        )
+
+        self.diagnostics_text.configure(state="normal")
+        self.diagnostics_text.delete("1.0", tk.END)
+        self.diagnostics_text.insert("1.0", "\n".join(lines))
+        self.diagnostics_text.configure(state="disabled")
+
+    def copy_selected_cell_summary(self) -> None:
+        cell = self.selected_cell
+        if cell is None:
+            messagebox.showinfo(
+                "Select a cell",
+                "Select a storm cell or rain echo first.",
+                parent=self.root,
+            )
+            return
+
+        lines = [
+            f"StormChase cell summary · {cell.identifier}",
+            f"Position: {cell.latitude:.4f}° N, {cell.longitude:.4f}° E",
+            f"Observed data time: {self._format_time(self.storm_update.timestamp)}",
+        ]
+        if isinstance(cell, RainCell):
+            lines.extend(
+                (
+                    "Type: 20–30 dBZ rain echo",
+                    f"Maximum reflectivity: {cell.max_reflectivity_dbz:.1f} dBZ",
+                    f"Area: {cell.area_pixels} radar pixels",
+                    f"Track points: {len(cell.track)}",
+                )
+            )
+        else:
+            lines.append("Type: KONRAD3D convective cell")
+            if cell.reflectivity_dbz is not None:
+                lines.append(f"Reflectivity: {cell.reflectivity_dbz:.1f} dBZ")
+            if cell.severity:
+                lines.append(f"Severity: {cell.severity}")
+            history = self.track_history.get(cell.identifier, [])
+            track_points = max(len(cell.track), len(history))
+            lines.append(f"Track points: {track_points}")
+            if history:
+                lines.append(
+                    f"First retained position: {history[0][0]:.4f}, {history[0][1]:.4f}"
+                )
+                lines.append(
+                    f"Latest retained position: {history[-1][0]:.4f}, {history[-1][1]:.4f}"
+                )
+
+        summary = "\n".join(lines)
+        self.root.clipboard_clear()
+        self.root.clipboard_append(summary)
+        self.root.update_idletasks()
+        self.status.set(f"Copied {cell.identifier} summary to the clipboard.")
+
     @staticmethod
     def _radar_status_text(product: str, frame: RadarFrame | None) -> str:
         if frame is None:
@@ -2569,6 +2845,7 @@ class StormRadarApp:
                 site.site,
             )
         except Exception as error:
+            self._record_source_error("DWD velocity", error)
             _terminal_progress(
                 "Radar",
                 f"Velocity request for {site.name} failed: {type(error).__name__}: {error}",
@@ -2591,13 +2868,29 @@ class StormRadarApp:
                     if frame is not None
                     else ()
                 )
-            except Exception:
+            except Exception as error:
                 # Keep the velocity image available when the optional volume
                 # mesocyclone product is delayed or unavailable.
+                self._record_source_error("DWD mesocyclone detections", error)
                 rotations = ()
+            else:
+                if frame is not None:
+                    self._record_source_success(
+                        "DWD mesocyclone detections",
+                        extra=f"{len(rotations)} detections",
+                    )
             if frame is None:
+                self._record_source_error(
+                    "DWD velocity",
+                    f"No velocity frame returned for {site.name}",
+                )
                 _terminal_progress("Radar", f"No velocity frame is currently available for {site.name}.")
             else:
+                self._record_source_success(
+                    "DWD velocity",
+                    observed_at=frame.timestamp,
+                    extra=site.name,
+                )
                 _terminal_progress(
                     "Radar",
                     f"Velocity frame loaded for {site.name}; found {len(rotations)} supported rotation detections.",
@@ -2697,6 +2990,10 @@ class StormRadarApp:
                 else "disabled"
             )
         )
+        if hasattr(self, "copy_cell_button"):
+            self.copy_cell_button.configure(
+                state="normal" if self.selected_cell is not None else "disabled"
+            )
 
     def _sync_auth_state(self) -> None:
         if (
@@ -2844,12 +3141,20 @@ class StormRadarApp:
         if len(remaining) != len(self.lightning_strikes):
             self.lightning_strikes = remaining
             self._draw_map()
+        self._refresh_diagnostics()
         self.root.after(60_000, self._expire_lightning_strikes)
 
     def _on_lightning_strike(self, strike: LightningStrike) -> None:
         if self._closed:
             return
         self.lightning_strikes[strike.identifier] = strike
+        self._session_lightning_ids.add(str(strike.identifier))
+        self._record_source_success(
+            "Blitzortung lightning",
+            observed_at=strike.timestamp,
+            extra=f"{len(self.lightning_strikes)} strokes in the rolling 15-minute window",
+            refresh=False,
+        )
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=15)
         self.lightning_strikes = {
             identifier: observed
@@ -3759,6 +4064,50 @@ class StormRadarApp:
                 labelcolor=FOREGROUND,
             )
 
+        if self._measurement_points:
+            latitudes = [point[0] for point in self._measurement_points]
+            longitudes = [point[1] for point in self._measurement_points]
+            self.axes.plot(
+                longitudes,
+                latitudes,
+                color="#52e4c8",
+                linewidth=2.0,
+                linestyle="--",
+                zorder=20,
+            )
+            self.axes.scatter(
+                longitudes,
+                latitudes,
+                color="#52e4c8",
+                edgecolors="#102027",
+                linewidths=1.0,
+                s=54,
+                zorder=21,
+            )
+            if len(self._measurement_points) == 2:
+                first, second = self._measurement_points
+                distance = self._distance_km(first, second)
+                midpoint = (
+                    (first[1] + second[1]) / 2,
+                    (first[0] + second[0]) / 2,
+                )
+                self.axes.annotate(
+                    f"{distance:.1f} km",
+                    midpoint,
+                    xytext=(7, 7),
+                    textcoords="offset points",
+                    color="white",
+                    fontsize=9,
+                    fontweight="bold",
+                    bbox={
+                        "facecolor": "#102027",
+                        "edgecolor": "#52e4c8",
+                        "alpha": 0.92,
+                        "boxstyle": "round,pad=0.35",
+                    },
+                    zorder=22,
+                )
+
         attribution = "" if outlook_mode else ESRI_ATTRIBUTION
         if self.map_mode == DWD_WARNING_MAP:
             attribution = f"Warning data © DWD · {ESRI_ATTRIBUTION}"
@@ -3968,6 +4317,7 @@ class StormRadarApp:
                 general_weather_outlook,
             )
         except Exception as error:
+            self._record_source_error("ICON-D2 outlook", error)
             self._storm_outlook_loading = False
             self._storm_outlook_error = f"{type(error).__name__}: {error}"
             _terminal_progress("Outlook", f"Load failed: {self._storm_outlook_error}")
@@ -3987,6 +4337,11 @@ class StormRadarApp:
         self._storm_outlook = outlook
         self._general_weather_outlook = general_weather_outlook
         self._storm_outlook_loaded_at = issued_at
+        self._record_source_success(
+            "ICON-D2 outlook",
+            observed_at=issued_at,
+            extra=f"{len(outlook)} StormAnalyzer results",
+        )
         self._storm_outlook_loading = False
         self._storm_outlook_error = None
         _terminal_progress(
@@ -4406,6 +4761,36 @@ class StormRadarApp:
             self.report_text.see(tk.END)
         self.report_text.configure(state="disabled")
 
+    def _toggle_measurement(self) -> None:
+        if self._measurement_enabled:
+            self._measurement_enabled = False
+            self.measure_status.set("Measurement cancelled")
+            self.measure_button.configure(text="Measure distance")
+        else:
+            self._measurement_points.clear()
+            self._measurement_enabled = True
+            self.measure_status.set("Click the first point on the map")
+            self.measure_button.configure(text="Cancel measure")
+        self._draw_map()
+
+    @staticmethod
+    def _distance_km(
+        first: tuple[float, float],
+        second: tuple[float, float],
+    ) -> float:
+        """Calculate great-circle distance between (latitude, longitude) pairs."""
+        latitude_1, longitude_1 = map(math.radians, first)
+        latitude_2, longitude_2 = map(math.radians, second)
+        latitude_delta = latitude_2 - latitude_1
+        longitude_delta = longitude_2 - longitude_1
+        haversine = (
+            math.sin(latitude_delta / 2) ** 2
+            + math.cos(latitude_1)
+            * math.cos(latitude_2)
+            * math.sin(longitude_delta / 2) ** 2
+        )
+        return 6371.0088 * 2 * math.asin(math.sqrt(min(1.0, haversine)))
+
     def _on_map_click(self, event: Any) -> None:
         if (
             event.button not in (1, "left")
@@ -4416,6 +4801,20 @@ class StormRadarApp:
             return
         latitude = float(event.ydata)
         longitude = float(event.xdata)
+        if self._measurement_enabled:
+            self._measurement_points.append((latitude, longitude))
+            if len(self._measurement_points) == 1:
+                self.measure_status.set(
+                    f"Start: {latitude:.4f}, {longitude:.4f} · choose endpoint"
+                )
+            else:
+                first, second = self._measurement_points
+                distance = self._distance_km(first, second)
+                self.measure_status.set(f"Distance: {distance:.1f} km")
+                self._measurement_enabled = False
+                self.measure_button.configure(text="Measure distance")
+            self._draw_map()
+            return
         _terminal_progress(
             "Map",
             f"Selected map point {latitude:.4f}, {longitude:.4f} in {self.map_mode}.",
@@ -4677,7 +5076,7 @@ class StormRadarApp:
         )
 
     def _on_map_pick(self, event: Any) -> None:
-        if not event.ind:
+        if self._measurement_enabled or not event.ind:
             return
         if event.artist is self._cell_artist:
             self._select_cell(int(event.ind[0]))
