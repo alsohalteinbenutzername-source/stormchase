@@ -23,8 +23,8 @@ WARNING_LEVELS: dict[str, tuple[WarningLevel, ...]] = {
     ),
     "tornado": (
         WarningLevel(1, "BASE", "Tornado warning", "Radar-indicated or reliably reported tornado/developing tornado."),
-        WarningLevel(2, "CONSIDERABLE / PDS", "Considerable tornado threat", "Rare PDS-level situation: strong, ongoing tornado and considerable threat to life and property."),
-        WarningLevel(3, "CATASTROPHIC / TORNADO EMERGENCY", "Catastrophic tornado emergency", "Exceedingly rare: violent tornado, catastrophic damage imminent/ongoing, and reliable confirmation."),
+        WarningLevel(2, "CONSIDERABLE / PDS WORDING", "Considerable tornado damage threat", "Used when a tornado is occurring with high-confidence radar evidence and/or reliable visual confirmation; NWS warning text adds the particularly dangerous situation wording."),
+        WarningLevel(3, "CATASTROPHIC / TORNADO EMERGENCY CRITERIA", "Catastrophic tornado damage threat", "Exceedingly rare: severe threat to human life and catastrophic damage are imminent or ongoing, with reliable visual/radar evidence and NWS supervisor/team concurrence. StormChase cannot reproduce NWS operational authorization."),
     ),
     "hail": (
         WarningLevel(1, "BASE", "Severe hail", "NWS base severe-thunderstorm hail criterion.", "≥1.00 in / 25 mm"),
@@ -140,7 +140,7 @@ def validate_warning_payload(
         raise ValueError("Description must contain 1–2000 characters.")
     if category == "tornado" and level == 3 and not catastrophic_confirmed:
         raise ValueError(
-            "Catastrophic tornado warnings require an explicit reliable-confirmation acknowledgement."
+            "The catastrophic tier requires confirmation of reliable evidence and the catastrophic-impact criteria."
         )
     now = datetime.now(timezone.utc)
     expiry = expires_at.replace(tzinfo=timezone.utc) if expires_at.tzinfo is None else expires_at.astimezone(timezone.utc)
