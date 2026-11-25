@@ -114,6 +114,15 @@ THREAT_PROBABILITIES = {
 }
 OUTLOOK_PARAMETER_SCALES = {"STP": 10.0, "SCP": 25.0}
 GENERAL_WEATHER_MAP_METRIC = "Precip chance"
+GENERAL_WEATHER_MAP_SCALES = {
+    "Precip chance": ("precipitation_probability_max_percent", 0.0, 100.0, "%"),
+    "Total precip": ("precipitation_sum_mm", 0.0, 30.0, "mm"),
+    "Rainfall": ("rain_sum_mm", 0.0, 30.0, "mm"),
+    "High temp": ("temperature_max_c", -20.0, 40.0, "°C"),
+    "Low temp": ("temperature_min_c", -30.0, 30.0, "°C"),
+    "Wind max": ("wind_speed_max_kmh", 0.0, 100.0, "km/h"),
+    "UV index": ("uv_index_max", 0.0, 12.0, ""),
+}
 
 
 def _format_optional_parameter(value: Any) -> str:
@@ -1118,7 +1127,7 @@ class StormRadarApp:
             map_toolbar, textvariable=self.outlook_metric_var,
             values=(
                 "Overall risk", "Tornado", "Hail", "Wind", "STP", "SCP",
-                GENERAL_WEATHER_MAP_METRIC,
+                *GENERAL_WEATHER_MAP_SCALES,
             ),
             state="readonly", width=14,
         )
@@ -2305,16 +2314,19 @@ class StormRadarApp:
             )
 
     def _draw_outlook_legend(self) -> None:
-        if self._outlook_metric == GENERAL_WEATHER_MAP_METRIC:
-            maximum = 100.0
-            levels = np.linspace(0.0, maximum, len(OUTLOOK_COLORS) + 1)
+        if self._outlook_metric in GENERAL_WEATHER_MAP_SCALES:
+            _field, minimum, maximum, unit = GENERAL_WEATHER_MAP_SCALES[
+                self._outlook_metric
+            ]
+            levels = np.linspace(minimum, maximum, len(OUTLOOK_COLORS) + 1)
             labels = [
-                f"{levels[index]:.0f}–<{levels[index + 1]:.0f}%"
+                f"{levels[index]:.0f}–<{levels[index + 1]:.0f} {unit}".strip()
                 for index in range(len(levels) - 2)
             ]
-            labels.append(f"{levels[-2]:.0f}–{maximum:.0f}%")
-            colors = OUTLOOK_COLORS
-            title = f"{self.outlook_day_var.get()} · General weather precipitation chance"
+            labels.append(f"{levels[-2]:.0f}–{maximum:.0f} {unit}".strip())
+            labels.append("No forecast data")
+            colors = (*OUTLOOK_COLORS, "#ffffff")
+            title = f"{self.outlook_day_var.get()} · General weather · {self._outlook_metric}"
         elif self._outlook_metric in OUTLOOK_PARAMETER_SCALES:
             maximum = OUTLOOK_PARAMETER_SCALES[self._outlook_metric]
             levels = np.linspace(0.0, maximum, len(OUTLOOK_COLORS) + 1)
@@ -2357,6 +2369,8 @@ class StormRadarApp:
         ]
         if self._outlook_metric == "Overall risk":
             handles[0].set_hatch("///")
+        elif self._outlook_metric in GENERAL_WEATHER_MAP_SCALES:
+            handles[-1].set_hatch("///")
         self.axes.legend(
             handles=handles,
             title=title,
@@ -2432,7 +2446,8 @@ class StormRadarApp:
         if outlook_mode and self._storm_outlook:
             day = self._outlook_day
             entries = [entry for entry in self._storm_outlook if entry["day"] == day]
-            general_weather_metric = self._outlook_metric == GENERAL_WEATHER_MAP_METRIC
+            general_weather_scale = GENERAL_WEATHER_MAP_SCALES.get(self._outlook_metric)
+            general_weather_metric = general_weather_scale is not None
             metric_key = {
                 "Overall risk": "risk",
                 "Tornado": "tornado",
@@ -2441,9 +2456,12 @@ class StormRadarApp:
                 "STP": "stp",
                 "SCP": "scp",
             }.get(self._outlook_metric)
+            parameter_minimum = (
+                general_weather_scale[1] if general_weather_scale is not None else 0.0
+            )
             parameter_scale = (
-                100.0
-                if general_weather_metric
+                general_weather_scale[2]
+                if general_weather_scale is not None
                 else OUTLOOK_PARAMETER_SCALES.get(self._outlook_metric)
             )
             parameter_values: list[float] = []
@@ -2457,11 +2475,7 @@ class StormRadarApp:
                     )
                     if not isinstance(source, dict):
                         continue
-                    value_key = (
-                        "precipitation_probability_max_percent"
-                        if general_weather_metric
-                        else metric_key
-                    )
+                    value_key = general_weather_scale[0] if general_weather_scale else metric_key
                     value = source.get(value_key)
                     try:
                         numeric_value = float(value)
@@ -2470,7 +2484,7 @@ class StormRadarApp:
                     if math.isfinite(numeric_value):
                         available_entries.append(entry)
                         parameter_values.append(
-                            float(np.clip(numeric_value, 0.0, parameter_scale))
+                            float(np.clip(numeric_value, parameter_minimum, parameter_scale))
                         )
                 entries = available_entries
             if entries:
@@ -2490,12 +2504,21 @@ class StormRadarApp:
                 triangulation = Triangulation(longitudes, latitudes) if len(entries) >= 3 else None
 
                 if parameter_scale is not None:
-                    score_levels = tuple(np.linspace(0.0, parameter_scale, len(OUTLOOK_COLORS) + 1))
-                    scores = np.minimum(scores, np.nextafter(parameter_scale, 0.0))
+                    score_levels = tuple(
+                        np.linspace(
+                            parameter_minimum,
+                            parameter_scale,
+                            len(OUTLOOK_COLORS) + 1,
+                        )
+                    )
+                    scores = np.minimum(
+                        scores,
+                        np.nextafter(parameter_scale, parameter_minimum),
+                    )
                     level_colors = OUTLOOK_COLORS
                     contour_options: dict[str, Any] = {}
                     minimum_to_render = (
-                        0.0 if general_weather_metric else score_levels[1]
+                        parameter_minimum if general_weather_metric else score_levels[1]
                     )
                 elif metric_key == "risk":
                     score_levels = (-1, *OVERALL_LEVELS, 101)
