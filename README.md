@@ -182,7 +182,7 @@ frozen precipitation, or a thunderstorm signal is likely.
    started manually or by cron-job.org. To configure cron-job.org, create a
    fine-grained GitHub token limited to this repository with **Actions: write**
    permission. Configure a POST job to
-   `https://api.github.com/repos/OWNER/REPO/actions/workflows/general-weather.yml/dispatches`
+   `https://api.github.com/repos/OWNER/REPO/actions/workflows/general_weather.yml/dispatches`
    with these headers and body:
 
    ```text
