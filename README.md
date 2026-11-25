@@ -318,7 +318,7 @@ official DWD/NWS warnings or a German legal warning scale:
   concurrence; StormChase cannot reproduce that official authorization process
   and does not issue an NWS Tornado Emergency.
 - **Heavy rain:** StormChase levels 1–3 map to DWD Warnstufen 2–4:
-  15–25 mm/1 h or 20–35 mm/6 h; >25–40 mm/1 h or >35–60 mm/6 h;
+  15–25 mm/1 h or 20–35 mm/6 h; 25–40 mm/1 h or 35–60 mm/6 h;
   >40 mm/1 h or >60 mm/6 h.
 
 The NWS severe-thunderstorm criteria are US warning standards adapted for a
