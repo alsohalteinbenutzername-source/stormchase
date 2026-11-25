@@ -23,6 +23,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.cm import ScalarMappable
 from matplotlib.colors import Normalize
 from matplotlib.figure import Figure
+from matplotlib.patches import Ellipse
 import matplotlib.patheffects as path_effects
 from matplotlib.tri import Triangulation, UniformTriRefiner
 import numpy as np
@@ -4652,7 +4653,7 @@ class StormRadarApp:
                         111.32 * abs(math.cos(math.radians(radar_latitude))),
                         1.0,
                     )
-                    ring = matplotlib.patches.Ellipse(
+                    ring = Ellipse(
                         (radar_longitude, radar_latitude),
                         width=2.0 * radius_km / longitude_scale_km,
                         height=2.0 * radius_km / latitude_scale_km,
