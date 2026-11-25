@@ -186,14 +186,14 @@ class RotationDetectionTests(unittest.TestCase):
         velocity[2:4, 5:10] = 20.0
         # A 10-degree grid would span hundreds of kilometres and fail the
         # detector's physical shear criteria. Model a compact radar couplet.
-        frame = RadarFrame(velocity, None, extent=(0.0, 0.01, 0.0, 0.005))
+        frame = RadarFrame(velocity, None, extent=(0.0, 0.015, 0.0, 0.005))
 
         detections = detect_rotations(frame)
 
         self.assertEqual(len(detections), 1)
         detection = detections[0]
         self.assertAlmostEqual(detection.latitude, 0.002)
-        self.assertAlmostEqual(detection.longitude, 0.005)
+        self.assertAlmostEqual(detection.longitude, 0.0075)
         self.assertEqual(detection.negative_pixels, 10)
         self.assertEqual(detection.positive_pixels, 10)
         self.assertTrue(rotation_detection(frame))
