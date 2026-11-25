@@ -84,8 +84,8 @@ create table if not exists public.storm_warnings (
         ))
         or (category = 'tornado' and (
             (level = 1 and level_tag = 'BASE')
-            or (level = 2 and level_tag = 'CONSIDERABLE / PDS')
-            or (level = 3 and level_tag = 'CATASTROPHIC / TORNADO EMERGENCY')
+            or (level = 2 and level_tag = 'CONSIDERABLE / PDS WORDING')
+            or (level = 3 and level_tag = 'CATASTROPHIC / TORNADO EMERGENCY CRITERIA')
         ))
         or (category = 'heavy_rain' and (
             (level = 1 and level_tag = 'DWD LEVEL 2')
