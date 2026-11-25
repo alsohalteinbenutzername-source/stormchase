@@ -1049,6 +1049,7 @@ class StormRadarApp:
         self._source_observed_at: dict[str, datetime] = {}
         self._source_errors: dict[str, str] = {}
         self._source_extra: dict[str, str] = {}
+        self._lightning_connection_status = "connecting"
         self._measurement_enabled = False
         self._measurement_points: list[tuple[float, float]] = []
 
@@ -2736,6 +2737,8 @@ class StormRadarApp:
                 stale_core_sources.append(name)
             if extra:
                 state += f" · {extra}"
+            if name == "Blitzortung lightning":
+                state += f" · connection: {self._lightning_connection_status}"
             if error:
                 state += f" · last attempt failed: {error}"
             lines.append(f"{name}: {state}")
@@ -2791,10 +2794,15 @@ class StormRadarApp:
             )
             return
 
+        observed_at = (
+            self.radar_frame.timestamp
+            if isinstance(cell, RainCell) and self.radar_frame is not None
+            else self.storm_update.timestamp
+        )
         lines = [
             f"StormChase cell summary · {cell.identifier}",
             f"Position: {cell.latitude:.4f}° N, {cell.longitude:.4f}° E",
-            f"Observed data time: {self._format_time(self.storm_update.timestamp)}",
+            f"Observed data time: {self._format_time(observed_at)}",
         ]
         if isinstance(cell, RainCell):
             lines.extend(
@@ -3175,7 +3183,9 @@ class StormRadarApp:
         self._draw_map()
 
     def _on_lightning_status(self, status: str) -> None:
+        self._lightning_connection_status = status
         self.lightning_status.set(status)
+        self._refresh_diagnostics()
         _terminal_progress("Lightning", status)
 
     @staticmethod
