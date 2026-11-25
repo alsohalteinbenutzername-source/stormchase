@@ -334,7 +334,7 @@ returns trigger
 language plpgsql
 security definer
 set search_path = ''
-as $
+as $$
 begin
     if new.verification_status is distinct from old.verification_status
        or new.review_note is distinct from old.review_note then
@@ -348,7 +348,7 @@ begin
     end if;
     return new;
 end;
-$;
+$$;
 
 revoke all on function public.audit_storm_report_moderation() from public, anon, authenticated;
 drop trigger if exists storm_report_moderation_audit_trigger on public.storm_reports;
@@ -370,7 +370,7 @@ $$;
 
 revoke all on function public.expire_stormchase_warnings() from public, anon, authenticated;
 
-do $
+do $$
 declare
     existing_job_id bigint;
 begin
@@ -382,7 +382,7 @@ begin
         perform cron.unschedule(existing_job_id);
     end loop;
 end;
-$;
+$$;
 
 select cron.schedule(
     'stormchase-community-warning-expiry',
