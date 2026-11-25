@@ -3168,6 +3168,18 @@ class StormRadarApp:
                         detected_cells,
                         radar_frame.timestamp,
                     )
+                    if radar_frame.timestamp is not None:
+                        for rain_cell in self.rain_cells:
+                            self.case_analysis.record_event(
+                                "rain_echo",
+                                f"{rain_cell.identifier}:{radar_frame.timestamp.isoformat()}",
+                                radar_frame.timestamp,
+                                f"Tracked rain echo · {rain_cell.max_reflectivity_dbz:.1f} dBZ · "
+                                f"{rain_cell.area_pixels} pixels",
+                                latitude=rain_cell.latitude,
+                                longitude=rain_cell.longitude,
+                                source="DWD reflectivity",
+                            )
                     _terminal_progress(
                         "Refresh",
                         f"Rain-echo analysis complete: {len(self.rain_cells)} active cells.",
@@ -3227,6 +3239,25 @@ class StormRadarApp:
                     self._sync_auth_state()
                 else:
                     self.community_reports = reports_result
+                    for report in reports_result:
+                        try:
+                            report_time = datetime.fromisoformat(
+                                str(report.get("created_at", "")).replace("Z", "+00:00")
+                            )
+                            report_latitude = float(report["latitude"])
+                            report_longitude = float(report["longitude"])
+                            self.case_analysis.record_event(
+                                "community_report",
+                                str(report.get("id", "")),
+                                report_time,
+                                f"Community report by {report.get('reporter_username', 'unknown')} · "
+                                f"{report.get('cell_id', 'unknown cell')}",
+                                latitude=report_latitude,
+                                longitude=report_longitude,
+                                source="StormChase community report",
+                            )
+                        except (KeyError, TypeError, ValueError):
+                            continue
                     self._record_source_success(
                         "Supabase reports",
                         extra=f"{len(reports_result)} reports",
@@ -3647,6 +3678,22 @@ class StormRadarApp:
                         "DWD mesocyclone detections",
                         extra=f"{len(rotations)} detections",
                     )
+                    if frame.timestamp is not None:
+                        for index, detection in enumerate(rotations):
+                            height = (
+                                f" · {detection.base_km:.1f}–{detection.top_km:.1f} km"
+                                if detection.base_km is not None and detection.top_km is not None
+                                else ""
+                            )
+                            self.case_analysis.record_event(
+                                "mesocyclone",
+                                f"{site_code}:{frame.timestamp.isoformat()}:{index}",
+                                frame.timestamp,
+                                f"DWD mesocyclone level {detection.level}{height}",
+                                latitude=detection.latitude,
+                                longitude=detection.longitude,
+                                source=f"DWD volume scan · {site.name}",
+                            )
             if frame is None:
                 self._record_source_error(
                     "DWD velocity",
